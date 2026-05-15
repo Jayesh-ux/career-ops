@@ -40,13 +40,15 @@ const ROOT = dirname(fileURLToPath(import.meta.url));
 
 const PATHS = {
   // Primary evaluation logic lives in these two mode files
-  shared:   join(ROOT, 'modes', '_shared.md'),
-  oferta:   join(ROOT, 'modes', 'oferta.md'),
+  shared:      join(ROOT, 'modes', '_shared.md'),
+  oferta:      join(ROOT, 'modes', 'oferta.md'),
   // Canonical skill path referenced in Issue #344
-  evaluate: join(ROOT, '.claude', 'skills', 'career-ops', 'SKILL.md'),
-  cv:       join(ROOT, 'cv.md'),
-  reports:  join(ROOT, 'reports'),
-  tracker:  join(ROOT, 'data', 'applications.md'),
+  evaluate:    join(ROOT, '.claude', 'skills', 'career-ops', 'SKILL.md'),
+  cv:          join(ROOT, 'cv.md'),
+  profile:     join(ROOT, 'modes', '_profile.md'),
+  profileYml:  join(ROOT, 'config', 'profile.yml'),
+  reports:     join(ROOT, 'reports'),
+  tracker:     join(ROOT, 'data', 'applications.md'),
 };
 
 // ---------------------------------------------------------------------------
@@ -163,9 +165,11 @@ if (!readdirSync) {
 // ---------------------------------------------------------------------------
 console.log('\n📂  Loading context files...');
 
-const sharedContext  = readFile(PATHS.shared,   'modes/_shared.md');
-const ofertaLogic    = readFile(PATHS.oferta,   'modes/oferta.md');
-const cvContent      = readFile(PATHS.cv,       'cv.md');
+const sharedContext  = readFile(PATHS.shared,      'modes/_shared.md');
+const ofertaLogic    = readFile(PATHS.oferta,      'modes/oferta.md');
+const cvContent      = readFile(PATHS.cv,          'cv.md');
+const profileContent = readFile(PATHS.profile,     'modes/_profile.md');
+const profileYml     = readFile(PATHS.profileYml,  'config/profile.yml');
 
 // ---------------------------------------------------------------------------
 // Build the system prompt (mirrors the Claude skill router logic)
@@ -189,6 +193,16 @@ ${ofertaLogic}
 CANDIDATE RESUME (cv.md)
 ═══════════════════════════════════════════════════════
 ${cvContent}
+
+═══════════════════════════════════════════════════════
+CANDIDATE PROFILE & TARGETS (config/profile.yml)
+═══════════════════════════════════════════════════════
+${profileYml}
+
+═══════════════════════════════════════════════════════
+USER ARCHETYPES & NARRATIVE (_profile.md)
+═══════════════════════════════════════════════════════
+${profileContent}
 
 ═══════════════════════════════════════════════════════
 IMPORTANT OPERATING RULES FOR THIS CLI SESSION
