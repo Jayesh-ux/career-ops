@@ -78,10 +78,12 @@ function normalizeTextForATS(html) {
     // Middle dot and bullet glyphs garble in some extractors \u2014 replace with pipe.
     t = t.replace(/\s*\u00B7\s*/g, () => { bump('middot', 1); return ' | '; });
     t = t.replace(/\s*\u2022\s*/g, () => { bump('bullet', 1); return ' | '; });
-    // Currency symbols sometimes stripped by font-subsetted PDFs \u2014 spell them out.
+    // Currency symbols sometimes stripped by font-subsetted PDFs \u2014 spell out
+    // the unambiguous ones. \u00A5 is intentionally NOT converted: it maps to both
+    // Japanese Yen (JPY) and Chinese Yuan (CNY), so any spelled-out code would be
+    // wrong for half of users \u2014 better to leave the glyph than emit bad data.
     t = t.replace(/\u20AC/g, () => { bump('euro', 1); return 'EUR '; });
     t = t.replace(/\u00A3/g, () => { bump('pound', 1); return 'GBP '; });
-    t = t.replace(/\u00A5/g, () => { bump('yen', 1); return 'JPY '; });
     return t;
   }
 }
