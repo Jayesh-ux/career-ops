@@ -2,9 +2,15 @@
 
 [English](README.md) | [Español](README.es.md) | [Português (Brasil)](README.pt-BR.md) | [한국어](README.ko-KR.md) | [日本語](README.ja.md) | [简体中文](README.cn.md) | [繁體中文](README.zh-TW.md) | [Українська](README.ua.md) | [Русский](README.ru.md)
 
-> _Я месяцами откликался на вакансии вручную. И создал систему, которую хотел бы иметь с самого начала._
-> Компании используют ИИ для фильтрации кандидатов. **Я дал кандидатам ИИ, чтобы _выбирать_ компании.**
-> _Теперь это open source._
+<p align="center">
+  <a href="https://x.com/santifer"><img src="docs/hero-banner.jpg" alt="Career-Ops Мультиагентная система поиска работы" width="800"></a>
+</p>
+
+<p align="center">
+  <em>Я месяцами откликался на вакансии вручную. И создал систему, которую хотел бы иметь с самого начала.</em><br>
+  Компании используют ИИ для фильтрации кандидатов. <strong>Я дал кандидатам ИИ, чтобы <em>выбирать</em> компании.</strong><br>
+  <em>Теперь это open source.</em>
+</p>
 
 <p align="center">
   <a href="https://trendshift.io/repositories/25195" target="_blank"><img src="https://trendshift.io/api/badge/repositories/25195" alt="santifer/career-ops | Trendshift" width="250" height="55"/></a>
@@ -20,7 +26,13 @@
 
 ---
 
-**740+ вакансий оценено · 100+ персонализированных резюме · 1 позиция мечты получена**
+<p align="center">
+  <img src="docs/demo.gif" alt="Career-Ops Демо" width="800">
+</p>
+
+<p align="center"><strong>740+ вакансий оценено · 100+ персонализированных резюме · 1 позиция мечты получена</strong></p>
+
+<p align="center"><a href="https://discord.gg/8pRpHETxa4"><img src="https://img.shields.io/badge/Присоединиться_к_сообществу-Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a></p>
 
 <p align="center">
   <sub>Создано с помощью</sub><br>
