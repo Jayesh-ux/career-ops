@@ -1274,6 +1274,39 @@ try {
   fail(`merge-tracker fuzzy dedup tests crashed: ${e.message}`);
 }
 
+// ── 12. COLD-START TRIGGER ──────────────────────────────────────
+
+console.log('\n12. Cold-start trigger (deterministic onboarding state)');
+
+try {
+  // Virgin env: none of the 4 user-layer prerequisites present → must onboard.
+  const virgin = mkdtempSync(join(tmpdir(), 'co-cold-'));
+  const v = JSON.parse(run(NODE, ['doctor.mjs', '--json', '--target', virgin]) || '{}');
+  if (v.onboardingNeeded === true && Array.isArray(v.missing) && v.missing.length === 4) {
+    pass('Virgin env → onboarding triggered (4 prerequisites missing)');
+  } else {
+    fail(`Virgin env not flagged for onboarding: ${JSON.stringify(v)}`);
+  }
+  rmSync(virgin, { recursive: true, force: true });
+
+  // Fully provisioned env: all 4 present → must NOT onboard.
+  const ready = mkdtempSync(join(tmpdir(), 'co-ready-'));
+  mkdirSync(join(ready, 'config'), { recursive: true });
+  mkdirSync(join(ready, 'modes'), { recursive: true });
+  for (const f of ['cv.md', 'config/profile.yml', 'modes/_profile.md', 'portals.yml']) {
+    writeFileSync(join(ready, f), 'x');
+  }
+  const r = JSON.parse(run(NODE, ['doctor.mjs', '--json', '--target', ready]) || '{}');
+  if (r.onboardingNeeded === false) {
+    pass('Provisioned env → no onboarding');
+  } else {
+    fail(`Provisioned env falsely flagged for onboarding: ${JSON.stringify(r)}`);
+  }
+  rmSync(ready, { recursive: true, force: true });
+} catch (e) {
+  fail(`Cold-start trigger test crashed: ${e.message}`);
+}
+
 // ── SUMMARY ─────────────────────────────────────────────────────
 
 console.log('\n' + '='.repeat(50));
