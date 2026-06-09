@@ -491,7 +491,9 @@ for (const section of requiredSections) {
 console.log('\n11. Version file');
 
 if (fileExists('VERSION')) {
-  const version = readFile('VERSION').trim();
+  // VERSION may carry a release-please marker, e.g. "1.9.0 # x-release-please-version".
+  // Validate the first whitespace-delimited token, mirroring update-system.mjs parseVersionFile().
+  const version = readFile('VERSION').trim().split(/\s+/)[0];
   if (/^\d+\.\d+\.\d+$/.test(version)) {
     pass(`VERSION is valid semver: ${version}`);
   } else {
