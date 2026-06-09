@@ -18,12 +18,6 @@
   <a href="https://www.producthunt.com/products/santifer-io?utm_source=badge-featured&utm_medium=badge" target="_blank"><img src="docs/press/producthunt.svg" alt="Career-Ops on Claude | Product Hunt" style="width: 206px; height: 54px; vertical-align: middle;" width="206" height="54"/></a>
 </p>
 
-<p align="center">
-  <a href="https://github.com/santifer/career-ops/stargazers"><img src="https://img.shields.io/github/stars/santifer/career-ops?style=for-the-badge&logo=github&color=e3b341&labelColor=2b3137" alt="GitHub stars"></a>
-  &nbsp;
-  <a href="https://github.com/santifer/career-ops/releases/latest"><img src="https://img.shields.io/github/v/release/santifer/career-ops?style=for-the-badge&color=2ea44f&labelColor=2b3137&label=release" alt="Latest release"></a>
-</p>
-
 <p align="center"><sub>FEATURED IN</sub></p>
 
 <p align="center">
@@ -42,6 +36,12 @@
 
 <p align="center">
   <a href="https://discord.gg/8pRpHETxa4"><img src="https://img.shields.io/badge/Join_the_community-Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/santifer/career-ops/stargazers"><img src="https://img.shields.io/github/stars/santifer/career-ops?style=for-the-badge&logo=github&color=e3b341&labelColor=2b3137" alt="GitHub stars"></a>
+  &nbsp;
+  <a href="https://github.com/santifer/career-ops/releases/latest"><img src="https://img.shields.io/github/v/release/santifer/career-ops?style=for-the-badge&color=2ea44f&labelColor=2b3137&label=release" alt="Latest release"></a>
   &nbsp;
   <a href="https://www.npmjs.com/package/@santifer/career-ops"><img src="https://img.shields.io/npm/dt/@santifer/career-ops?style=for-the-badge&logo=npm&color=CB3837&label=npx%20installs" alt="npm installs"></a>
 </p>
