@@ -39,11 +39,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/santifer/career-ops/stargazers"><img src="https://img.shields.io/github/stars/santifer/career-ops?style=for-the-badge&logo=github&color=e3b341&labelColor=2b3137" alt="GitHub stars"></a>
-  &nbsp;
-  <a href="https://github.com/santifer/career-ops/releases/latest"><img src="https://img.shields.io/github/v/release/santifer/career-ops?style=for-the-badge&color=2ea44f&labelColor=2b3137&label=release" alt="Latest release"></a>
-  &nbsp;
-  <a href="https://www.npmjs.com/package/@santifer/career-ops"><img src="https://img.shields.io/npm/dt/@santifer/career-ops?style=for-the-badge&logo=npm&color=CB3837&label=npx%20installs" alt="npm installs"></a>
+  <a href="https://github.com/santifer/career-ops/releases/latest"><img src="https://img.shields.io/badge/release-v1.9.0-2ea44f?style=for-the-badge&labelColor=2b3137" alt="Latest release"></a>
 </p>
 
 <p align="center">
