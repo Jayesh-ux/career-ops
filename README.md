@@ -37,10 +37,12 @@
 <p align="center"><strong>740+ job listings evaluated · 100+ personalized CVs · 1 dream role landed</strong></p>
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://mission-control.career-ops.org/api/chart?repo=santifer%2Fcareer-ops&theme=dark">
-    <img alt="Star history of santifer/career-ops" src="https://mission-control.career-ops.org/api/chart?repo=santifer%2Fcareer-ops&theme=light">
-  </picture>
+  <a href="https://mission-control.career-ops.org/">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://mission-control.career-ops.org/api/chart?theme=dark">
+      <img alt="Live star telemetry of santifer/career-ops" src="https://mission-control.career-ops.org/api/chart?theme=light" loading="lazy">
+    </picture>
+  </a>
 </p>
 
 <p align="center">

@@ -35,6 +35,15 @@
 <p align="center"><strong>740+ ofertas evaluadas · 100+ CVs personalizados · 1 trabajo soñado conseguido</strong></p>
 
 <p align="center">
+  <a href="https://mission-control.career-ops.org/">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://mission-control.career-ops.org/api/chart?theme=dark">
+      <img alt="Live star telemetry of santifer/career-ops" src="https://mission-control.career-ops.org/api/chart?theme=light" loading="lazy">
+    </picture>
+  </a>
+</p>
+
+<p align="center">
   <a href="https://discord.gg/8pRpHETxa4"><img src="https://img.shields.io/badge/Unete_a_la_comunidad-Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
   &nbsp;
   <a href="https://www.npmjs.com/package/@santifer/career-ops"><img src="https://img.shields.io/npm/dt/@santifer/career-ops?style=for-the-badge&logo=npm&color=CB3837&label=npx%20installs" alt="npm installs"></a>
@@ -254,15 +263,6 @@ Mi portfolio y otros proyectos open source → [santifer.io](https://santifer.io
 
 - **[cv-santiago](https://github.com/santifer/cv-santiago)** -- El portfolio (santifer.io) con chatbot IA, dashboard LLMOps y case studies. Si necesitas un portfolio para acompañar tu busqueda de empleo, echale un vistazo.
 
-## Star History
-
-<a href="https://www.star-history.com/?repos=santifer%2Fcareer-ops&type=timeline&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=santifer/career-ops&type=timeline&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=santifer/career-ops&type=timeline&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=santifer/career-ops&type=timeline&legend=top-left" />
- </picture>
-</a>
 
 ## Aviso legal
 
