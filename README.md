@@ -39,8 +39,8 @@
 <p align="center">
   <a href="https://warpchart.dev/hq">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://warpchart.dev/api/chart?theme=dark">
-      <img alt="Live star telemetry of santifer/career-ops" src="https://warpchart.dev/api/chart?theme=light" loading="lazy">
+      <source media="(prefers-color-scheme: dark)" srcset="https://warpchart.dev/api/chart?theme=dark&v=2">
+      <img alt="Live star telemetry of santifer/career-ops" src="https://warpchart.dev/api/chart?theme=light&v=2" loading="lazy">
     </picture>
   </a>
 </p>
