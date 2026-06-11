@@ -11,7 +11,7 @@
  *   node test-all.mjs --quick   # Skip dashboard build (faster)
  */
 
-import { execSync, execFileSync } from 'child_process';
+import { execSync, execFileSync, spawn } from 'child_process';
 import { readFileSync, existsSync, readdirSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
 import { join, dirname } from 'path';
 import { tmpdir } from 'os';
@@ -521,6 +521,10 @@ if (shared.includes('_profile.md')) {
 }
 
 for (const skillPath of ['.claude/skills/career-ops/SKILL.md', '.agents/skills/career-ops/SKILL.md']) {
+  if (!fileExists(skillPath)) {
+    fail(`${skillPath} is missing`);
+    continue;
+  }
   const skill = readFile(skillPath);
   if (skill.includes('/career-ops latex')) {
     pass(`${skillPath} exposes /career-ops latex in discovery menu`);
@@ -1568,6 +1572,133 @@ try {
   }
 } catch (e) {
   fail(`merge-tracker fuzzy dedup tests crashed: ${e.message}`);
+}
+
+// ── MERGE-TRACKER CONCURRENT WRITES (#781 follow-up) ─────────────────────
+// Report-number reservation is atomic now (#803), but tracker merges are a
+// separate read/modify/write step. If two merge-tracker processes read the same
+// old applications.md snapshot and then write back independently, one process
+// can erase the row added by the other. This fixture gives each process a
+// different additions dir and pauses the first process after it has read the
+// tracker, making the old race deterministic.
+console.log('\n🧪 Testing merge-tracker concurrent writes...');
+try {
+  const mergeTmp = mkdtempSync(join(tmpdir(), 'career-ops-merge-lock-'));
+  /**
+   * Spawn one isolated `merge-tracker.mjs` process against the temporary fixture.
+   *
+   * Each spawned process receives the same tracker path and lock path but a
+   * different additions directory. Without serialization, both processes can
+   * read the same old tracker and the later write can lose the other row. The
+   * first worker also sends an IPC readiness message after reading the tracker
+   * and before its test hold, which lets the test launch the second worker at
+   * the exact old race point instead of relying on scheduler timing.
+   *
+   * @param {string} additionsDir - Directory containing this process's TSV row.
+   * @param {number} [holdMs=0] - Optional post-read delay injected into the merge.
+   * @returns {{ready: Promise<void>, result: Promise<{code:number|null,stdout:string,stderr:string}>}}
+   * Worker readiness and final process result promises.
+   */
+  function spawnMerge(additionsDir, holdMs = 0) {
+    let markReady;
+    let readyMarked = false;
+    const ready = new Promise(resolve => { markReady = resolve; });
+    const result = new Promise(resolve => {
+      const child = spawn(NODE, ['merge-tracker.mjs'], {
+        cwd: ROOT,
+        env: {
+          ...process.env,
+          CAREER_OPS_TRACKER: join(mergeTmp, 'data', 'applications.md'),
+          CAREER_OPS_ADDITIONS: additionsDir,
+          CAREER_OPS_TRACKER_LOCK: join(mergeTmp, 'career-ops-merge-tracker-fixture.lock'),
+          CAREER_OPS_MERGE_HOLD_MS: String(holdMs),
+          CAREER_OPS_MERGE_READY_IPC: '1',
+        },
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+      });
+      let stdout = '';
+      let stderr = '';
+      const resolveReady = () => {
+        if (readyMarked) return;
+        readyMarked = true;
+        markReady();
+      };
+      child.stdout.on('data', chunk => { stdout += chunk; });
+      child.stderr.on('data', chunk => { stderr += chunk; });
+      child.on('message', msg => {
+        if (msg?.type === 'merge-tracker-ready') resolveReady();
+      });
+      child.on('error', err => {
+        resolveReady();
+        resolve({ code: -1, stdout, stderr: String(err) });
+      });
+      child.on('close', code => {
+        resolveReady();
+        resolve({ code, stdout, stderr });
+      });
+    });
+    return { ready, result };
+  }
+
+  /**
+   * Fail fast when a worker never reaches the deterministic race checkpoint.
+   *
+   * A missing readiness signal would otherwise hang the test suite. Timing out
+   * turns that broken test contract into a normal assertion failure with a clear
+   * message.
+   *
+   * @param {Promise<void>} ready - Worker readiness promise.
+   * @param {number} timeoutMs - Maximum milliseconds to wait.
+   * @returns {Promise<void>} Resolves when ready arrives before the timeout.
+   */
+  function waitForReady(ready, timeoutMs) {
+    return Promise.race([
+      ready,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('merge worker did not signal readiness')), timeoutMs)),
+    ]);
+  }
+
+  try {
+    mkdirSync(join(mergeTmp, 'data'));
+    mkdirSync(join(mergeTmp, 'reports'));
+    const additionsA = join(mergeTmp, 'additions-a');
+    const additionsB = join(mergeTmp, 'additions-b');
+    mkdirSync(additionsA);
+    mkdirSync(additionsB);
+
+    writeFileSync(join(mergeTmp, 'data', 'applications.md'),
+      '# Applications Tracker\n\n' +
+      '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n' +
+      '|---|------|---------|------|-------|--------|-----|--------|-------|\n');
+    writeFileSync(join(mergeTmp, 'reports', '010-alpha-2026-01-07.md'), '# fixture\n');
+    writeFileSync(join(mergeTmp, 'reports', '011-beta-2026-01-07.md'), '# fixture\n');
+    writeFileSync(join(additionsA, '010-alpha.tsv'),
+      '10\t2026-01-07\tAlpha\tPlatform Engineer\tEvaluated\t4.1/5\t❌\t[10](reports/010-alpha-2026-01-07.md)\tfirst concurrent merge\n');
+    writeFileSync(join(additionsB, '011-beta.tsv'),
+      '11\t2026-01-07\tBeta\tData Engineer\tEvaluated\t4.2/5\t❌\t[11](reports/011-beta-2026-01-07.md)\tsecond concurrent merge\n');
+
+    const first = spawnMerge(additionsA, 350);
+    await waitForReady(first.ready, 2_000);
+    const second = spawnMerge(additionsB, 0);
+    const [firstResult, secondResult] = await Promise.all([first.result, second.result]);
+
+    if (firstResult.code === 0 && secondResult.code === 0) {
+      pass('concurrent merge processes both exited successfully');
+    } else {
+      fail(`concurrent merge process failed: first=${firstResult.code} second=${secondResult.code} stderr=${firstResult.stderr || secondResult.stderr}`);
+    }
+
+    const merged = readFileSync(join(mergeTmp, 'data', 'applications.md'), 'utf-8');
+    if (merged.includes('Alpha') && merged.includes('Beta')) {
+      pass('concurrent tracker merges preserve rows from both processes');
+    } else {
+      fail(`concurrent tracker merge lost a row: ${merged}`);
+    }
+  } finally {
+    rmSync(mergeTmp, { recursive: true, force: true });
+  }
+} catch (e) {
+  fail(`merge-tracker concurrent write test crashed: ${e.message}`);
 }
 
 // ── 12. COLD-START TRIGGER ──────────────────────────────────────
