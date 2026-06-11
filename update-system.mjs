@@ -82,6 +82,7 @@ const SYSTEM_PATHS = [
   'followup-cadence.mjs',
   'gemini-eval.mjs',
   'test-all.mjs',
+  'test-salary-filter.mjs',
   'updater-migration-tests.mjs',
   'batch/batch-prompt.md',
   'batch/batch-runner.sh',
