@@ -18,6 +18,7 @@
     "liveness": "node check-liveness.mjs",
     "scan": "node scan.mjs",
     "scan:full": "node scan-ats-full.mjs",
+    "validate:portals": "node validate-portals.mjs",
     "patterns": "node analyze-patterns.mjs",
     "gemini:eval": "node gemini-eval.mjs"
   },
