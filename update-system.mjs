@@ -72,6 +72,7 @@ const SYSTEM_PATHS = [
   'generate-cover-letter.mjs',
   'merge-tracker.mjs',
   'tracker-links.mjs',
+  'tracker.mjs',
   'verify-pipeline.mjs',
   'dedup-tracker.mjs',
   'normalize-statuses.mjs',
