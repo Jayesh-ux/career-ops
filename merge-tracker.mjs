@@ -21,6 +21,7 @@ import { execFileSync } from 'child_process';
 import { createHash, randomUUID } from 'crypto';
 import { tmpdir } from 'os';
 import { normalizeReportLink as normalizeLink } from './tracker-links.mjs';
+import { roleFuzzyMatch } from './role-matcher.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
 // Support both layouts: data/applications.md (boilerplate) and applications.md (original).
@@ -50,7 +51,17 @@ const TRACKER_LOCK_DIR = resolveTrackerLockDir(process.env.CAREER_OPS_TRACKER_LO
 // data/ layout (data/applications.md) and the tracker's own dir at root layout.
 const REPORTS_ROOT = basename(TRACKER_DIR) === 'data' ? dirname(TRACKER_DIR) : TRACKER_DIR;
 
-// Normalize a report link relative to the tracker file's own directory (#760).
+/**
+ * Normalize report links before writing them into the tracker file.
+ *
+ * TSV additions use root-relative report links so they are easy for agents to
+ * generate. The tracker may live either at `data/applications.md` or at the
+ * repository root, so this wrapper binds the correct tracker and reports
+ * directories before delegating to the shared link normalizer.
+ *
+ * @param {string} reportField - Raw report cell from a TSV addition.
+ * @returns {string} Markdown report link relative to the tracker file.
+ */
 const normalizeReportLink = (reportField) => normalizeLink(reportField, TRACKER_DIR, REPORTS_ROOT);
 
 // Ensure required directories exist (fresh setup)
@@ -323,6 +334,17 @@ try {
 // Canonical states and aliases
 const CANONICAL_STATES = ['Evaluated', 'Applied', 'Responded', 'Interview', 'Offer', 'Rejected', 'Discarded', 'SKIP'];
 
+/**
+ * Convert raw addition status text into one canonical tracker state.
+ *
+ * Batch workers and older tracker additions may emit Spanish labels, bold
+ * Markdown, legacy date suffixes, or repost markers. The merge script normalizes
+ * all of those variants here so applications.md keeps the states defined by
+ * templates/states.yml.
+ *
+ * @param {string} status - Raw status string from a TSV or pipe-delimited row.
+ * @returns {string} Canonical tracker status.
+ */
 function validateStatus(status) {
   const clean = status.replace(/\*\*/g, '').replace(/\s+\d{4}-\d{2}-\d{2}.*$/, '').trim();
   const lower = clean.toLowerCase();
@@ -354,102 +376,61 @@ function validateStatus(status) {
   return 'Evaluated';
 }
 
+/**
+ * Normalize company names for duplicate lookup during tracker merges.
+ *
+ * Company names can contain spaces, punctuation, or branding variants in the
+ * tracker and incoming TSV rows. Removing non-alphanumeric characters gives the
+ * merge step a stable same-company key before it compares report numbers or
+ * fuzzy role titles.
+ *
+ * @param {string} name - Company name from the tracker or addition row.
+ * @returns {string} Lowercase alphanumeric company key.
+ */
 function normalizeCompany(name) {
   return name.toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
-// Tokens that almost every role shares — must NOT count as signal.
-// Includes seniority, work-mode, contract, and common locations.
-const ROLE_STOPWORDS = new Set([
-  // seniority / level
-  'junior', 'mid', 'middle', 'senior', 'staff', 'principal', 'lead', 'head',
-  'chief', 'associate', 'intern', 'entry', 'level',
-  // contract / mode
-  'remote', 'hybrid', 'onsite', 'contract', 'contractor', 'freelance',
-  'fulltime', 'parttime', 'permanent', 'temporary', 'intern', 'internship',
-  // generic job words
-  'role', 'position', 'opportunity', 'team', 'based',
-  // very common locations (extend in portals.yml later if needed)
-  'bangalore', 'bengaluru', 'mumbai', 'delhi', 'hyderabad', 'pune', 'chennai',
-  'london', 'berlin', 'paris', 'madrid', 'barcelona', 'amsterdam', 'dublin',
-  'york', 'francisco', 'seattle', 'boston', 'austin', 'chicago', 'toronto',
-  'tokyo', 'singapore', 'sydney', 'melbourne', 'lisbon', 'warsaw',
-  // regions / countries
-  'europe', 'emea', 'apac', 'latam', 'americas', 'india', 'spain', 'germany',
-  'france', 'italy', 'canada', 'brazil', 'mexico', 'japan',
-  // prepositions leaking through length filter
-  'with', 'from', 'into', 'over', 'this', 'that',
-]);
-
-// Short specialty acronyms that ARE discriminating despite their length.
-// Without this allowlist, `length > 3` strips them out, leaving only the
-// generic "Software Engineer" baseline (see Issue #633).
-//
-// Deliberately narrow: includes tokens like 'api' / 'sre' / 'sdk' that name
-// a specific team or technology, and excludes broad ones like 'ai' / 'ml' /
-// 'llm' that appear across many roles (AI Engineer, ML Manager, etc.).
-// Adding the broad ones would regress #329's AI Success/Deployment case.
-const SHORT_SPECIALTY = new Set([
-  'api', 'sre', 'sdk', 'cli', 'gpu', 'cpu',
-  'ios', 'qa', 'ux', 'ui', 'ar', 'vr',
-  'ocr', 'crm', 'erp',
-]);
-
-// Generic role-level descriptors. Two roles whose ONLY overlap is in this
-// set (e.g. [software, engineer]) are NOT the same role — they're just
-// labelled at the same altitude. See Issue #633: "Staff SWE, API" vs
-// "Staff SWE, Kubernetes Platform" share [software, engineer] only.
-const BASELINE_TOKENS = new Set([
-  'software', 'engineer', 'developer', 'manager', 'architect',
-  'analyst', 'designer', 'consultant', 'specialist',
-  'platform', 'systems', 'services',
-  'backend', 'frontend', 'fullstack',
-]);
-
-function roleTokens(s) {
-  return s
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, ' ')
-    .split(/\s+/)
-    .filter(w => (w.length > 3 || SHORT_SPECIALTY.has(w)) && !ROLE_STOPWORDS.has(w));
-}
-
-function roleFuzzyMatch(a, b) {
-  const wordsA = roleTokens(a);
-  const wordsB = roleTokens(b);
-  if (wordsA.length === 0 || wordsB.length === 0) return false;
-
-  const setB = new Set(wordsB);
-  const overlap = wordsA.filter(w => setB.has(w));
-  if (overlap.length < 2) return false;
-
-  // Require at least one non-baseline token in the overlap. Roles that
-  // share only generic descriptors like [software, engineer] are NOT the
-  // same role (see Issue #633).
-  const discriminating = overlap.filter(w => !BASELINE_TOKENS.has(w));
-  if (discriminating.length === 0) return false;
-
-  // True Jaccard ratio on content tokens (overlap / union). Dividing by the
-  // smaller side conflated distinct roles that share a long prefix — e.g.
-  // "Full-Stack Engineer 5, AI Insights & Visualizations" vs "Full Stack
-  // Engineer 5, Ads Reporting" (overlap full/stack/engineer = 3, min side 4
-  // → 0.75 "match"). Union punishes the non-shared specialty tokens, while
-  // genuine reposts (identical token sets) still score 1.0.
-  const union = new Set([...wordsA, ...wordsB]).size;
-  const ratio = overlap.length / union;
-  return ratio >= 0.6;
-}
-
+/**
+ * Extract the bracketed report number from a Markdown report link.
+ *
+ * Report-number equality is an exact duplicate signal, but only after company
+ * equality is confirmed by the caller. This helper reads links such as
+ * `[123](../reports/123-company-role-date.md)` and returns the numeric id.
+ *
+ * @param {string} reportStr - Raw report cell from applications.md or TSV input.
+ * @returns {number|null} Parsed report number, or null when absent.
+ */
 function extractReportNum(reportStr) {
   const m = reportStr.match(/\[(\d+)\]/);
   return m ? parseInt(m[1]) : null;
 }
 
+/**
+ * Parse a score cell into a numeric value for score-upgrade decisions.
+ *
+ * The merge path compares old and new scores to decide whether to update an
+ * existing duplicate row. Markdown bolding and `/5` suffixes are presentation
+ * details, so only the first numeric value is used.
+ *
+ * @param {string} s - Raw score cell such as `4.2/5`.
+ * @returns {number} Parsed score, or 0 when no numeric value is present.
+ */
 function parseScore(s) {
   const m = s.replace(/\*\*/g, '').match(/([\d.]+)/);
   return m ? parseFloat(m[1]) : 0;
 }
 
+/**
+ * Parse one Markdown applications.md table row into a tracker object.
+ *
+ * Header/separator rows and malformed rows return null. Valid rows preserve the
+ * original raw line so the merge logic can locate and replace the exact tracker
+ * line when a higher-scored re-evaluation arrives.
+ *
+ * @param {string} line - One line from applications.md.
+ * @returns {object|null} Parsed tracker row, or null for non-data rows.
+ */
 function parseAppLine(line) {
   const parts = line.split('|').map(s => s.trim());
   if (parts.length < 9) return null;
@@ -464,7 +445,15 @@ function parseAppLine(line) {
 
 /**
  * Parse a TSV file content into a structured addition object.
- * Handles: 9-col TSV, 8-col TSV, pipe-delimited markdown.
+ *
+ * Handles 9-column TSV, 8-column TSV, and pipe-delimited Markdown rows. The
+ * parser also tolerates old score/status column ordering, validates status, and
+ * rejects additions without a usable tracker number so malformed batch output
+ * cannot corrupt applications.md.
+ *
+ * @param {string} content - Raw file content from batch/tracker-additions.
+ * @param {string} filename - Source filename used in warning messages.
+ * @returns {object|null} Parsed tracker addition, or null when malformed.
  */
 function parseTsvContent(content, filename) {
   content = content.trim();

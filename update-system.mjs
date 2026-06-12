@@ -75,6 +75,7 @@ const SYSTEM_PATHS = [
   'tracker.mjs',
   'verify-pipeline.mjs',
   'dedup-tracker.mjs',
+  'role-matcher.mjs',
   'normalize-statuses.mjs',
   'cv-sync-check.mjs',
   'update-system.mjs',
@@ -405,7 +406,7 @@ async function apply() {
     // Every release that adds a file imported by other system scripts MUST
     // append it here, or clients on older versions break on upgrade
     // (e.g. v1.8.x → v1.9.0: merge-tracker.mjs imports tracker-links.mjs).
-    const BOOTSTRAP_PATHS = ['.agents/', '.opencode/skills/', 'providers/', 'liveness-browser.mjs', 'tracker-links.mjs', 'scaffolder/', 'reserve-report-num.mjs', 'updater-migration-tests.mjs', 'validate-portals.mjs'];
+    const BOOTSTRAP_PATHS = ['.agents/', '.opencode/skills/', 'providers/', 'liveness-browser.mjs', 'tracker-links.mjs', 'role-matcher.mjs', 'scaffolder/', 'reserve-report-num.mjs', 'updater-migration-tests.mjs', 'validate-portals.mjs'];
     for (const path of BOOTSTRAP_PATHS) {
       if (SYSTEM_PATHS.includes(path)) continue; // already in main loop
       try {
