@@ -12,7 +12,7 @@
  */
 
 import { execSync, execFileSync, spawn } from 'child_process';
-import { readFileSync, existsSync, readdirSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
+import { readFileSync, existsSync, readdirSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from 'fs';
 import { join, dirname } from 'path';
 import { tmpdir } from 'os';
 import { fileURLToPath, pathToFileURL } from 'url';
@@ -348,11 +348,12 @@ console.log('\n5. Data contract validation');
 
 // Check system files exist
 const systemFiles = [
-  'CLAUDE.md', 'VERSION', 'DATA_CONTRACT.md',
+  'CLAUDE.md', 'OPENCODE.md', 'VERSION', 'DATA_CONTRACT.md',
   'modes/_shared.md', 'modes/_profile.template.md',
   'modes/oferta.md', 'modes/pdf.md', 'modes/scan.md',
   'templates/states.yml', 'templates/cv-template.html',
   '.claude/skills/career-ops/SKILL.md',
+  '.opencode/skills/career-ops/SKILL.md',
 ];
 
 for (const f of systemFiles) {
@@ -727,9 +728,69 @@ for (const section of requiredSections) {
   }
 }
 
-// ── 11. VERSION FILE ─────────────────────────────────────────────
+// ── 11. CLI WRAPPER FILE INTEGRITY ──────────────────────────
 
-console.log('\n11. Version file');
+console.log('\n11. CLI wrapper file integrity');
+
+const cliWrappers = ['CLAUDE.md', 'OPENCODE.md', 'GEMINI.md'];
+for (const f of cliWrappers) {
+  if (!fileExists(f)) {
+    fail(`Missing CLI wrapper: ${f}`);
+    continue;
+  }
+  const content = readFile(f);
+  if (content.includes('AGENTS.md')) {
+    pass(`${f} references AGENTS.md`);
+  } else {
+    fail(`${f} does NOT reference AGENTS.md`);
+  }
+}
+
+// ── 12. SKILL SYMLINK INTEGRITY ─────────────────────────────
+
+console.log('\n12. Skill symlink integrity');
+
+const canonicalSkill = '.agents/skills/career-ops/SKILL.md';
+const symlinks = [
+  '.claude/skills/career-ops/SKILL.md',
+  '.opencode/skills/career-ops/SKILL.md',
+];
+
+let canonicalReal = null;
+try {
+  canonicalReal = realpathSync(join(ROOT, canonicalSkill));
+  pass(`Canonical skill resolves: ${canonicalSkill}`);
+} catch {
+  fail(`Canonical skill not found: ${canonicalSkill}`);
+}
+
+for (const link of symlinks) {
+  let resolved = null;
+  let target = null;
+  try {
+    target = realpathSync(join(ROOT, link));
+  } catch {
+    target = null;
+  }
+  if (target === null) {
+    fail(`Symlink missing: ${link}`);
+    continue;
+  }
+  try {
+    resolved = realpathSync(join(ROOT, link));
+  } catch {
+    resolved = null;
+  }
+  if (resolved === canonicalReal) {
+    pass(`${link} → canonical skill`);
+  } else {
+    fail(`${link} resolves to ${resolved}, expected ${canonicalReal}`);
+  }
+}
+
+// ── 14. VERSION FILE ─────────────────────────────────────────────
+
+console.log('\n14. Version file');
 
 if (fileExists('VERSION')) {
   // VERSION may carry a release-please marker, e.g. "1.9.0 # x-release-please-version".
@@ -744,9 +805,9 @@ if (fileExists('VERSION')) {
   fail('VERSION file missing');
 }
 
-// ── 11. LOCATION FILTER — always_allow tier ───────────────────────
+// ── 15. LOCATION FILTER — always_allow tier ───────────────────────
 
-console.log('\n11. Location filter — always_allow tier');
+console.log('\n15. Location filter — always_allow tier');
 
 try {
   const { buildLocationFilter, shouldDedupScanHistoryRow } = await import(pathToFileURL(join(ROOT, 'scan.mjs')).href);
