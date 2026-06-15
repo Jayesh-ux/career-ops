@@ -51,11 +51,13 @@ const SYSTEM_PATHS = [
   'modes/project.md',
   'modes/tracker.md',
   'modes/training.md',
+  'modes/interview.md',
   'modes/latex.md',
   'modes/followup.md',
   'modes/interview-prep.md',
   'modes/patterns.md',
   'modes/update.md',
+  'modes/ar/',
   'modes/de/',
   'modes/fr/',
   'modes/ja/',
@@ -92,6 +94,7 @@ const SYSTEM_PATHS = [
   'gemini-eval.mjs',
   'test-all.mjs',
   'test-salary-filter.mjs',
+  'tracker-columns-tests.mjs',
   'validate-portals.mjs',
   'updater-migration-tests.mjs',
   'batch/batch-prompt.md',
@@ -114,6 +117,7 @@ const SYSTEM_PATHS = [
   'DATA_CONTRACT.md',
   'CONTRIBUTING.md',
   'README.md',
+  'README.ar.md',
   'README.cn.md',
   'README.es.md',
   'README.fr.md',
@@ -449,7 +453,7 @@ async function apply() {
 
     // 3a. Keep bootstrap paths as a fallback for very old targets, but the
     // target updater's SYSTEM_PATHS is now the source of truth for new files.
-    const BOOTSTRAP_PATHS = ['.agents/', '.opencode/skills/', 'providers/', 'liveness-browser.mjs', 'tracker-links.mjs', 'role-matcher.mjs', 'scaffolder/', 'reserve-report-num.mjs', 'updater-migration-tests.mjs', 'validate-portals.mjs'];
+    const BOOTSTRAP_PATHS = ['.agents/', '.opencode/skills/', 'providers/', 'liveness-browser.mjs', 'tracker-links.mjs', 'role-matcher.mjs', 'scaffolder/', 'reserve-report-num.mjs', 'updater-migration-tests.mjs', 'validate-portals.mjs', 'tracker-columns-tests.mjs'];
     const updatePaths = mergePathLists(SYSTEM_PATHS, remoteSystemPaths, BOOTSTRAP_PATHS);
 
     for (const path of updatePaths) {
