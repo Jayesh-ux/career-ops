@@ -146,14 +146,15 @@ console.log('\n2. Script execution (graceful on empty data)');
 const scripts = [
   { name: 'cv-sync-check.mjs', expectExit: 1, allowFail: true }, // fails without cv.md (normal in repo)
   { name: 'verify-pipeline.mjs', expectExit: 0 },
-  // --dry-run: these three scripts resolve ROOT from import.meta.url and write
-  // data/applications.md in place. On a provisioned working copy with a real
-  // tracker present, running them without --dry-run mutates user data. Harmless
-  // in this repo (no tracker shipped), risky for end users who run tests inside
-  // their active career-ops workspace.
+  // --dry-run: these scripts resolve ROOT from import.meta.url and write
+  // data/applications.md (or data/pipeline.md) in place. On a provisioned working
+  // copy with a real tracker present, running them without --dry-run mutates user
+  // data. Harmless in this repo (no tracker shipped), risky for end users who run
+  // tests inside their active career-ops workspace.
   { name: 'normalize-statuses.mjs --dry-run', expectExit: 0 },
   { name: 'dedup-tracker.mjs --dry-run', expectExit: 0 },
   { name: 'merge-tracker.mjs --dry-run', expectExit: 0 },
+  { name: 'reconcile-pipeline.mjs --dry-run', expectExit: 0 },
   { name: 'analyze-patterns.mjs --self-test', expectExit: 0 },
   { name: 'updater-migration-tests.mjs', expectExit: 0 },
   { name: 'tracker-columns-tests.mjs', expectExit: 0 },

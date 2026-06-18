@@ -76,6 +76,7 @@ const SYSTEM_PATHS = [
   'tracker-links.mjs',
   'tracker.mjs',
   'verify-pipeline.mjs',
+  'reconcile-pipeline.mjs',
   'dedup-tracker.mjs',
   'role-matcher.mjs',
   'normalize-statuses.mjs',
