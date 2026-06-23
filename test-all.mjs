@@ -2182,6 +2182,13 @@ try {
     fail(`non-report link altered: ${other}`);
   }
 
+  const pipelineProcessed = normalizeReportLink('[12](reports/012-acme-2026-01-04.md)', join(repo, 'data'), repo);
+  if (pipelineProcessed === '[12](../reports/012-acme-2026-01-04.md)') {
+    pass('pipeline processed links are relative to data/pipeline.md (#1126)');
+  } else {
+    fail(`pipeline processed link normalization wrong (#1126): ${pipelineProcessed}`);
+  }
+
   // End-to-end migration against a fictional fixture tracker (no personal data)
   const tmpDir = mkdtempSync(join(tmpdir(), 'career-ops-migrate-'));
   try {
@@ -2205,6 +2212,30 @@ try {
     }
   } finally {
     rmSync(tmpDir, { recursive: true, force: true });
+  }
+
+  const { resolveReportPath } = await import(pathToFileURL(join(ROOT, 'followup-cadence.mjs')).href);
+  const followupTmp = mkdtempSync(join(tmpdir(), 'career-ops-followup-link-'));
+  try {
+    mkdirSync(join(followupTmp, 'data'), { recursive: true });
+    mkdirSync(join(followupTmp, 'reports'), { recursive: true });
+    const reportFile = join(followupTmp, 'reports', '012-acme-2026-01-04.md');
+    writeFileSync(reportFile, '# fixture\n');
+    const appsFile = join(followupTmp, 'data', 'applications.md');
+    const resolved = resolveReportPath('[12](../reports/012-acme-2026-01-04.md)', appsFile, followupTmp);
+    if (resolved === 'reports/012-acme-2026-01-04.md') {
+      pass('follow-up reportPath is repo-root relative for data/ tracker links (#1126)');
+    } else {
+      fail(`follow-up reportPath wrong (#1126): ${resolved}`);
+    }
+    const escaped = resolveReportPath('[99](../../outside.md)', appsFile, followupTmp);
+    if (escaped === null) {
+      pass('follow-up reportPath rejects links outside reports/ (#1126)');
+    } else {
+      fail(`follow-up reportPath allowed escaped link (#1126): ${escaped}`);
+    }
+  } finally {
+    rmSync(followupTmp, { recursive: true, force: true });
   }
 } catch (e) {
   fail(`tracker-link normalization tests crashed: ${e.message}`);
