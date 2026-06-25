@@ -54,6 +54,7 @@ These files contain system logic, scripts, templates, and instructions that impr
 | `modes/pl/*` | Polish language modes |
 | `modes/pt/*` | Portuguese language modes |
 | `modes/ru/*` | Russian language modes |
+| `modes/heuristics/*` | Shared candidate-facing application heuristics |
 | `CLAUDE.md` | Agent instructions (Claude Code) |
 | `OPENCODE.md` | Agent instructions (OpenCode) |
 | `GEMINI.md` | Legacy no-op context guard (prevents Antigravity duplicate imports) |

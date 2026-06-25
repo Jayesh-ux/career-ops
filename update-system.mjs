@@ -67,6 +67,7 @@ const SYSTEM_PATHS = [
   'modes/ru/',
   'modes/tr/',
   'modes/ua/',
+  'modes/heuristics/',
   'CLAUDE.md',
   'OPENCODE.md',
   'AGENTS.md',
