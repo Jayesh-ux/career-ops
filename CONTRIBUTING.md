@@ -4,9 +4,11 @@ Thanks for your interest in contributing! Career-Ops is built with Claude Code, 
 
 ## Before Submitting a PR
 
-**Please open an issue first to discuss the change you'd like to make.** This helps us align on direction before you invest time coding.
+**For a new feature, a new mode or command, or an architecture change, please open an issue first.** It saves you from investing time in something we'd have to redirect, and lets us align on direction before you write code.
 
-PRs without a corresponding issue may be closed if they don't align with the project's architecture or goals.
+**Going straight to a PR is welcome — no issue needed — for:** bug fixes, new zero-auth scanner providers, docs, and translations. Don't let process slow these down; these are the contributions we most want.
+
+A large *feature* PR that skipped this step may be asked to start with an issue if it doesn't fit the architecture or roadmap — that's a scope conversation, never a judgment on your work.
 
 ### What makes a good PR
 - Fixes a bug listed in Issues
