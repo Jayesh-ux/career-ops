@@ -496,7 +496,13 @@ export function formatPipelineOffer(offer) {
   const url = sanitizePipelineUrl(offer.url);
   const company = sanitizeMarkdownField(offer.company);
   const title = sanitizeMarkdownField(offer.title);
-  return `- [ ] ${url} | ${company} | ${title}`;
+  // Location is appended as an optional 4th pipe-delimited column when the ATS
+  // exposes it (sanitized like every other field). Offers without a location
+  // keep the original 3-column form, which downstream readers treat as empty;
+  // loadSeenUrls dedups on the URL and ignores trailing columns (backward-compatible).
+  const location = sanitizeMarkdownField(offer.location);
+  const base = `- [ ] ${url} | ${company} | ${title}`;
+  return location ? `${base} | ${location}` : base;
 }
 
 export function formatScanHistoryRow(offer, date, status = 'added') {

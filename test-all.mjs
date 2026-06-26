@@ -758,6 +758,27 @@ if (fileExists('providers/local-parser.mjs')) {
   fail('local-parser provider module is missing');
 }
 
+// pipeline.md location column (B1): formatPipelineOffer appends location as a
+// 4th pipe-delimited column when present, and degrades to the original 3-column
+// form when the ATS exposes no location.
+try {
+  const { formatPipelineOffer } = await import(pathToFileURL(join(ROOT, 'scan.mjs')).href);
+  const withLoc = formatPipelineOffer({ url: 'https://x/1', company: 'Acme', title: 'SA', location: 'Remote (US)' });
+  const noLoc = formatPipelineOffer({ url: 'https://x/2', company: 'BigCo', title: 'PM' });
+  const blankLoc = formatPipelineOffer({ url: 'https://x/3', company: 'Co', title: 'Eng', location: '   ' });
+  if (
+    withLoc === '- [ ] https://x/1 | Acme | SA | Remote (US)' &&
+    noLoc === '- [ ] https://x/2 | BigCo | PM' &&
+    blankLoc === '- [ ] https://x/3 | Co | Eng'
+  ) {
+    pass('scan.mjs formatPipelineOffer appends location column (degrades to 3 cols when absent)');
+  } else {
+    fail(`scan.mjs formatPipelineOffer location column wrong: "${withLoc}" / "${noLoc}" / "${blankLoc}"`);
+  }
+} catch (err) {
+  fail(`scan.mjs formatPipelineOffer import failed: ${err.message}`);
+}
+
 const scanMode = fileExists('modes/scan.md') ? readFile('modes/scan.md') : '';
 if (
   scanMode.includes('local_parser_ok') &&
@@ -1567,15 +1588,16 @@ try {
   const pipelineFields = pipelineRow.split('|').map(part => part.trim());
   if (
     pendingLines.length === 1 &&
-    pipelineFields.length === 3 &&
+    pipelineFields.length === 4 &&
     pipelineFields[0] === '- [ ] https://jobs.example.com/123%7Cevil' &&
+    pipelineFields[3] === '@Remote EU' &&
     !pipelineRow.includes('\n') &&
     !pipelineRow.includes('\t') &&
     !pipelineRow.includes('\\|') &&
     pipelineRow.includes('=ACME\\\\Corp / R&D') &&
     pipelineRow.includes('- \\[ \\] https://evil.example/job / EvilCorp / Injected')
   ) {
-    pass('scan pipeline writer preserves row shape without injected checkboxes or extra pipes');
+    pass('scan pipeline writer preserves row shape (optional location 4th col) without injected checkboxes or extra pipes');
   } else {
     fail(`scan pipeline metadata sanitizer produced unsafe row: ${pipelineRow}`);
   }
