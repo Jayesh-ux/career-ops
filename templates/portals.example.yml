@@ -498,6 +498,7 @@ search_queries:
 #
 # Some providers are job boards / aggregators with no per-company careers
 # URL to detect, so they must be selected with an explicit `provider:`
+# field: arbeitsagentur, glints, jobstreet, ibm, jobicy, remoteok, remotive,
 # field: arbeitsagentur, glints, himalayas, jobstreet, ibm, remoteok, remotive,
 # field: arbeitsagentur, glints, jobstreet, ibm, remoteok, remotive, thehub,
 # weworkremotely, workingnomads. Examples for every built-in provider are below.
@@ -594,6 +595,10 @@ search_queries:
 #
 # - name: Working Nomads
 #   provider: workingnomads
+#   enabled: true
+#
+# - name: Jobicy
+#   provider: jobicy
 #   enabled: true
 #
 # Comeet needs the full careers-api URL (it carries a per-tenant token that a
