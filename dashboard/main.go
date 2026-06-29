@@ -95,6 +95,15 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = viewPipeline
 		return m, nil
 
+	case screens.ViewerOpenCoverLetterMsg:
+		path := msg.Path
+		return m, func() tea.Msg {
+			if err := openWithDefaultApp(path); err != nil {
+				fmt.Fprintf(os.Stderr, "WARN: could not open cover letter: %v\n", err)
+			}
+			return nil
+		}
+
 	case screens.ViewerUpdateStatusMsg:
 		err := data.UpdateApplicationStatus(m.careerOpsPath, msg.App, msg.NewStatus)
 		if err != nil {
