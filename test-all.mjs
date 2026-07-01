@@ -446,16 +446,28 @@ try {
 if (!QUICK) {
   console.log('\n4. Dashboard build');
   const isWindows = process.platform === 'win32';
-  const outPath = isWindows ? 'career-dashboard-test.exe' : '/tmp/career-dashboard-test';
-  const goBuild = run(`cd dashboard && go build -o ${outPath} . 2>&1`);
+  const dashboardBuildTmp = mkdtempSync(join(tmpdir(), 'career-dashboard-build-'));
+  const outPath = join(dashboardBuildTmp, isWindows ? 'career-dashboard-test.exe' : 'career-dashboard-test');
+  const goEnv = { ...process.env };
+  if (isWindows && !goEnv.GOCACHE) {
+    goEnv.GOCACHE = join(tmpdir(), 'career-ops-go-build-cache');
+  }
+  if (goEnv.GOCACHE) {
+    try { mkdirSync(goEnv.GOCACHE, { recursive: true }); } catch (e) {}
+  }
+  const goBuild = run('go', ['build', '-o', outPath, '.'], {
+    cwd: join(ROOT, 'dashboard'),
+    env: goEnv,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    timeout: 60000,
+  });
   if (goBuild !== null) {
     pass('Dashboard compiles');
-    if (isWindows) {
-      try { rmSync(join(ROOT, 'dashboard', 'career-dashboard-test.exe'), { force: true }); } catch (e) {}
-    }
+    try { rmSync(outPath, { force: true }); } catch (e) {}
   } else {
     fail('Dashboard build failed');
   }
+  try { rmSync(dashboardBuildTmp, { recursive: true, force: true }); } catch (e) {}
 } else {
   console.log('\n4. Dashboard build (skipped --quick)');
 }
@@ -632,11 +644,48 @@ if (!/waitUntil:\s*['"]networkidle['"]/.test(generatePdfScript)) {
 } else {
   fail('generate-pdf still waits for networkidle');
 }
-const renderHtmlToPdfCall = generatePdfScript.match(/renderHtmlToPdf\(html,\s*outputPath,\s*\{([\s\S]*?)\}\)/);
-if (renderHtmlToPdfCall && /\breportNum\b/.test(renderHtmlToPdfCall[1]) && /\binputPath\b/.test(renderHtmlToPdfCall[1])) {
+
+function extractRenderHtmlToPdfOptions(source) {
+  const call = /renderHtmlToPdf\s*\(\s*html\s*,\s*outputPath\s*,/g.exec(source);
+  if (!call) return '';
+  const objectStart = source.indexOf('{', call.index + call[0].length);
+  if (objectStart === -1) return '';
+
+  let depth = 0;
+  let quote = '';
+  let escaped = false;
+  for (let i = objectStart; i < source.length; i += 1) {
+    const ch = source[i];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === quote) quote = '';
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      quote = ch;
+      continue;
+    }
+    if (ch === '{') depth += 1;
+    else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) return source.slice(objectStart + 1, i);
+    }
+  }
+  return '';
+}
+
+const renderHtmlToPdfOptions = extractRenderHtmlToPdfOptions(generatePdfScript);
+if (renderHtmlToPdfOptions && /\breportNum\b/.test(renderHtmlToPdfOptions) && /\binputPath\b/.test(renderHtmlToPdfOptions)) {
   pass('generate-pdf threads reportNum/inputPath into renderHtmlToPdf');
 } else {
   fail('generate-pdf does not pass reportNum/inputPath into renderHtmlToPdf');
+}
+const nestedRenderOptions = extractRenderHtmlToPdfOptions('return renderHtmlToPdf(html, outputPath, { format, metadata: { reportNum, inputPath } });');
+if (/\breportNum\b/.test(nestedRenderOptions) && /\binputPath\b/.test(nestedRenderOptions)) {
+  pass('generate-pdf renderHtmlToPdf option matcher handles nested object literals');
+} else {
+  fail('generate-pdf renderHtmlToPdf option matcher fails on nested object literals');
 }
 if (generatePdfScript.includes('opts.reportNum') && generatePdfScript.includes('opts.inputPath')) {
   pass('renderHtmlToPdf reads manifest metadata from opts');
@@ -738,6 +787,120 @@ if (
   pass('apply mode includes liveness and role-match preflight gate');
 } else {
   fail('apply mode missing liveness/role-match preflight gate');
+}
+
+if (
+  applyMode.includes('## Application Answers') &&
+  applyMode.includes('**State:** filled') &&
+  applyMode.includes('**State:** submitted') &&
+  applyMode.includes('Do not rename, reorder, or edit the existing A-H report blocks') &&
+  applyMode.includes('application-answers.mjs')
+) {
+  pass('apply mode persists filled/submitted answers in an additive report section');
+} else {
+  fail('apply mode missing additive Application Answers persistence instructions');
+}
+
+try {
+  const {
+    formatApplicationAnswersSection,
+    upsertApplicationAnswersSection,
+  } = await import(pathToFileURL(join(ROOT, 'application-answers.mjs')).href);
+
+  const snapshot = {
+    date: '2026-06-30',
+    state: 'submitted',
+    freeText: [
+      { question: 'Why this role?', answer: 'I want to apply production AI agent experience here.' },
+    ],
+    selections: [
+      { field: 'Technical areas', selected: ['Node.js', 'Go', 'LLM evaluation'] },
+    ],
+    fieldValues: [
+      { field: 'Compensation expectation', value: '$150k base' },
+    ],
+    files: [
+      { field: 'CV', path: 'output/acme-cv.pdf', version: 'v3' },
+      { field: 'Cover letter', path: 'output/acme-cover-letter.pdf' },
+    ],
+  };
+
+  const section = formatApplicationAnswersSection(snapshot);
+  if (
+    section.includes('## Application Answers') &&
+    section.includes('**Date:** 2026-06-30') &&
+    section.includes('**State:** submitted') &&
+    section.includes('Why this role?') &&
+    section.includes('Node.js, Go, LLM evaluation') &&
+    section.includes('Compensation expectation') &&
+    section.includes('output/acme-cv.pdf (v3)')
+  ) {
+    pass('application answers formatter captures free text, selections, field values, files, date, and state');
+  } else {
+    fail(`application answers formatter dropped expected data:\n${section}`);
+  }
+
+  const report = [
+    '# Evaluation: Acme - Staff Engineer',
+    '',
+    '## G) Posting Legitimacy',
+    'original G content',
+    '',
+    '## H) Draft Application Answers',
+    'draft H content',
+    '',
+    '## Keywords extracted',
+    'agentic systems, node, go',
+    '',
+  ].join('\n');
+  const updated = upsertApplicationAnswersSection(report, snapshot);
+  const existingBlocksPreserved =
+    updated.includes('## G) Posting Legitimacy\noriginal G content') &&
+    updated.includes('## H) Draft Application Answers\ndraft H content') &&
+    updated.includes('## Keywords extracted\nagentic systems, node, go');
+  const existingOrderPreserved =
+    updated.indexOf('## G) Posting Legitimacy') < updated.indexOf('## H) Draft Application Answers') &&
+    updated.indexOf('## H) Draft Application Answers') < updated.indexOf('## Keywords extracted') &&
+    updated.indexOf('## Keywords extracted') < updated.indexOf('## Application Answers');
+  if (existingBlocksPreserved && existingOrderPreserved) {
+    pass('application answers upsert appends without changing existing report blocks');
+  } else {
+    fail(`application answers upsert disturbed report blocks:\n${updated}`);
+  }
+
+  const refreshed = upsertApplicationAnswersSection([
+    report.trimEnd(),
+    '',
+    '## Application Answers',
+    '',
+    'old filled snapshot',
+    '',
+    '## Later Additive Section',
+    'later content',
+    '',
+  ].join('\n'), snapshot);
+  const applicationAnswerHeadings = refreshed.match(/^## Application Answers$/gm) || [];
+  if (
+    applicationAnswerHeadings.length === 1 &&
+    !refreshed.includes('old filled snapshot') &&
+    refreshed.includes('## Later Additive Section\nlater content') &&
+    refreshed.indexOf('## Application Answers') < refreshed.indexOf('## Later Additive Section')
+  ) {
+    pass('application answers upsert refreshes only the existing Application Answers section');
+  } else {
+    fail(`application answers upsert did not replace only its own section:\n${refreshed}`);
+  }
+} catch (e) {
+  fail(`application answers helper crashed: ${e.message}`);
+}
+
+if (
+  run(NODE, ['application-answers.mjs', '--report', '--input'], { stdio: ['pipe', 'pipe', 'pipe'] }) === null &&
+  run(NODE, ['application-answers.mjs', '--report', '--input', 'answers.json'], { stdio: ['pipe', 'pipe', 'pipe'] }) === null
+) {
+  pass('application-answers CLI rejects missing option values');
+} else {
+  fail('application-answers CLI accepted a missing option value');
 }
 
 const ofertaMode = readFile('modes/oferta.md');
@@ -8267,12 +8430,14 @@ console.log('\n49. Plugin engine (contract + sandbox + firewall)');
 
 const __origWarn = console.warn;
 let __pluginTmp = null;
+let __manifestTmp = null;
 try {
   const eng = await import(pathToFileURL(join(ROOT, 'plugins/_engine.mjs')).href);
   const { validateManifest, discoverPlugins, pluginRoots, buildCtx, mergeProviderPlugins } = eng;
 
   const base = { id: 'x', apiVersion: 1, description: 'one line', hooks: ['ingest'], requiredEnv: [], allowedHosts: [], humanInTheLoop: true };
-  const vm = (m, dirName = 'x') => validateManifest(m, join('/tmp', dirName), dirName);
+  __manifestTmp = mkdtempSync(join(tmpdir(), 'co-plugin-manifest-'));
+  const vm = (m, dirName = 'x') => validateManifest(m, join(__manifestTmp, dirName), dirName);
 
   // Manifest validation (warnings are expected here — suppress to keep output clean).
   console.warn = () => {};
@@ -8567,6 +8732,7 @@ try {
 } finally {
   console.warn = __origWarn;
   if (__pluginTmp) { try { rmSync(__pluginTmp, { recursive: true, force: true }); } catch {} }
+  if (__manifestTmp) { try { rmSync(__manifestTmp, { recursive: true, force: true }); } catch {} }
 }
 
 // ── SUMMARY ─────────────────────────────────────────────────────
