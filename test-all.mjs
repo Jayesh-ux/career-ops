@@ -3537,6 +3537,72 @@ try {
   fail(`tracker-parse unit test crashed: ${e.message}`);
 }
 
+// #1431 "Apply to #13" is ambiguous: report numbers and tracker row numbers
+// diverge, and mapping company ↔ report# ↔ tracker# ↔ PDF used to require
+// opening three files. find.mjs resolves a report#, tracker#, or company/role
+// fragment to the full pipeline identity in one read-only lookup.
+console.log('\n🧪 Testing find.mjs pipeline identity lookup...');
+try {
+  const { parseTrackerRows, parsePdfIndex, findMatches } = await import(pathToFileURL(join(ROOT, 'find.mjs')).href);
+
+  // Tracker# and report# intentionally diverge: row 3 carries report 12, and a
+  // different row is numbered 12 — the exact friction the tool exists to solve.
+  const rows = parseTrackerRows([
+    '| # | Date | Company | Role | Score | Status | PDF | Report | Notes |',
+    '|---|------|---------|------|-------|--------|-----|--------|-------|',
+    '| 3 | 2026-06-01 | Acme Labs | Platform Engineer | 4.2/5 | **Applied** (2026-06-02) | ✅ | [12](reports/012-acme-labs-2026-06-01.md) | strong fit |',
+    '| 12 | 2026-06-10 | Globex | Data Engineer | 3.8/5 | Evaluated | ❌ | [15](reports/015-globex-2026-06-10.md) | — |',
+  ].join('\n'));
+  const pdfIndex = parsePdfIndex(
+    '# report\tpdf\thtml\tformat\tdate — written by generate-pdf.mjs, do not edit\n' +
+    '012\toutput/cv-acme-labs.pdf\toutput/cv-acme-labs.html\tats\t2026-06-01\n');
+
+  const byTracker = findMatches(rows, '3', pdfIndex);
+  if (byTracker.length === 1 && byTracker[0].company === 'Acme Labs' &&
+      byTracker[0].trackerNum === 3 && byTracker[0].reportNum === '12' &&
+      byTracker[0].reportPath === 'reports/012-acme-labs-2026-06-01.md' &&
+      byTracker[0].status === 'Applied' &&
+      byTracker[0].pdfPath === 'output/cv-acme-labs.pdf') {
+    pass('find.mjs resolves a tracker# to company, report#, canonical status, and PDF path');
+  } else {
+    fail(`find.mjs tracker# lookup wrong: ${JSON.stringify(byTracker)}`);
+  }
+
+  // "12" is both Acme's report# and Globex's tracker# — both rows must surface
+  // (with the zero-padded "012" report-link form treated as the same number).
+  const ambiguous = findMatches(rows, '012', pdfIndex);
+  const companies = ambiguous.map(m => m.company).sort();
+  if (ambiguous.length === 2 && companies[0] === 'Acme Labs' && companies[1] === 'Globex') {
+    pass('find.mjs surfaces report#/tracker# collisions as multiple matches (zero-pad normalized)');
+  } else {
+    fail(`find.mjs numeric collision lookup wrong: ${JSON.stringify(ambiguous)}`);
+  }
+
+  const byFragment = findMatches(rows, 'acme', pdfIndex);
+  if (byFragment.length === 1 && byFragment[0].company === 'Acme Labs') {
+    pass('find.mjs matches a case-insensitive company fragment');
+  } else {
+    fail(`find.mjs company fragment lookup wrong: ${JSON.stringify(byFragment)}`);
+  }
+
+  // Fuzzy multi-word lookup reuses role-matcher.mjs (stopwords like "remote"
+  // dropped) instead of reinventing matching.
+  const byFuzzy = findMatches(rows, 'remote data engineer', pdfIndex);
+  if (byFuzzy.length === 1 && byFuzzy[0].company === 'Globex' && byFuzzy[0].pdfPath === null) {
+    pass('find.mjs fuzzy-matches a role phrase via role-matcher and reports a missing PDF');
+  } else {
+    fail(`find.mjs fuzzy role lookup wrong: ${JSON.stringify(byFuzzy)}`);
+  }
+
+  if (findMatches(rows, 'no-such-company', pdfIndex).length === 0) {
+    pass('find.mjs returns zero matches cleanly for an unknown query');
+  } else {
+    fail('find.mjs matched a query that exists nowhere in the tracker');
+  }
+} catch (e) {
+  fail(`find.mjs unit test crashed: ${e.message}`);
+}
+
 // dedup-tracker reads AND writes by column; with a Location column its status
 // promotion must target the Status cell, not fixed parts[6].
 console.log('\n🧪 Testing dedup-tracker with an inserted Location column...');

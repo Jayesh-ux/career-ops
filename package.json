@@ -30,6 +30,7 @@
     "validate:portals": "node validate-portals.mjs",
     "verify:portals": "node verify-portals.mjs",
     "tracker": "node tracker.mjs",
+    "find": "node find.mjs",
     "patterns": "node analyze-patterns.mjs",
     "reposts": "node detect-reposts.mjs",
     "gemini:eval": "node gemini-eval.mjs",
