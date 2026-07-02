@@ -26,6 +26,7 @@
 * **dashboard:** map tracker columns by header name ([#1327](https://github.com/santifer/career-ops/issues/1327)) ([#1328](https://github.com/santifer/career-ops/issues/1328)) ([8257f69](https://github.com/santifer/career-ops/commit/8257f697ef0c0d5b9e0804344cb0275c80075059))
 * **followup-cadence:** schedule first responded follow-up with responded_initial ([#1352](https://github.com/santifer/career-ops/issues/1352)) ([e30dd0b](https://github.com/santifer/career-ops/commit/e30dd0b3ec3a360dfa3d68f81f845c0269a8cf9a))
 * **liveness:** add Ashby API rung so live jobs.ashbyhq.com postings aren't false-expired ([#1372](https://github.com/santifer/career-ops/issues/1372)) ([b7bc6f3](https://github.com/santifer/career-ops/commit/b7bc6f38497ff423de3865f6ad729b0f511a8adf))
+* **pdf:** anchor the output path-traversal guard to the repo root, not cwd ([5ba3c83](https://github.com/santifer/career-ops/commit/5ba3c83))
 * **pdf:** keep a right gutter so right-aligned CV content isn't clipped ([#1341](https://github.com/santifer/career-ops/issues/1341)) ([#1351](https://github.com/santifer/career-ops/issues/1351)) ([37c0703](https://github.com/santifer/career-ops/commit/37c07033de3cf872a9f40cc2ca33f400a1192db7))
 * **pdf:** thread manifest metadata through render options ([#1367](https://github.com/santifer/career-ops/issues/1367)) ([c7e2439](https://github.com/santifer/career-ops/commit/c7e2439c1b7d2a031900404439dc2d27d93f1f88))
 
