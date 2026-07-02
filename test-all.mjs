@@ -9013,6 +9013,14 @@ try {
   if (importOk) pass('every bundled plugin entry imports cleanly with a default hook export');
   else fail('a bundled plugin failed to import or lacks a default export');
 
+  const notionMod = await import(pathToFileURL(join(ROOT, 'plugins', 'notion', 'index.mjs')).href);
+  const notionParseScore = notionMod.parseScore || notionMod.default?.parseScore;
+  if (typeof notionParseScore === 'function' && notionParseScore('4.2/5') === 4.2 && notionParseScore('5/5') === 5 && notionParseScore('**4.2/5**') === 4.2) {
+    pass('notion plugin parseScore sanitizes slash-formatted scores cleanly (4.2/5 -> 4.2, 5/5 -> 5) (#1414)');
+  } else {
+    fail(`notion plugin parseScore broken: 4.2/5 -> ${notionParseScore?.('4.2/5')}, 5/5 -> ${notionParseScore?.('5/5')}`);
+  }
+
   // Recursively collect every .mjs under plugins/ (the deny-list must not be flat-only).
   const allPluginMjs = [];
   const walkMjs = (d) => {
