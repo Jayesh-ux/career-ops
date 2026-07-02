@@ -118,6 +118,7 @@ const SYSTEM_PATHS = [
   'analyze-patterns.mjs',
   'detect-reposts.mjs',
   'followup-cadence.mjs',
+  'followup-cadence.test.mjs',
   'gemini-eval.mjs',
   'ollama-eval.mjs',
   'openai-eval.mjs',
