@@ -5993,6 +5993,14 @@ try {
     fail('modes/_custom.md is NOT in USER_PATHS — custom instructions would be wiped on update (#1198)');
   }
 
+  // .claude/settings.json holds user-configured permissions and hooks (e.g. auto-backup).
+  // It must be in USER_PATHS so the updater never overwrites it (#1408).
+  if (userBlock.includes("'.claude/settings.json'")) {
+    pass('.claude/settings.json is in USER_PATHS (user harness config protected from update-system.mjs)');
+  } else {
+    fail('.claude/settings.json is NOT in USER_PATHS — user harness config would be wiped on update (#1408)');
+  }
+
   // The template MUST be in SYSTEM_PATHS so updates deliver/refresh it.
   const sysBlock = (updater.match(/SYSTEM_PATHS\s*=\s*\[([\s\S]*?)\]/) || [, ''])[1];
   if (sysBlock.includes("'modes/_custom.template.md'")) {
