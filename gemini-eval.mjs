@@ -122,6 +122,73 @@ for (let i = 0; i < args.length; i++) {
   }
 }
 
+function assertSafeRemoteUrl(url) {
+  let u;
+  try { u = new URL(url); } catch { throw new Error(`Invalid URL: ${url}`); }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') {
+    throw new Error(`Refusing non-HTTP(S) URL: ${url}`);
+  }
+  const host = u.hostname.toLowerCase();
+  const blocked = host === 'localhost' || host === '::1' || host.endsWith('.local') ||
+    /^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) ||
+    /^169\.254\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host);
+  if (blocked) throw new Error(`Refusing private/loopback host: ${host}`);
+  return u;
+}
+
+async function fetchJobPage(url) {
+  assertSafeRemoteUrl(url);
+  let chromium;
+  try {
+    ({ chromium } = await import('playwright'));
+  } catch {
+    console.warn('[fetch] Playwright unavailable — falling back to plain fetch.');
+  }
+
+  if (chromium) {
+    let browser;
+    try {
+      browser = await chromium.launch({ headless: true });
+      const page = await browser.newPage();
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      await page.waitForTimeout(2000); // wait for SPA render
+      const text = await page.evaluate(() => {
+        document.querySelectorAll('script,style,nav,footer,header').forEach(el => el.remove());
+        return (document.body?.innerText || document.body?.textContent || '').replace(/\s+/g, ' ').trim();
+      });
+      return text.slice(0, 16_000);
+    } catch (e) {
+      console.warn(`[fetch] Playwright error: ${e.message} — falling back to plain fetch.`);
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+    }
+  }
+
+  // Plain HTTP fallback
+  try {
+    const r = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; career-ops/1.0)' }
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText}`);
+    const html = await r.text();
+    return html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 16_000);
+  } catch (e) {
+    throw new Error(`Could not fetch job page: ${e.message}`);
+  }
+}
+
+// If jdText starts with http/https, fetch the content
+if (jdText.startsWith('http://') || jdText.startsWith('https://')) {
+  console.log(`🌐  Detected URL: ${jdText}. Fetching job page content...`);
+  try {
+    jdText = await fetchJobPage(jdText);
+    console.log(`✅  Job page fetched successfully (${jdText.length} chars).`);
+  } catch (err) {
+    console.error(`❌  Failed to fetch job page: ${err.message}`);
+    process.exit(1);
+  }
+}
+
 if (!jdText) {
   console.error('❌  No Job Description provided. Run with --help for usage.');
   process.exit(1);
