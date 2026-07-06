@@ -259,7 +259,9 @@ async function main() {
   console.log(`📂 CV PDF: ${CV_PATH}`);
   console.log(`📸 Screenshots directory: ${SCREENSHOT_DIR}\n`);
 
-  const browser = await chromium.launch({ headless: false });
+  const isHeadless = process.argv.includes('--headless');
+  console.log(`🖥️  Browser Mode: ${isHeadless ? 'Headless (Background)' : 'Headed (Visible)'}`);
+  const browser = await chromium.launch({ headless: isHeadless });
 
   for (let i = 0; i < JOBS.length; i++) {
     await runJob(browser, JOBS[i], i);
