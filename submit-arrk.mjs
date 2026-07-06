@@ -23,21 +23,19 @@ const PDF_PATH = resolve(__dirname, 'output/cv-arrk-009.pdf');
 const HTML_PATH = resolve(__dirname, 'output/cv-arrk.html');
 
 const CANDIDATE = {
-  name: 'Jayesh Singh',
-  email: 'hsinghjayesh@gmail.com',
-  phone: '+91-7821816193',
+  name: 'Rohit Shankarram Jaiswar',
+  email: 'rohit.s.jaiswar@gmail.com',
+  phone: '8286996458',
   coverLetter: `Dear Hiring Team,
 
-I am writing to apply for the Junior Software Developer (Fresher) position at Arrk Group. I recently completed my B.E. in Information Technology from Mumbai University and have hands-on experience in Node.js, Python, Java, and React.js -- the exact stack mentioned in your job description.
+I am writing to apply for the Junior Software Developer position at Arrk Group. I recently completed my B.E. in Information Technology from Mumbai University and have strong hands-on experience in Next.js, React, Java, Spring Boot, and Firebase.
 
-During my internship at Qyuki Digital Media, I built production web applications using Next.js, Django, and Spring Boot with REST APIs and secure OAuth authentication. I also developed Fair Pay Solution (fairpaysolution.com), a full-stack loan settlement platform with PostgreSQL and Razorpay, deployed with CI/CD.
+I built ClockHustle (clockhustle.com), an AI-powered SaaS platform that automates 30% of project scope creep detection using Gemini AI. I also developed a real-time Ambulance Dispatch System using Firebase Authentication, Firestore, and Google Maps API. My projects demonstrate full-stack ownership from database schemas to cloud deployments.
 
-I have foundational knowledge of AI/ML concepts including Langchain, RAG, and model fine-tuning (Gemma Vision, Index TTS2). My projects demonstrate end-to-end ownership: frontend to database to cloud deployment.
-
-I am based in Kalyan and Mahape is easily commutable. I look forward to the opportunity to contribute to Arrk Group's engineering team.
+I am based in Mumbai and look forward to the opportunity to contribute to Arrk Group's engineering team.
 
 Best regards,
-Jayesh Singh`,
+Rohit Shankarram Jaiswar`,
 };
 
 // Write cover letter as a temp file for upload (Arrk expects it as file)

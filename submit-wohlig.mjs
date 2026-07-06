@@ -7,7 +7,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const CV_PATH = resolve(__dirname, 'output/cv-jayesh-wohlig.pdf');
 
 async function submitWohlig() {
-  const browser = await chromium.launch({ headless: true });
+  const headless = !process.argv.includes('--show');
+  const browser = await chromium.launch({ headless });
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
 
   try {
@@ -40,17 +41,21 @@ async function submitWohlig() {
       const name = (await inp.getAttribute('name') || '').toLowerCase();
 
       if (ph.includes('first') || id.includes('first') || name.includes('first')) {
-        await inp.fill('Jayesh');
+        await inp.fill('Rohit');
         console.log(`   Filled First Name`);
+        await page.waitForTimeout(2500);
       } else if (ph.includes('last') || id.includes('last') || name.includes('last')) {
-        await inp.fill('Singh');
+        await inp.fill('Jaiswar');
         console.log(`   Filled Last Name`);
+        await page.waitForTimeout(2500);
       } else if (ph.includes('mobile') || ph.includes('phone') || id.includes('mobile') || name.includes('mobile')) {
-        await inp.fill('7821816193');
+        await inp.fill('8286996458');
         console.log(`   Filled Phone`);
+        await page.waitForTimeout(2500);
       } else if (ph.includes('email') || id.includes('email') || name.includes('email')) {
-        await inp.fill('hsinghjayesh@gmail.com');
+        await inp.fill('rohit.s.jaiswar@gmail.com');
         console.log(`   Filled Email`);
+        await page.waitForTimeout(2500);
       }
     }
 
@@ -138,7 +143,12 @@ async function submitWohlig() {
     console.error('Error:', err.message);
     try { await page.screenshot({ path: 'output/wohlig-error.png', fullPage: true }); } catch {}
   } finally {
-    await browser.close();
+    if (headless) {
+      await browser.close();
+    } else {
+      console.log('👀 Browser is visible. Review the page, then Ctrl+C to exit.');
+      await new Promise(() => {});
+    }
   }
 }
 

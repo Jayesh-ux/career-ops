@@ -8,7 +8,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 async function main() {
   console.log('=== mthree Graduate Recruitment Submission ===');
-  const browser = await chromium.launch({ headless: true });
+  const headless = !process.argv.includes('--show');
+  const browser = await chromium.launch({ headless });
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
 
   try {
@@ -24,13 +25,12 @@ async function main() {
     await page.waitForTimeout(3000);
     console.log('Apply clicked');
 
-    // Fill form using evaluate to handle Greenhouse's dynamic form
+    // Expose helpers globally on window
     await page.evaluate(() => {
-      // Helper to fill input by label text
-      function fillByLabel(label, value) {
+      window.fillByLabel = function(label, value) {
         const labels = document.querySelectorAll('label');
         for (const lbl of labels) {
-          if (lbl.textContent.includes(label)) {
+          if (lbl.textContent.toLowerCase().includes(label.toLowerCase())) {
             const forId = lbl.getAttribute('for');
             if (forId) {
               const input = document.getElementById(forId);
@@ -45,77 +45,59 @@ async function main() {
           }
         }
         return false;
-      }
+      };
 
-      // Click checkbox by label
-      function clickCheckbox(label) {
+      window.clickCheckbox = function(label) {
         const labels = document.querySelectorAll('label');
         for (const lbl of labels) {
-          if (lbl.textContent.trim() === label) {
+          if (lbl.textContent.trim().toLowerCase() === label.toLowerCase() || lbl.textContent.toLowerCase().includes(label.toLowerCase())) {
             const forId = lbl.getAttribute('for');
             if (forId) {
               const cb = document.getElementById(forId);
               if (cb) { cb.click(); return true; }
             }
-            // Try clicking the label itself
             lbl.click();
             return true;
           }
         }
         return false;
-      }
-
-      // Fill text inputs
-      fillByLabel('First Name', 'Jayesh');
-      fillByLabel('Last Name', 'Singh');
-      fillByLabel('Email', 'hsinghjayesh@gmail.com');
-      fillByLabel('Phone', '+917821816193');
-      fillByLabel('Location (City)', 'Mumbai');
-      fillByLabel('Country', 'India');
-      
-      // How did you hear about us
-      fillByLabel('How did you hear about us', 'Online job search');
-      
-      // Preferred gender pronouns
-      fillByLabel('preferred gender pronouns', 'He/Him');
-      
-      // Date of birth
-      fillByLabel('Date of birth', '2002-06-15');
-      
-      // Domicile state
-      fillByLabel('domicile state', 'Maharashtra');
-      
-      // Citizenship
-      fillByLabel('Citizenship', 'India');
-      
-      // Undergraduate degree
-      fillByLabel('Undergraduate Degree', 'B.E. in Information Technology');
-      
-      // Major stream
-      fillByLabel('major stream', 'Information Technology');
-      
-      // Year of passing
-      fillByLabel('year of passing', '2024');
-      
-      // College name
-      fillByLabel('College Name', 'Mahatma Gandhi Mission, University of Mumbai');
-      
-      // 60% or more?
-      fillByLabel('60%', 'Yes');
-      
-      // Standing arrears?
-      fillByLabel('standing Arrear', 'No');
-      
-      // Select programming languages: Java, Python
-      clickCheckbox('Java');
-      clickCheckbox('Python');
-      
-      // Location: Mumbai
-      clickCheckbox('Mumbai');
-      
-      // Open to relocate?
-      fillByLabel('open to Re-locate', 'Yes');
+      };
     });
+
+    const fill = async (label, value) => {
+      await page.evaluate(({ label, value }) => window.fillByLabel(label, value), { label, value });
+      console.log(`   Filled ${label}`);
+      await page.waitForTimeout(1500);
+    };
+
+    const check = async (label) => {
+      await page.evaluate((label) => window.clickCheckbox(label), label);
+      console.log(`   Checked ${label}`);
+      await page.waitForTimeout(1500);
+    };
+
+    console.log('4. Filling form fields with pacing...');
+    await fill('First Name', 'Rohit');
+    await fill('Last Name', 'Jaiswar');
+    await fill('Email', 'rohit.s.jaiswar@gmail.com');
+    await fill('Phone', '8286996458');
+    await fill('Location (City)', 'Mumbai');
+    await fill('Country', 'India');
+    await fill('How did you hear about us', 'Online job search');
+    await fill('preferred gender pronouns', 'He/Him');
+    await fill('Date of birth', '2000-01-01');
+    await fill('domicile state', 'Maharashtra');
+    await fill('Citizenship', 'India');
+    await fill('Undergraduate Degree', 'B.E. in Information Technology');
+    await fill('major stream', 'Information Technology');
+    await fill('year of passing', '2022');
+    await fill('College Name', 'Armiet College, University of Mumbai');
+    await fill('60%', 'Yes');
+    await fill('standing Arrear', 'No');
+    await check('Java');
+    await check('Python');
+    await check('Mumbai');
+    await fill('open to Re-locate', 'Yes');
 
     await page.waitForTimeout(1000);
     console.log('Form fields filled');
@@ -193,7 +175,12 @@ async function main() {
     await page.screenshot({ path: 'output/mthree-error.png', fullPage: true }).catch(() => {});
   }
 
-  await browser.close();
+  if (headless) {
+    await browser.close();
+  } else {
+    console.log('👀 Browser is visible. Review the page, then Ctrl+C to exit.');
+    await new Promise(() => {});
+  }
 }
 
 main();
