@@ -16,14 +16,25 @@ const CANDIDATE = {
   portfolio: 'https://portfolio-next-js-chi-beryl.vercel.app/',
 };
 
+// Precise Answers based on Rohit's profile context
+const ANSWERS = {
+  whyElevenLabs: `I have been following ElevenLabs' breakthroughs in synthetic media, voice translation, and developer tools. As a developer who has integrated AI APIs (like Gemini in ClockHustle) to build real-world user value, I am fascinated by ElevenLabs' research-backed deployment speed and developer-first ecosystem (ElevenAgents, ElevenAPI). ElevenLabs is leading the voice AI space, and I want to be part of the engineering team that brings these capabilities to APAC developers and partners.`,
+  
+  impactfulThing: `The most impactful thing I have built is ClockHustle (clockhustle.com), an AI-powered scope creep detection SaaS. I was the sole founder and full-stack developer. I architected the application with a Next.js frontend and a Firebase backend, and integrated Gemini AI. The core value is that it automates 30% of project scope creep detection, reducing manual audit time for freelance developers and small software teams.`,
+  
+  howItWorked: `Success looked like users saving hours of manual audit time. By automating 30% of scope creep detection, our users (primarily freelancers and team managers) reported a significant reduction in the time spent manually reviewing project requirement updates and client messages. The platform successfully calculated metrics, parsed scopes, and generated alerts with low latency.`,
+  
+  usedProduct: `Yes! I have experimented with ElevenLabs' text-to-speech API in personal projects to explore voice cloning and dynamic audio generation. I have used your developer documentation to generate high-fidelity audio streams and explored how ElevenAgents can be used for voice-based agentic workflows.`
+};
+
 const JOBS = {
   fde: {
     title: 'Forward Deployed Engineer - Software Engineer',
-    url: 'https://jobs.ashbyhq.com/elevenlabs/6c4c57c1-ec72-42ba-af3a-eb7aebbde2e6',
+    url: 'https://jobs.ashbyhq.com/elevenlabs/6c4c57c1-ec72-42ba-af3a-eb7aebbde2e6/application',
   },
   solutions: {
     title: 'Solutions Engineer',
-    url: 'https://jobs.ashbyhq.com/elevenlabs/fb1fd9cc-bd6d-4895-be29-4bc37d0c31a0',
+    url: 'https://jobs.ashbyhq.com/elevenlabs/fb1fd9cc-bd6d-4895-be29-4bc37d0c31a0/application',
   }
 };
 
@@ -49,75 +60,78 @@ async function applyToRole(key) {
   const page = await context.newPage();
 
   try {
-    console.log('1. Navigating to Ashby page...');
+    console.log('1. Navigating to Ashby form page...');
     await page.goto(job.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(3000);
 
-    // Scroll down to the form
-    console.log('2. Scrolling to application form...');
-    const formElement = page.locator('form').first();
-    await formElement.scrollIntoViewIfNeeded().catch(() => {});
-    await page.waitForTimeout(2000);
+    // Helper to safely write to fields with sequence keypresses
+    async function typeIntoField(selector, value) {
+      const loc = page.locator(selector).first();
+      await loc.waitFor({ state: 'visible', timeout: 10000 });
+      await loc.focus();
+      await loc.fill(''); // clear
+      await page.waitForTimeout(200);
+      await loc.pressSequentially(value, { delay: 5 });
+      await page.waitForTimeout(500);
+    }
 
     // Fill Full Name
-    console.log('3. Filling Name...');
-    const nameInput = page.locator('input[name="name"], input[placeholder*="name" i], label:has-text("Full Name") + input, input#name').first();
-    if (await nameInput.isVisible()) {
-      await nameInput.fill(CANDIDATE.name);
-      await page.waitForTimeout(2000);
-    }
+    console.log('2. Filling Name...');
+    await typeIntoField('[id="_systemfield_name"]', CANDIDATE.name);
 
     // Fill Email
-    console.log('4. Filling Email...');
-    const emailInput = page.locator('input[type="email"], input[name="email"], label:has-text("Email") + input, input#email').first();
-    if (await emailInput.isVisible()) {
-      await emailInput.fill(CANDIDATE.email);
-      await page.waitForTimeout(2000);
-    }
+    console.log('3. Filling Email...');
+    await typeIntoField('[id="_systemfield_email"]', CANDIDATE.email);
 
-    // Fill Phone
-    console.log('5. Filling Phone...');
-    const phoneInput = page.locator('input[type="tel"], input[name="phone"], label:has-text("Phone") + input, input#phone').first();
-    if (await phoneInput.isVisible()) {
-      await phoneInput.fill(CANDIDATE.phone);
-      await page.waitForTimeout(2000);
-    }
+    // Fill Location (Autocomplete)
+    console.log('4. Filling Location...');
+    const locationInput = page.locator('input[placeholder="Start typing..."]').first();
+    await locationInput.waitFor({ state: 'visible', timeout: 10000 });
+    await locationInput.focus();
+    await locationInput.fill('India');
+    await page.waitForTimeout(2000);
+    await page.keyboard.press('ArrowDown');
+    await page.waitForTimeout(1000);
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(1000);
 
     // Upload CV
-    console.log('6. Uploading CV PDF...');
-    const fileInput = page.locator('input[type="file"]').first();
-    if (await fileInput.isVisible()) {
-      await fileInput.setInputFiles(CV_PATH);
-      await page.waitForTimeout(3000);
-    }
-
-    // Fill LinkedIn
-    console.log('7. Filling LinkedIn...');
-    const linkedinInput = page.locator('input[placeholder*="linkedin" i], label:has-text("LinkedIn") + input, input[name*="linkedin" i]').first();
-    if (await linkedinInput.isVisible()) {
-      await linkedinInput.fill(CANDIDATE.linkedin);
-      await page.waitForTimeout(2000);
-    }
+    console.log('5. Uploading CV PDF...');
+    const fileInput = page.locator('[id="_systemfield_resume"]');
+    await fileInput.setInputFiles(CV_PATH);
+    await page.waitForTimeout(3000);
 
     // Fill GitHub
-    console.log('8. Filling GitHub...');
-    const githubInput = page.locator('input[placeholder*="github" i], label:has-text("GitHub") + input, input[name*="github" i]').first();
-    if (await githubInput.isVisible()) {
-      await githubInput.fill(CANDIDATE.github);
-      await page.waitForTimeout(2000);
+    console.log('6. Filling GitHub Profile...');
+    await typeIntoField('[id="e4a64e8d-f4aa-4cc5-964f-38a42480fc66"]', CANDIDATE.github);
+
+    // Fill LinkedIn
+    console.log('7. Filling LinkedIn Profile...');
+    await typeIntoField('[id="c4f15582-25b5-49d8-a22c-b994689cb957"]', CANDIDATE.linkedin);
+
+    // Select "Job board" for "How did you hear about this job?"
+    console.log('8. Selecting source channel...');
+    const radioBtn = page.locator('input[id*="labeled-radio-2"]').first();
+    if (await radioBtn.isVisible()) {
+      await radioBtn.click();
+      await page.waitForTimeout(1500);
     }
 
-    // Fill Portfolio
-    console.log('9. Filling Portfolio/Website...');
-    const portfolioInput = page.locator('input[placeholder*="portfolio" i], input[placeholder*="website" i], label:has-text("Portfolio") + input, label:has-text("Website") + input, input[name*="portfolio" i]').first();
-    if (await portfolioInput.isVisible()) {
-      await portfolioInput.fill(CANDIDATE.portfolio);
-      await page.waitForTimeout(2000);
-    }
+    // Fill Custom Questions
+    console.log('9. Answering "Why ElevenLabs"...');
+    await typeIntoField('[id="29e8435d-6a3d-4cd4-91b4-8e82afa0c1f3"]', ANSWERS.whyElevenLabs);
+
+    console.log('10. Answering "Most impactful thing built"...');
+    await typeIntoField('[id="94b85326-2bf1-445f-ab41-7f2d316ca9f8"]', ANSWERS.impactfulThing);
+
+    console.log('11. Answering "How did you know it worked"...');
+    await typeIntoField('[id="832af6e6-f4c6-49de-b4d6-e6d3c7041863"]', ANSWERS.howItWorked);
+
+    console.log('12. Answering "Have you used ElevenLabs"...');
+    await typeIntoField('[id="81600888-8c3f-43e6-a3cf-13d5166f5f6c"]', ANSWERS.usedProduct);
 
     console.log('\n👀 ================= MANUAL REVIEW REQUIRED =================');
     console.log('   Form has been auto-filled. Please check the browser window.');
-    console.log('   If there are additional custom questions, answer them.');
     console.log('   Once satisfied, click Submit/Apply on the webpage.');
     console.log('   Press CTRL+C in this terminal when you are done to close.');
     console.log('   ===========================================================');
@@ -128,6 +142,8 @@ async function applyToRole(key) {
   } catch (e) {
     console.error(`❌ Playwright error: ${e.message}`);
   } finally {
+    // DO NOT CLOSE browser immediately on error so user can inspect it
+    await page.waitForTimeout(120_000);
     await browser.close().catch(() => {});
   }
 }
