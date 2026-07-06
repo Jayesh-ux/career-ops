@@ -350,7 +350,8 @@ IMPORTANT OPERATING RULES FOR THIS CLI SESSION
    - For Block G (Legitimacy): analyze the JD text only; skip URL/page freshness checks.
    - Post-evaluation file saving is handled by the script, not by you.
 2. Generate Blocks A through G in full, in English, unless the JD is in another language.
-3. At the very end, output a machine-readable summary block in this exact format:
+3. CRITICAL: When generating markdown tables, do NOT pad cells with extra spaces for visual alignment. Keep columns compact and tight to prevent generation loops.
+4. At the very end, output a machine-readable summary block in this exact format:
 
 ---SCORE_SUMMARY---
 COMPANY: <company name or "Unknown">
