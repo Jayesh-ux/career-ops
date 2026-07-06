@@ -37,43 +37,95 @@ const CANDIDATE = {
   portfolio: profile.candidate?.portfolio_url || 'https://portfolio-next-js-chi-beryl.vercel.app/',
 };
 
-const JOBS = [
-  {
-    company: 'Glean',
-    role: 'Associate Solutions Architect',
-    url: 'https://job-boards.greenhouse.io/gleanwork/jobs/4706804005',
-    type: 'greenhouse',
-    location: 'Bangalore'
-  },
-  {
-    company: 'Anthropic',
-    role: 'Solutions Architect, Applied AI',
-    url: 'https://job-boards.greenhouse.io/anthropic/jobs/5117581008',
-    type: 'greenhouse',
-    location: 'Bangalore'
-  },
-  {
-    company: 'Celonis',
-    role: 'Applied AI Engineer',
-    url: 'https://job-boards.greenhouse.io/celonis/jobs/7681593003?gh_jid=7681593003',
-    type: 'greenhouse',
-    location: 'Remote'
-  },
-  {
-    company: 'ElevenLabs',
-    role: 'Solutions Engineer - India',
-    url: 'https://jobs.ashbyhq.com/elevenlabs/fb1fd9cc-bd6d-4895-be29-4bc37d0c31a0/application',
-    type: 'ashby',
-    location: 'India/Remote'
-  },
-  {
-    company: 'ElevenLabs',
-    role: 'Forward Deployed Engineer',
-    url: 'https://jobs.ashbyhq.com/elevenlabs/6c4c57c1-ec72-42ba-af3a-eb7aebbde2e6/application',
-    type: 'ashby',
-    location: 'India/Remote'
+const TRACKER_PATH = resolve(PROJECT_ROOT, 'data/applications.md');
+
+function getJobsFromTracker() {
+  if (!existsSync(TRACKER_PATH)) {
+    console.error(`❌ Tracker not found at ${TRACKER_PATH}`);
+    return [];
   }
-];
+  
+  const content = fs.readFileSync(TRACKER_PATH, 'utf8');
+  const lines = content.split('\n');
+  const jobs = [];
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (line.startsWith('|') && !line.includes('Date | Company') && !line.includes('---|---')) {
+      const parts = line.split('|').map(p => p.trim());
+      if (parts.length >= 10) {
+        const company = parts[3];
+        const role = parts[4];
+        const scoreStr = parts[5];
+        const status = parts[6].toLowerCase();
+        const jobLinkCol = parts[9]; // index 9 contains Job Link
+        
+        let url = jobLinkCol;
+        const match = jobLinkCol.match(/\[.*?\]\((.*?)\)/);
+        if (match) {
+          url = match[1];
+        }
+        
+        if (status === 'evaluated' && url.startsWith('http')) {
+          // Parse score (e.g. "4.5/5")
+          let score = 0;
+          const scoreMatch = scoreStr.match(/([0-9.]+)\/5/);
+          if (scoreMatch) {
+            score = parseFloat(scoreMatch[1]);
+          }
+          
+          // Only auto-apply to roles with ATS score >= 4.0 (80%+)
+          if (score >= 4.0) {
+            // Determine type
+            let type = 'greenhouse';
+            if (url.includes('ashbyhq.com')) {
+              type = 'ashby';
+              // Ensure URL goes directly to application form
+              if (!url.endsWith('/application') && !url.includes('/application?')) {
+                url = url.replace(/\/$/, '') + '/application';
+              }
+            }
+            
+            // Determine location
+            let location = 'Remote';
+            if (role.toLowerCase().includes('bangalore') || role.toLowerCase().includes('bengaluru') || url.toLowerCase().includes('bangalore')) {
+              location = 'Bangalore';
+            } else if (role.toLowerCase().includes('mumbai') || role.toLowerCase().includes('pune') || role.toLowerCase().includes('thane') || role.toLowerCase().includes('kalyan')) {
+              location = 'Mumbai';
+            }
+            
+            jobs.push({
+              company,
+              role,
+              url,
+              type,
+              location,
+              lineIndex: i,
+              parts
+            });
+          }
+        }
+      }
+    }
+  }
+  return jobs;
+}
+
+function updateTrackerStatus(lineIndex, parts) {
+  if (!existsSync(TRACKER_PATH)) return;
+  const content = fs.readFileSync(TRACKER_PATH, 'utf8');
+  const lines = content.split('\n');
+  
+  // Update status column (index 6) to "Applied"
+  parts[6] = 'Applied';
+  
+  // Reconstruct markdown table row
+  const updatedLine = '| ' + parts.slice(1, -1).join(' | ') + ' |';
+  lines[lineIndex] = updatedLine;
+  
+  fs.writeFileSync(TRACKER_PATH, lines.join('\n'), 'utf8');
+  console.log(`📝 Updated tracker status to "Applied" for row in line ${lineIndex + 1}`);
+}
 
 // Helper to safely write to fields with sequence keypresses
 async function typeIntoField(page, selector, value) {
@@ -244,6 +296,9 @@ async function runJob(browser, job, index) {
       console.log(`❌ Submission blocked or errored on ${job.company} portal.`);
     } else {
       console.log(`✅ ${job.company} application sequential stage completed!`);
+      if (job.lineIndex !== undefined) {
+        updateTrackerStatus(job.lineIndex, job.parts);
+      }
     }
 
   } catch (err) {
@@ -259,12 +314,19 @@ async function main() {
   console.log(`📂 CV PDF: ${CV_PATH}`);
   console.log(`📸 Screenshots directory: ${SCREENSHOT_DIR}\n`);
 
+  const jobs = getJobsFromTracker();
+  console.log(`📋 Found ${jobs.length} pending target jobs with >= 80% match in tracker.`);
+  if (jobs.length === 0) {
+    console.log('🎉 No new jobs to apply. Exiting.');
+    return;
+  }
+
   const isHeadless = process.argv.includes('--headless');
   console.log(`🖥️  Browser Mode: ${isHeadless ? 'Headless (Background)' : 'Headed (Visible)'}`);
   const browser = await chromium.launch({ headless: isHeadless });
 
-  for (let i = 0; i < JOBS.length; i++) {
-    await runJob(browser, JOBS[i], i);
+  for (let i = 0; i < jobs.length; i++) {
+    await runJob(browser, jobs[i], i);
     console.log('\n⏱️ Pacing delay: waiting 5 seconds before starting next application...');
     await new Promise(resolve => setTimeout(resolve, 5000));
   }
