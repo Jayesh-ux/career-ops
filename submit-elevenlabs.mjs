@@ -11,8 +11,8 @@ const CANDIDATE = {
   name: 'Rohit Shankarram Jaiswar',
   email: 'rohit.s.jaiswar@gmail.com',
   phone: '8286996458',
-  linkedin: 'https://linkedin.com/in/rohitjaiswar',
-  github: 'https://github.com/rohitjaiswar',
+  linkedin: 'https://www.linkedin.com/in/rohit-jaiswar-313a60230/',
+  github: 'https://github.com/Rohitjaiswar123',
   portfolio: 'https://portfolio-next-js-chi-beryl.vercel.app/',
 };
 
