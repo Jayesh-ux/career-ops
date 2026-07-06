@@ -94,8 +94,9 @@ async function runJob(browser, job, index) {
   console.log(`🔗 URL: ${job.url}`);
   console.log(`==================================================\n`);
 
-  // Dynamic Location Address Determination
+  // Dynamic Location Address & Phone Determination
   let activeAddress = profile.location?.location_profiles?.mumbai?.address || 'Mumbai, India';
+  let activePhone = profile.location?.location_profiles?.mumbai?.phone || CANDIDATE.phone;
   if (job.location.toLowerCase().includes('bangalore') || job.location.toLowerCase().includes('bengaluru')) {
     const bgAddress = profile.location?.location_profiles?.bangalore?.address;
     if (!bgAddress || bgAddress === 'PENDING_BANGALORE_ADDRESS') {
@@ -103,9 +104,12 @@ async function runJob(browser, job, index) {
       return;
     }
     activeAddress = bgAddress;
+    activePhone = profile.location?.location_profiles?.bangalore?.phone || activePhone;
     console.log(`📍 Using Bangalore address: "${activeAddress}"`);
+    console.log(`📞 Using Bangalore phone: "${activePhone}"`);
   } else {
     console.log(`📍 Using Mumbai address: "${activeAddress}"`);
+    console.log(`📞 Using Mumbai phone: "${activePhone}"`);
   }
 
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
@@ -143,7 +147,7 @@ async function runJob(browser, job, index) {
     } else {
       await typeIntoField(page, 'input[type="email"], input[name*="email"], input[id*="email"]', CANDIDATE.email);
     }
-    await typeIntoField(page, 'input[type="tel"], input[name*="phone"], input[name*="mobile"], input[id*="phone"], input[id*="mobile"]', CANDIDATE.phone);
+    await typeIntoField(page, 'input[type="tel"], input[name*="phone"], input[name*="mobile"], input[id*="phone"], input[id*="mobile"]', activePhone);
 
     console.log('4. Selecting location/address...');
     if (job.type === 'ashby') {
