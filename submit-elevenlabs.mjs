@@ -130,20 +130,30 @@ async function applyToRole(key) {
     console.log('12. Answering "Have you used ElevenLabs"...');
     await typeIntoField('[id="81600888-8c3f-43e6-a3cf-13d5166f5f6c"]', ANSWERS.usedProduct);
 
-    console.log('\n👀 ================= MANUAL REVIEW REQUIRED =================');
-    console.log('   Form has been auto-filled. Please check the browser window.');
-    console.log('   Once satisfied, click Submit/Apply on the webpage.');
-    console.log('   Press CTRL+C in this terminal when you are done to close.');
-    console.log('   ===========================================================');
+    // Auto-click submit button
+    console.log('13. Attempting to auto-submit the application...');
+    const submitBtn = page.locator('button:has-text("Submit Application"), button:has-text("Submit"), button[type="submit"]').first();
+    await submitBtn.waitFor({ state: 'visible', timeout: 10000 });
+    await submitBtn.click();
+    console.log('    Submit button clicked! Waiting 8 seconds to verify submission...');
+    await page.waitForTimeout(8000);
 
-    // Keep browser open indefinitely for manual review and submit
-    await new Promise(() => {});
+    // Verify if submission succeeded or failed
+    const bodyText = await page.locator('body').innerText().catch(() => '');
+    if (bodyText.includes('limiting applications') || bodyText.includes('cannot submit') || bodyText.includes('error') || bodyText.includes('invalid')) {
+      console.log('\n❌ Submission blocked by Ashby/ElevenLabs (e.g., 90-day multi-application limit or error).');
+      console.log('   Keeping browser open for 60 seconds so you can see the warning.');
+      await page.waitForTimeout(60000);
+    } else {
+      console.log('\n✅ Application submitted successfully!');
+      await page.waitForTimeout(3000);
+    }
 
   } catch (e) {
     console.error(`❌ Playwright error: ${e.message}`);
+    // Keep open on error so user can see it
+    await page.waitForTimeout(30000);
   } finally {
-    // DO NOT CLOSE browser immediately on error so user can inspect it
-    await page.waitForTimeout(120_000);
     await browser.close().catch(() => {});
   }
 }
