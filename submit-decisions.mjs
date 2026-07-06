@@ -9,7 +9,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 async function main() {
   console.log('=== Decisions Greenhouse Submission ===');
-  const browser = await chromium.launch({ headless: true });
+  const headless = !process.argv.includes('--show');
+  const browser = await chromium.launch({ headless });
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
 
   try {
@@ -36,22 +37,22 @@ async function main() {
     // Fill form fields
     // First Name
     const firstNameInput = page.locator('input[name="first_name"]');
-    await firstNameInput.fill('Jayesh');
+    await firstNameInput.fill('Rohit');
     console.log('First name filled');
 
     // Last Name
     const lastNameInput = page.locator('input[name="last_name"]');
-    await lastNameInput.fill('Singh');
+    await lastNameInput.fill('Jaiswar');
     console.log('Last name filled');
 
     // Email
     const emailInput = page.locator('input[name="email"]');
-    await emailInput.fill('hsinghjayesh@gmail.com');
+    await emailInput.fill('rohit.s.jaiswar@gmail.com');
     console.log('Email filled');
 
     // Phone
     const phoneInput = page.locator('input[name="phone"]');
-    await phoneInput.fill('+917821816193');
+    await phoneInput.fill('8286996458');
     console.log('Phone filled');
 
     // Upload resume
@@ -149,13 +150,19 @@ async function main() {
 
     await page.screenshot({ path: 'output/decisions-after-submit.png', fullPage: true });
     console.log('\nScreenshots saved');
-
   } catch (e) {
     console.error('Error:', e.message);
-    await page.screenshot({ path: 'output/decisions-error.png', fullPage: true });
+    await page.screenshot({ path: 'output/decisions-error.png', fullPage: true }).catch(() => {});
+  } finally {
+    if (headless) {
+      await browser.close();
+    } else {
+      console.log('👀 Browser is visible. Review the page, then Ctrl+C to exit.');
+      await new Promise(() => {});
+    }
   }
-
-  await browser.close();
 }
 
 main();
+
+
