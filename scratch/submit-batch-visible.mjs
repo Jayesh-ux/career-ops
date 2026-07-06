@@ -314,6 +314,7 @@ async function main() {
   console.log(`📂 CV PDF: ${CV_PATH}`);
   console.log(`📸 Screenshots directory: ${SCREENSHOT_DIR}\n`);
 
+  const MAX_APPLICATIONS_PER_RUN = 2;
   const jobs = getJobsFromTracker();
   console.log(`📋 Found ${jobs.length} pending target jobs with >= 80% match in tracker.`);
   if (jobs.length === 0) {
@@ -321,12 +322,16 @@ async function main() {
     return;
   }
 
+  // Slice jobs to apply to maximum 2 to pace applications and look human
+  const jobsToApply = jobs.slice(0, MAX_APPLICATIONS_PER_RUN);
+  console.log(`🚀 Pacing execution: Applying to a maximum of ${jobsToApply.length} jobs in this scheduled run.`);
+
   const isHeadless = process.argv.includes('--headless');
   console.log(`🖥️  Browser Mode: ${isHeadless ? 'Headless (Background)' : 'Headed (Visible)'}`);
   const browser = await chromium.launch({ headless: isHeadless });
 
-  for (let i = 0; i < jobs.length; i++) {
-    await runJob(browser, jobs[i], i);
+  for (let i = 0; i < jobsToApply.length; i++) {
+    await runJob(browser, jobsToApply[i], i);
     console.log('\n⏱️ Pacing delay: waiting 5 seconds before starting next application...');
     await new Promise(resolve => setTimeout(resolve, 5000));
   }
