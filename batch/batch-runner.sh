@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# career-ops batch runner — standalone orchestrator for headless CLI workers
-# Reads batch-input.tsv, delegates each offer to a claude -p or opencode run worker,
+# career-ops batch runner — standalone orchestrator for claude -p workers
+# Reads batch-input.tsv, delegates each offer to a claude -p worker,
 # tracks state in batch-state.tsv for resumability.
 #
-# NOTE: This script is primarily Claude Code-specific. It uses claude -p with
+# NOTE: This script is Claude Code-specific. It uses claude -p with
 # --dangerously-skip-permissions and --append-system-prompt-file flags
-# that are not available in other CLIs. For OpenCode, use `opencode run` directly.
-# Multi-CLI support is out of scope for now — contributions welcome.
+# that are not available in other CLIs. Multi-CLI support is out of scope
+# for now — contributions welcome.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -461,7 +461,7 @@ process_offer() {
   # Inject user-layer personalization into the temporary worker prompt.
   # The resolved prompt is gitignored runtime state, so user profile data stays
   # out of the system layer while batch scoring matches interactive scoring.
-  for context_file in "$PROJECT_DIR/modes/_profile.md" "$PROJECT_DIR/config/profile.yml"; do
+  for context_file in "$PROJECT_DIR/modes/_profile.md" "$PROJECT_DIR/config/profile.yml" "$PROJECT_DIR/modes/_custom.md"; do
     if [[ -f "$context_file" ]]; then
       {
         printf '\n\n---\n\n'
