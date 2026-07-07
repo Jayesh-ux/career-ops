@@ -595,7 +595,7 @@ func splitTrackerRow(line string) []string {
 var trackerHeaderAliases = map[string]string{
 	"#": "num", "num": "num", "date": "date",
 	"company": "company", "empresa": "company",
-	"role": "role", "puesto": "role",
+	"via": "via", "role": "role", "puesto": "role",
 	"location": "location", "score": "score", "status": "status",
 	"pdf": "pdf", "report": "report", "notes": "notes",
 }
@@ -621,9 +621,11 @@ func detectTrackerColumns(lines []string) map[string]int {
 		m := make(map[string]int)
 		for i, c := range cells {
 			if name, ok := trackerHeaderAliases[strings.ToLower(c)]; ok {
-				if _, seen := m[name]; !seen {
-					m[name] = i
-				}
+				// Unconditional assign: with a duplicated header name the LAST
+				// occurrence wins, matching detectColumns in tracker-parse.mjs
+				// (which this function mirrors) — first-wins here made the two
+				// runtimes map the same header row differently.
+				m[name] = i
 			}
 		}
 		complete := true

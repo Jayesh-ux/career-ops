@@ -10,6 +10,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import yaml from 'js-yaml';
 import { discoverPlugins, pluginRoots, pluginStatus } from './plugins/_engine.mjs';
+import { resolveExtractorMode } from './browser-extract.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const argv = process.argv.slice(2);
@@ -107,6 +108,25 @@ function playwrightMcpConfigured(root) {
     }
   }
   return false;
+}
+
+// Report which scan/JD extractor is active (config/profile.yml → scan.extractor).
+// `mcp` (default) uses the browser MCP; `cli` uses browser-extract.mjs. When cli
+// is selected but the helper is missing, the modes fall back to MCP — surface
+// that as a warning, never a failure.
+function checkScanExtractor(root) {
+  const mode = resolveExtractorMode(join(root, 'config', 'profile.yml'));
+  if (mode === 'cli') {
+    if (existsSync(join(root, 'browser-extract.mjs'))) {
+      return { pass: true, label: 'Scan extractor: cli (browser-extract.mjs)' };
+    }
+    return {
+      warn: true,
+      label: 'Scan extractor: cli set, but browser-extract.mjs is missing — falls back to MCP',
+      fix: ['Restore browser-extract.mjs, or set `scan.extractor: mcp` in config/profile.yml.'],
+    };
+  }
+  return { pass: true, label: 'Scan extractor: mcp (default)' };
 }
 
 function checkPlaywrightMcp(root) {
@@ -310,6 +330,7 @@ async function main() {
     checkDependencies(),
     await checkPlaywright(),
     checkPlaywrightMcp(projectRoot),
+    checkScanExtractor(projectRoot),
     ...USER_LAYER_PREREQS.map(checkPrereq),
     checkFonts(),
     checkAutoDir('data'),
@@ -352,7 +373,7 @@ async function main() {
     process.exit(1);
   } else {
     const warnNote = warnings > 0 ? ` (${warnings} warning${warnings === 1 ? '' : 's'} — see above)` : '';
-    console.log(`Result: All checks passed${warnNote}. You're ready to go! Run \`opencode\` (or \`claude\`) to start.`);
+    console.log(`Result: All checks passed${warnNote}. You're ready to go! Run \`claude\` (or \`opencode\`) to start.`);
     console.log('');
     console.log('Join the community: https://discord.gg/8pRpHETxa4');
     process.exit(0);

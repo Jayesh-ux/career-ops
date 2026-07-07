@@ -19,11 +19,11 @@ const NPM = process.platform === "win32" ? "npm.cmd" : "npm";
 // out of the box. We only detect them to tailor the final message — we never
 // install, configure, or remove anything per-CLI.
 const SUPPORTED_CLIS = [
-  { name: "OpenCode", cmd: "opencode" },
   { name: "Claude Code", cmd: "claude" },
   { name: "Gemini CLI", cmd: "gemini" },
   { name: "Codex", cmd: "codex" },
   { name: "Qwen Code", cmd: "qwen" },
+  { name: "OpenCode", cmd: "opencode" },
   { name: "GitHub Copilot CLI", cmd: "copilot" },
   { name: "Antigravity CLI", cmd: "agy" },
   { name: "Grok Build CLI", cmd: "grok" },
@@ -147,7 +147,7 @@ async function main() {
 
   console.log("\nOn first launch it walks you through setup — your CV, profile and target");
   console.log("roles — just by chatting. Nothing to configure by hand.");
-  console.log("\ncareer-ops is AI-agnostic — OpenCode, Claude Code, Codex, Qwen, Copilot, Antigravity and Grok all work.");
+  console.log("\ncareer-ops is AI-agnostic — Claude Code, Codex, Qwen, OpenCode, Copilot, Antigravity and Grok all work.");
   console.log("\nOptional (for PDF generation):");
   console.log("  npx playwright install chromium\n");
 }
