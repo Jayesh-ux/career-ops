@@ -1,0 +1,19 @@
+[cron] Starting daily job search at Sun Jul  5 10:38:15 UTC 2026
+[10:38:16] 🚀 ===== DAILY JOB AUTO-APPLY =====
+
+[10:38:16] 🏢 Checking company career pages...
+[10:38:25]   Jio GET: ❌ Inactive
+[10:38:35]   Decisions: ❌ Inactive (redirected)
+[10:38:44]   Wohlig: ❌ Inactive
+[10:38:53]   Teleperformance: ❌ Inactive
+[10:39:02]   Ingram Micro India: ✅ Active
+[10:39:13]   Siemens India: ❌ Inactive (redirected)
+[10:39:13] 📡 Running ATS scanner...
+[cron] Starting daily job search at Mon Jul  6 03:00:37 UTC 2026
+[03:00:39] 🚀 ===== DAILY JOB AUTO-APPLY =====
+
+[03:00:39] 🏢 Checking company career pages...
+[03:00:42]   ⚠️ Jio GET: page.goto: net::ERR_ABORTED at https://careers.jio.com/frmStudent_Campus.aspx
+Call log:
+[2m  - navigating to "https://careers.jio.com/frmStudent_Campus.aspx", waiting until "domcontentloaded"[22m
+

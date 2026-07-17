@@ -101,3 +101,6 @@ package-lock.json
 
 # Planning (local scratchpad)
 plan/
+
+# Bridge server credentials
+.bridge.env
