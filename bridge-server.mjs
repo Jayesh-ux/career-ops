@@ -1,0 +1,1202 @@
+#!/usr/bin/env node
+
+import express from 'express';
+import cors from 'cors';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, unlinkSync, readdirSync } from 'fs';
+import { spawnSync, spawn } from 'child_process';
+import { fileURLToPath } from 'url';
+import { dirname, join, basename } from 'path';
+import yaml from 'js-yaml';
+import multer from 'multer';
+import { createRequire } from 'module';
+import { loadProviders, resolveProvider } from './providers/_registry.mjs';
+import { makeHttpCtx } from './providers/_http.mjs';
+
+const require = createRequire(import.meta.url);
+const Imap = require('imap');
+const { simpleParser } = require('mailparser');
+const nodemailer = require('nodemailer');
+let mammoth = null;
+try { mammoth = require('mammoth'); } catch { /* optional */ }
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const PORT = parseInt(process.env.PORT || '8787', 10);
+
+// Load .bridge.env if present (sets GMAIL_USER, GMAIL_APP_PASSWORD, etc.)
+try {
+  const envFile = join(__dirname, '.bridge.env');
+  if (existsSync(envFile)) {
+    const lines = readFileSync(envFile, 'utf-8').split('\n');
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eq = trimmed.indexOf('=');
+      if (eq > 0) {
+        const key = trimmed.slice(0, eq).trim();
+        const val = trimmed.slice(eq + 1).trim();
+        if (!process.env[key]) process.env[key] = val;
+      }
+    }
+  }
+} catch (e) { /* ignore */ }
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+
+// ── helpers ────────────────────────────────────────────────────────
+
+/** Strip markdown formatting from text (bold, italic, code, headings, etc.) */
+function stripMarkdown(s) {
+  return (s || '')
+    .replace(/\*\*(.+?)\*\*/g, '$1')   // **bold**
+    .replace(/\*(.+?)\*/g, '$1')        // *italic*
+    .replace(/__(.+?)__/g, '$1')        // __bold__
+    .replace(/_(.+?)_/g, '$1')          // _italic_
+    .replace(/`(.+?)`/g, '$1')          // `code`
+    .replace(/^#{1,6}\s*/gm, '')        // # headings
+    .replace(/^[-*+]\s+/gm, '')         // list markers
+    .trim();
+}
+
+const PROFILE_PATH = join(__dirname, 'config/profile.yml');
+const TRACKER_PATH = existsSync(join(__dirname, 'data/applications.md'))
+  ? join(__dirname, 'data/applications.md')
+  : join(__dirname, 'applications.md');
+const STATES_PATH = join(__dirname, 'templates/states.yml');
+const ADDITIONS_DIR = join(__dirname, 'batch/tracker-additions');
+const SCAN_HISTORY = join(__dirname, 'data/scan-history.tsv');
+const UPLOAD_DIR = join(__dirname, 'data/uploads');
+
+if (!existsSync(UPLOAD_DIR)) mkdirSync(UPLOAD_DIR, { recursive: true });
+
+const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 10 * 1024 * 1024 } });
+
+function readProfile() {
+  if (!existsSync(PROFILE_PATH)) return {};
+  return yaml.load(readFileSync(PROFILE_PATH, 'utf-8')) || {};
+}
+
+function writeProfile(data) {
+  writeFileSync(PROFILE_PATH, yaml.dump(data, { indent: 2, lineWidth: -1, noRefs: true }));
+}
+
+function trackerLines() {
+  if (!existsSync(TRACKER_PATH)) return [];
+  const text = readFileSync(TRACKER_PATH, 'utf-8');
+  return text.split('\n');
+}
+
+function findHeaderCols(lines) {
+  for (const line of lines) {
+    if (!line.startsWith('|')) continue;
+    const cells = line.split('|').map(s => s.trim().toLowerCase());
+    const map = {};
+    const aliases = {
+      '#': 'num', 'no': 'num', 'number': 'num',
+      date: 'date', company: 'company', role: 'role',
+      score: 'score', status: 'status', pdf: 'pdf',
+      report: 'report', notes: 'notes', location: 'location',
+      via: 'via', contacto: 'contactemail', 'contact email': 'contactemail',
+      email: 'contactemail',
+    };
+    cells.forEach((c, i) => {
+      const k = aliases[c];
+      if (k) map[k] = i;
+    });
+    if (map.num != null && map.company != null && map.role != null) return map;
+    // fallback legacy
+    if (cells.length >= 9) {
+      return { num: 1, date: 2, company: 3, role: 4, score: 5, status: 6, pdf: 7, report: 8, notes: 9 };
+    }
+  }
+  return null;
+}
+
+function parseTrackerRows(lines, colmap) {
+  if (!colmap) return [];
+  const rows = [];
+  for (const line of lines) {
+    if (!line.startsWith('|')) continue;
+    const parts = line.split('|').map(s => s.trim());
+    const num = parseInt(parts[colmap.num], 10);
+    if (isNaN(num)) continue;
+    const get = (k) => (colmap[k] != null ? (parts[colmap[k]] ?? '') : '');
+    rows.push({
+      id: num,
+      num,
+      date: get('date'),
+      company: get('company'),
+      role: get('role'),
+      score: get('score'),
+      status: get('status'),
+      pdf: get('pdf'),
+      report: get('report'),
+      notes: get('notes'),
+      location: get('location'),
+      contactEmail: get('contactemail'),
+    });
+  }
+  return rows;
+}
+
+function runCli(script, args = []) {
+  const result = spawnSync('node', [script, ...args], {
+    cwd: __dirname,
+    encoding: 'utf-8',
+    timeout: 120_000,
+    env: { ...process.env, FORCE_COLOR: '0' },
+  });
+  return { stdout: result.stdout || '', stderr: result.stderr || '', status: result.status, error: result.error };
+}
+
+function nextReportNum() {
+  if (!existsSync(join(__dirname, 'reports'))) mkdirSync(join(__dirname, 'reports'), { recursive: true });
+  const existing = readFileSync(TRACKER_PATH, 'utf-8').split('\n');
+  let max = 0;
+  for (const line of existing) {
+    if (!line.startsWith('|')) continue;
+    const m = line.match(/^\|\s*(\d+)/);
+    if (m) max = Math.max(max, parseInt(m[1], 10));
+  }
+  return max + 1;
+}
+
+// ── endpoints ──────────────────────────────────────────────────────
+
+// GET /doctor — runs 'node doctor.mjs --json' and returns the result
+app.get('/doctor', (req, res) => {
+  try {
+    const r = spawnSync('node', ['doctor.mjs', '--json'], {
+      cwd: __dirname,
+      encoding: 'utf-8',
+      timeout: 30000
+    });
+    if (r.status !== 0) {
+      return res.status(500).json({ error: r.stderr || 'doctor.mjs failed' });
+    }
+    const output = (r.stdout || '').trim();
+    try {
+      res.json(JSON.parse(output));
+    } catch {
+      res.status(500).json({ error: 'doctor.mjs produced invalid JSON', raw: output });
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /profile — returns full profile from config/profile.yml
+app.get('/profile', (req, res) => {
+  try {
+    const p = readProfile();
+    const c = p.candidate || {};
+    const t = p.target_roles || {};
+    const n = p.narrative || {};
+    const comp = p.compensation || {};
+    const loc = p.location || {};
+    res.json({
+      name: c.full_name || '',
+      email: c.email || '',
+      phone: c.phone || '',
+      portfolio: c.portfolio_url || c.portfolio || '',
+      linkedin: c.linkedin || '',
+      github: c.github || '',
+      resumeFileName: '',
+      location: loc.city || '',
+      country: loc.country || '',
+      timezone: loc.timezone || '',
+      targetRoles: t.primary || [],
+      archetypes: (t.archetypes || []).map(a => a.name || a),
+      headline: n.headline || '',
+      exitStory: n.exit_story || '',
+      superpowers: n.superpowers || [],
+      proofPoints: (n.proof_points || []).map(pp => pp.name || pp),
+      compensation: comp.target_range || '',
+      minimum: comp.minimum || '',
+      currency: comp.currency || 'INR'
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /profile — update profile fields in config/profile.yml
+app.put('/profile', (req, res) => {
+  try {
+    const { name, email, phone, portfolio, linkedin, targetRoles, location, headline, compensation } = req.body;
+    const p = readProfile();
+    if (!p.candidate) p.candidate = {};
+    if (name != null) p.candidate.full_name = name;
+    if (email != null) p.candidate.email = email;
+    if (phone != null) p.candidate.phone = phone;
+    if (portfolio != null) p.candidate.portfolio_url = portfolio;
+    if (linkedin != null) p.candidate.linkedin = linkedin;
+    if (targetRoles != null) {
+      if (!p.target_roles) p.target_roles = {};
+      p.target_roles.primary = targetRoles;
+    }
+    if (location != null) {
+      if (!p.location) p.location = {};
+      p.location.city = location;
+    }
+    if (headline != null) {
+      if (!p.narrative) p.narrative = {};
+      p.narrative.headline = headline;
+    }
+    if (compensation != null) {
+      if (!p.compensation) p.compensation = {};
+      p.compensation.target_range = compensation;
+    }
+    writeProfile(p);
+
+    // Also sync search keywords to portals.yml title_filter.positive
+    const { searchKeywords, searchLocations } = req.body;
+    if (searchKeywords != null || searchLocations != null) {
+      const portalsPath = join(__dirname, 'portals.yml');
+      let portals = {};
+      if (existsSync(portalsPath)) {
+        try { portals = yaml.load(readFileSync(portalsPath, 'utf-8')) || {}; } catch { /* keep empty */ }
+      }
+      if (searchKeywords != null) {
+        if (!portals.title_filter) portals.title_filter = {};
+        portals.title_filter.positive = searchKeywords;
+      }
+      if (searchLocations != null) {
+        if (!portals.title_filter) portals.title_filter = {};
+        portals.title_filter.location = searchLocations;
+      }
+      writeFileSync(portalsPath, yaml.dump(portals, { lineWidth: -1 }), 'utf-8');
+    }
+
+    const c = p.candidate;
+    res.json({
+      name: c.full_name || '',
+      email: c.email || '',
+      phone: c.phone || '',
+      portfolio: c.portfolio_url || '',
+      linkedin: c.linkedin || '',
+      resumeFileName: '',
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /tracker
+app.get('/tracker', (req, res) => {
+  try {
+    const lines = trackerLines();
+    const colmap = findHeaderCols(lines);
+    const rows = parseTrackerRows(lines, colmap);
+    res.json({ applications: rows.map(r => ({
+      id: r.num,
+      date: r.date,
+      company: r.company,
+      role: r.role,
+      location: r.location || '',
+      status: r.status,
+      score: r.score,
+      contactEmail: r.contactEmail || '',
+      notes: r.notes,
+    })) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /tracker/:id/status
+app.put('/tracker/:id/status', (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+    if (!status) return res.status(400).json({ error: 'status is required' });
+
+    // Load canonical states from states.yml
+    let validStates = [];
+    if (existsSync(STATES_PATH)) {
+      const s = yaml.load(readFileSync(STATES_PATH, 'utf-8'));
+      if (s && s.states) validStates = s.states.map(st => st.label.toLowerCase());
+    }
+
+    const r = runCli('set-status.mjs', [id, status, '--json']);
+    if (r.status !== 0) {
+      const errMsg = r.stderr || r.stdout || `set-status exited with code ${r.status}`;
+      return res.status(400).json({ error: errMsg });
+    }
+
+    // Return updated tracker
+    const lines = trackerLines();
+    const colmap = findHeaderCols(lines);
+    const rows = parseTrackerRows(lines, colmap);
+    res.json({ applications: rows.map(r => ({
+      id: r.num, date: r.date, company: r.company, role: r.role,
+      location: r.location || '', status: r.status, score: r.score,
+      contactEmail: r.contactEmail || '', notes: r.notes,
+    })) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /tracker/add
+app.post('/tracker/add', (req, res) => {
+  try {
+    const { company, role, location, contactEmail, notes } = req.body;
+    if (!company || !role) return res.status(400).json({ error: 'company and role are required' });
+
+    if (!existsSync(ADDITIONS_DIR)) mkdirSync(ADDITIONS_DIR, { recursive: true });
+
+    const num = nextReportNum();
+    const date = new Date().toISOString().split('T')[0];
+    const slug = company.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    const tsvPath = join(ADDITIONS_DIR, `${num}-${slug}.tsv`);
+
+    // Format: num\tdate\tcompany\trole\tstatus\tscore\tpdf\treport\tnotes
+    const tsvContent = `${num}\t${date}\t${company}\t${role}\tApplied\tN/A\t❌\t[num](reports/xxx)\t${notes || ''}\n`;
+    writeFileSync(tsvPath, tsvContent);
+
+    // Run merge-tracker
+    const r = runCli('merge-tracker.mjs', []);
+    if (r.status !== 0 && r.status !== null) {
+      return res.status(500).json({ error: r.stderr || 'merge-tracker failed', id: num, success: false });
+    }
+
+    res.json({ id: num, success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message, success: false });
+  }
+});
+
+// POST /email/send
+app.post('/email/send', async (req, res) => {
+  try {
+    const { email, appPassword, company, role, body, to, pdfPath } = req.body;
+    if (!email || !appPassword || !body) {
+      return res.status(400).json({ error: 'email, appPassword, and body are required' });
+    }
+
+    const transporter = nodemailer.createTransport({
+      host: 'smtp.gmail.com', port: 587, secure: false,
+      auth: { user: email, pass: appPassword },
+    });
+
+    const mailOpts = {
+      from: email,
+      to: to || email,
+      subject: `Application for ${role} at ${company}`,
+      text: body,
+    };
+    if (pdfPath && existsSync(pdfPath)) mailOpts.attachments = [{ path: pdfPath }];
+
+    const info = await transporter.sendMail(mailOpts);
+    res.json({ success: true, applicationId: 0 });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Shared IMAP fetch — single implementation used by /email/inbox and /email/triage
+function fetchEmails(email, password, { daysBack = 30, maxEmails = 50, timeout = 30000 } = {}) {
+  return new Promise((resolve) => {
+    const emails = [];
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      emails.sort((a, b) => new Date(b.date) - new Date(a.date));
+      // Assign sequential IDs after sorting
+      emails.forEach((e, i) => { e.id = i + 1; });
+      resolve(emails);
+    };
+
+    const imap = new Imap({
+      user: email, password,
+      host: 'imap.gmail.com', port: 993, tls: true,
+      tlsOptions: { rejectUnauthorized: false },
+    });
+
+    imap.once('ready', () => {
+      imap.openBox('INBOX', false, (err) => {
+        if (err) { imap.end(); finish(); return; }
+        const since = new Date(Date.now() - daysBack * 86400000).toISOString().split('T')[0];
+        imap.search(['ALL', ['SINCE', since]], (err, results) => {
+          if (err || !results || results.length === 0) { imap.end(); finish(); return; }
+          const latest = results.slice(-maxEmails);
+          let pending = latest.length;
+          let timedOut = false;
+
+          if (pending === 0) { imap.end(); finish(); return; }
+
+          const f = imap.fetch(latest, { bodies: '' });
+          f.on('message', (msg) => {
+            let buf = '';
+            msg.on('body', (stream) => {
+              stream.on('data', (chunk) => { buf += chunk.toString('utf-8'); });
+              stream.on('end', () => {
+                simpleParser(buf, (parseErr, parsed) => {
+                  if (!parseErr && parsed) {
+                    emails.push({
+                      from: parsed.from?.text || '',
+                      fromEmail: (parsed.from?.value?.[0]?.address) || '',
+                      subject: parsed.subject || '',
+                      date: parsed.date ? new Date(parsed.date).toISOString() : new Date(0).toISOString(),
+                      preview: (parsed.text || '').substring(0, 200),
+                      body: (parsed.text || '').substring(0, 5000),
+                    });
+                  }
+                  pending--;
+                  if (pending <= 0 && !timedOut) { timedOut = true; imap.end(); finish(); }
+                });
+              });
+            });
+            msg.on('end', () => {
+              setTimeout(() => { if (pending <= 0 && !timedOut) { timedOut = true; imap.end(); finish(); } }, 2000);
+            });
+          });
+          f.once('error', () => { if (!timedOut) { timedOut = true; imap.end(); finish(); } });
+          f.once('end', () => {
+            setTimeout(() => { if (!timedOut) { timedOut = true; imap.end(); finish(); } }, 5000);
+          });
+        });
+      });
+    });
+    imap.once('error', () => { finish(); });
+    imap.connect();
+    setTimeout(() => { finish(); }, timeout);
+  });
+}
+
+// GET /email/inbox
+app.get('/email/inbox', async (req, res) => {
+  const email = req.query.email || process.env.GMAIL_USER;
+  const appPassword = req.query.appPassword || process.env.GMAIL_APP_PASSWORD;
+  if (!email || !appPassword) {
+    return res.status(400).json({ error: 'email and appPassword required — set GMAIL_USER/GMAIL_APP_PASSWORD env vars or pass as query params' });
+  }
+  const emails = await fetchEmails(email, appPassword);
+  res.json({ emails });
+});
+
+// POST /scan — uses real career-ops provider system (57 portals) + web search fallback
+// Now includes: blacklist checking, scan history tracking, trust validation
+app.post('/scan', async (req, res) => {
+  try {
+    const { keywords, locations } = req.body;
+    const kw = (keywords || []).map(k => k.toLowerCase().trim()).filter(Boolean);
+    const locs = (locations || []).map(l => l.toLowerCase().trim()).filter(Boolean);
+
+    const portalsPath = join(__dirname, 'portals.yml');
+    if (!existsSync(portalsPath)) return res.json({ results: [], summary: { portalsScanned: 0, totalFound: 0, filteredByKeywords: 0, duplicatesSkipped: 0, netNew: 0, tooBroad: false, narrowingHints: [] } });
+    const py = yaml.load(readFileSync(portalsPath, 'utf-8'));
+    const companies = py?.tracked_companies || [];
+    const boards = py?.search_queries || [];
+
+    // Load blacklist — same format as career-ops CLI
+    const blacklistPath = join(__dirname, 'data/blacklist.md');
+    const blacklist = new Set();
+    if (existsSync(blacklistPath)) {
+      const blLines = readFileSync(blacklistPath, 'utf-8').split('\n');
+      for (const line of blLines) {
+        const m = line.match(/^\s*[-*]\s*(.+)/);
+        if (m) blacklist.add(m[1].trim().toLowerCase());
+      }
+    }
+
+    // Load scan history for dedup — same TSV as career-ops CLI
+    const scanHistory = new Map();
+    if (existsSync(SCAN_HISTORY)) {
+      const histLines = readFileSync(SCAN_HISTORY, 'utf-8').split('\n');
+      for (const line of histLines) {
+        const parts = line.split('\t');
+        if (parts.length >= 2) scanHistory.set(parts[1], parts[0]);
+      }
+    }
+
+    const providers = await loadProviders(join(__dirname, 'providers'));
+    const results = [];
+    const errored = [];
+    let totalBeforeFilter = 0;
+
+    // Phase 1: Provider-based scanning
+    const providerTargets = [];
+    const webSearchTargets = [];
+    for (const entry of companies) {
+      if (entry.enabled === false) continue;
+      if (blacklist.has((entry.name || '').toLowerCase())) continue;
+      const resolved = resolveProvider(entry, providers);
+      if (resolved && !resolved.error) {
+        providerTargets.push({ entry, provider: resolved.provider });
+      } else if (entry.scan_query || entry.careers_url) {
+        if (!blacklist.has((entry.name || '').toLowerCase())) webSearchTargets.push(entry);
+      }
+    }
+    for (const entry of boards) {
+      if (entry.enabled === false) continue;
+      const resolved = resolveProvider(entry, providers);
+      if (resolved && !resolved.error) providerTargets.push({ entry, provider: resolved.provider, isBoard: true });
+    }
+
+    // Provider results
+    await Promise.all(providerTargets.map(async (t) => {
+      try {
+        const ctx = makeHttpCtx();
+        const jobs = await t.provider.fetch(t.entry, ctx);
+        totalBeforeFilter += jobs.length;
+        for (const job of jobs) {
+          const title = (job.title || '').toLowerCase();
+          const loc = (job.location || '').toLowerCase();
+          const matchesKw = kw.length === 0 || kw.some(k => title.includes(k));
+          const matchesLoc = locs.length === 0 || locs.some(l => loc.includes(l));
+          if (matchesKw && matchesLoc) {
+            results.push({
+              company: job.company || t.entry.name || '',
+              role: job.title || '',
+              location: job.location || '',
+              url: job.url || '',
+              matched: true,
+              source: t.provider.id,
+            });
+          }
+        }
+      } catch (e) {
+        errored.push({ company: t.entry.name, error: e.message });
+      }
+    }));
+
+    // Phase 2: Web search fallback for companies with no provider match
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 25000);
+
+    await Promise.all(webSearchTargets.slice(0, 15).map(async (entry) => {
+      try {
+        if (!entry.careers_url) return;
+        const resp = await fetch(entry.careers_url, {
+          signal: controller.signal,
+          headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36' },
+        });
+        if (!resp.ok) return;
+        const html = await resp.text();
+        // Match job title patterns in links and headings
+        const titlePattern = /<a[^>]*href="([^"]*)"[^>]*>([^<]*(?:developer|engineer|full.?stack|frontend|backend|react|node|python|java|intern)[^<]*)<\/a>/gi;
+        let m;
+        while ((m = titlePattern.exec(html)) !== null) {
+          const title = m[2].trim();
+          const lower = title.toLowerCase();
+          totalBeforeFilter++;
+          const matchesKw = kw.length === 0 || kw.some(k => lower.includes(k));
+          if (matchesKw) {
+            const href = m[1].startsWith('http') ? m[1] : new URL(m[1], entry.careers_url).href;
+            if (!results.some(r => r.url === href)) {
+              results.push({
+                company: entry.name || '',
+                role: title,
+                location: '',
+                url: href,
+                matched: true,
+                source: 'websearch',
+              });
+            }
+          }
+        }
+      } catch {
+        // timeout or fetch error — skip
+      }
+    }));
+    clearTimeout(timeout);
+
+    // Dedup by url
+    const seen = new Set();
+    const beforeDedup = results.length;
+    const deduped = results.filter(r => {
+      if (seen.has(r.url)) return false;
+      seen.add(r.url);
+      return true;
+    });
+    const duplicatesSkipped = beforeDedup - deduped.length;
+    const netNew = deduped.length;
+    const filteredByKeywords = totalBeforeFilter - beforeDedup;
+    const portalsScanned = providerTargets.length + Math.min(webSearchTargets.length, 15);
+
+    // Track scan history — append new URLs to data/scan-history.tsv (same as scan.mjs)
+    const today = new Date().toISOString().slice(0, 10);
+    for (const r of deduped) {
+      if (r.url && !scanHistory.has(r.url)) {
+        try { appendFileSync(SCAN_HISTORY, `${today}\t${r.url}\t${r.source || 'bridge'}\n`); } catch { /* non-fatal */ }
+      }
+    }
+
+    // Determine if results are too broad and generate narrowing hints
+    const narrowingHints = [];
+    if (kw.length === 0) narrowingHints.push('No keyword filter — all roles matched');
+    if (locs.length === 0) narrowingHints.push('No location filter — results include all locations');
+    if (netNew > 100) narrowingHints.push(`${netNew} results is a lot — consider narrowing keywords or adding a location`);
+
+    res.json({
+      results: deduped.slice(0, 100),
+      errors: errored,
+      webFallback: webSearchTargets.length,
+      summary: {
+        portalsScanned,
+        totalFound: totalBeforeFilter,
+        filteredByKeywords,
+        duplicatesSkipped,
+        netNew,
+        tooBroad: netNew > 100,
+        narrowingHints,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message, results: [] });
+  }
+});
+
+// POST /resume/upload — accepts PDF/DOCX, extracts text, returns structured profile + suggestions
+app.post('/resume/upload', upload.single('resume'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const filePath = req.file.path;
+    const ext = req.file.originalname?.toLowerCase() || '';
+    let text = '';
+
+    if (ext.endsWith('.pdf')) {
+      const r = spawnSync('pdftotext', [filePath, '-'], { encoding: 'utf-8', timeout: 30000 });
+      text = (r.stdout || '').trim();
+    } else if (ext.endsWith('.docx') && mammoth) {
+      const buf = readFileSync(filePath);
+      const r = await mammoth.extractRawText({ buffer: buf });
+      text = (r.value || '').trim();
+    } else {
+      try { text = readFileSync(filePath, 'utf-8').trim(); } catch { /* fall through */ }
+    }
+
+    try { unlinkSync(filePath); } catch { /* cleanup */ }
+
+    if (!text) return res.status(400).json({ error: 'Could not extract text from file' });
+
+    // Write raw text to data/cv.md — the canonical CV file for career-ops
+    const cvDir = join(__dirname, 'data');
+    if (!existsSync(cvDir)) mkdirSync(cvDir, { recursive: true });
+    writeFileSync(join(cvDir, 'cv.md'), text, 'utf-8');
+
+    // Parse profile from text
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    const name = lines[0] || '';
+    const emailMatch = text.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+    const email = emailMatch ? emailMatch[0] : '';
+    const phoneMatch = text.match(/\+91\s*\d{5}\s*\d{5}|(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/);
+    const phone = phoneMatch ? phoneMatch[0] : '';
+    const linkMatches = text.matchAll(/https?:\/\/[^\s]+/g);
+    const links = [...new Set([...linkMatches].map(m => m[0]))];
+
+    // ── Skill extraction — stream-agnostic, no predefined bank ──
+    const textLower = text.toLowerCase();
+    const ROLE_SUFFIXES = /(?:developer|engineer|architect|designer|manager|analyst|scientist|consultant|specialist|lead|administrator|accountant|officer|executive|coordinator|supervisor|therapist|nurse|doctor|agent|broker|instructor|teacher|professor|technician|mechanic|inspector|auditor|controller|planner|surveyor|pharmacist|dietitian|counselor|social worker)/i;
+    let skills = [];
+    const skillsSectionMatch = text.match(/(?:skills|tools|technologies|competencies|proficiencies|technical skills)[:\s]*\n([\s\S]*?)(?:\n\s*\n|\n(?=[A-Z]))/i);
+    if (skillsSectionMatch) {
+      // Extract comma, pipe, or dash separated items from the skills section
+      skills = skillsSectionMatch[1]
+        .split(/[,|•·–—]/)
+        .map(s => stripMarkdown(s.replace(/^[\s\d.)\-*]+/, '').trim()))
+        .filter(s => s.length > 1 && s.length < 60)
+        .slice(0, 20);
+    }
+    // Fallback: if no skills section found, extract capitalized multi-word professional terms (line-by-line)
+    // Exclude the candidate's own name (e.g. "Rahul Sharma") from appearing as a "skill"
+    const nameWords = name.replace(/^(Dr|Mr|Mrs|Ms|Prof)\.?\s*/i, '').split(/\s+/).filter(Boolean);
+    if (skills.length === 0) {
+      skills = [...new Set(
+        lines.flatMap(l => (l.match(/\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b/g) || []))
+          .filter(t => t.length > 3 && !/^(Dear|Subject|Resume|Curriculum|Contact|Phone|Email|Address|Date|References)/.test(t))
+          .filter(t => !nameWords.every(w => t.includes(w)))
+      )].slice(0, 15);
+    }
+
+    // ── Role/title extraction — from the resume, not a list ──
+    // Strategy 1: look for explicit title patterns (Senior X, Lead X, X Manager, etc.)
+    const TITLE_PATTERNS = /\b(?:junior|senior|lead|principal|staff|chief|head|vp|director|associate|assistant|certified|chartered|licensed|registered)?\s*(?:[A-Za-z.#+-]+\s+){0,2}(?:developer|engineer|architect|designer|manager|analyst|scientist|consultant|specialist|lead|administrator|accountant|officer|executive|coordinator|supervisor|therapist|nurse|doctor|agent|broker|assistant|officer|instructor|teacher|professor|technician|mechanic|inspector|auditor|controller|planner|surveyor|pharmacist|dietitian|therapist|counselor|social worker)\b/gi;
+    const rolePhrases = [...new Set(
+      lines.flatMap(l => (l.match(TITLE_PATTERNS) || []).map(r => r.trim()))
+    )].slice(0, 8);
+    // Strategy 2: first significant line is often the current title (skip name, contact info)
+    const titleLine = lines.find(l =>
+      l.length > 3 && l.length < 80 &&
+      !/^[A-Z0-9._%+-]+@/.test(l) &&
+      !/^\+?\d/.test(l) &&
+      !/^(http|www\.|linkedin|github)/i.test(l) &&
+      !/^(curriculum|resume|cv|contact|phone|email|address)/i.test(l) &&
+      ROLE_SUFFIXES.test(l)
+    );
+    const suggestedKeywords = [...new Set([
+      ...rolePhrases,
+      ...(titleLine ? [titleLine.trim()] : []),
+      ...skills.slice(0, 5),
+    ])].slice(0, 10).map(stripMarkdown);
+
+    // ── Location extraction — worldwide, not India-only ──
+    // Extract any city-like proper nouns that appear near address/contact sections
+    // or are mentioned in the first 20 lines (header area)
+    const headerText = lines.slice(0, 20).join(' ').toLowerCase();
+    const bodyText = textLower;
+    // Match common city patterns: standalone capitalized words in address-like context
+    const CITY_PATTERN = /\b(?:mumbai|kalyan|thane|navi mumbai|pune|bangalore|bengaluru|delhi|gurgaon|noida|hyderabad|chennai|kolkata|ahmedabad|goa|jaipur|lucknow|coimbatore|indore|nagpur|surat|vadodara|visakhapatnam|remote|india|usa|uk|canada|australia|singapore|dubai|uae|abu dhabi|sharjah|london|manchester|birmingham|new york|san francisco|seattle|toronto|vancouver|berlin|munich|paris|amsterdam|tokyo|seoul|hong kong|shanghai|bangkok|jakarta|manila|nairobi|lagos|johannesburg|cape town|sao paulo|mexico city|buenos aires|berlin|madrid|barcelona|rome|milan|zurich|vienna|prague|warsaw|budapest|lisbon|dublin)\b/gi;
+    const suggestedLocations = [...new Set(
+      (bodyText.match(CITY_PATTERN) || []).map(l => l.charAt(0).toUpperCase() + l.slice(1).toLowerCase())
+    )].slice(0, 5);
+
+    const existing = readProfile();
+    if (!existing.candidate) existing.candidate = {};
+    if (name && !existing.candidate?.full_name) { existing.candidate.full_name = name; }
+    if (email) existing.candidate.email = email;
+    if (phone) existing.candidate.phone = phone;
+    writeProfile(existing);
+
+    const portfolioUrl = links.find(l => l.includes('github') || l.includes('portfolio')) || '';
+    const linkedinUrl = links.find(l => l.includes('linkedin')) || '';
+
+    // Compensation guess — stream-agnostic, derived from seniority signals and location.
+    // This is a rough heuristic. The onboarding confirmation step lets the user correct it.
+    // Reasoning is included so the UI can explain *why* a number was guessed.
+    const hasSeniorSignals = /senior|lead|principal|staff|head|director|vp|architect|chief|10\+|8\+|12\+|15\+/i.test(text);
+    const hasInternSignals = /\bintern(?:ship)?\b|\bfresher\b|\bentry.?level\b|\bjunior\b/i.test(text);
+    const hasExperienceYears = (text.match(/\b(\d{1,2})\+?\s*(?:years?|yrs?)\b/i) || [])[1];
+    const expYears = hasExperienceYears ? parseInt(hasExperienceYears) : 0;
+    const locationLower = text.toLowerCase();
+    const isMetroCity = /mumbai|bangalore|pune|delhi|gurgaon|noida|hyderabad|chennai|london|new york|san francisco|singapore|dubai|toronto|berlin|tokyo/i.test(locationLower);
+    let compensationGuess = '';
+    let compensationReason = '';
+    if (hasInternSignals) {
+      compensationGuess = '1.5-3 LPA';
+      compensationReason = 'Resume mentions intern/fresher level — typical entry-level range';
+    } else if (hasSeniorSignals || expYears >= 8) {
+      compensationGuess = isMetroCity ? '15-30 LPA' : '10-20 LPA';
+      compensationReason = `Senior-level signals detected${isMetroCity ? ' in a metro city' : ''} — senior range`;
+    } else if (expYears >= 3) {
+      compensationGuess = isMetroCity ? '6-12 LPA' : '4-8 LPA';
+      compensationReason = `${expYears} years experience${isMetroCity ? ' in a metro city' : ''} — mid-level range`;
+    } else if (isMetroCity) {
+      compensationGuess = '3-6 LPA';
+      compensationReason = 'Metro city location detected — typical range for early-career roles';
+    } else {
+      compensationGuess = '2.5-5 LPA';
+      compensationReason = 'No strong seniority signals — entry-to-mid range estimate';
+    }
+
+    res.json({
+      name, email, phone,
+      portfolio: portfolioUrl,
+      linkedin: linkedinUrl,
+      suggestedKeywords,
+      suggestedLocations,
+      compensationGuess,
+      compensationReason,
+      fileName: req.file.originalname || ''
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /email/triage — classify inbox emails server-side into recruiter replies / spam / other
+app.post('/email/triage', async (req, res) => {
+  const { email, appPassword } = req.body;
+  const user = email || process.env.GMAIL_USER;
+  const pass = appPassword || process.env.GMAIL_APP_PASSWORD;
+  if (!user || !pass) return res.status(400).json({ error: 'email and appPassword required' });
+
+  const allEmails = await fetchEmails(user, pass);
+  const triaged = allEmails.map(e => {
+    const subj = (e.subject || '').toLowerCase();
+    const body = (e.body || '').toLowerCase();
+    const isInterview = /interview|schedule|meeting|phone screen|zoom|teams|on-site/i.test(subj) ||
+      /schedule|availability|next step/i.test(body);
+    const isRejection = /reject|unfortunately|not moving forward|decided to pursue other/i.test(subj) ||
+      /unfortunately|not selected|other candidates/i.test(body);
+    const isOffer = /offer|congratulations|pleased to inform|compensation|package/i.test(subj) ||
+      /offer letter|join|start date/i.test(body);
+    const isRecruiter = /recruiter|talent.?acquisition|hiring manager|your application/i.test(subj) ||
+      /resume|application|profile|opportunity/i.test(body);
+    const isSpam = /unsubscribe|promotion|newsletter|discount|you won|click here|limited time/i.test(subj) ||
+      /marketing|sale|offer|subscribe/i.test(body);
+    let classification = 'noise';
+    if (isInterview) classification = 'interview';
+    else if (isOffer) classification = 'offer';
+    else if (isRejection) classification = 'rejection';
+    else if (isRecruiter) classification = 'recruiter_reply';
+    else if (isSpam) classification = 'spam';
+    return { ...e, classification };
+  });
+  res.json({ emails: triaged });
+});
+
+// GET /portals — list available tracked companies and boards
+app.get('/portals', (req, res) => {
+  try {
+    const portalsPath = join(__dirname, 'portals.yml');
+    if (!existsSync(portalsPath)) return res.json({ companies: [], boards: [] });
+    const py = yaml.load(readFileSync(portalsPath, 'utf-8'));
+    res.json({
+      companies: (py?.tracked_companies || []).filter(c => c.enabled !== false).map(c => ({ name: c.name, url: c.careers_url || '' })),
+      boards: (py?.search_queries || []).filter(b => b.enabled !== false).map(b => ({ name: b.name, query: b.query || '' })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message, companies: [], boards: [] });
+  }
+});
+
+// POST /email/reply — draft a contextual reply using profile data
+app.post('/email/reply', async (req, res) => {
+  try {
+    const { email, appPassword, to, subject, originalBody, replyType } = req.body;
+    if (!email || !appPassword || !to) return res.status(400).json({ error: 'email, appPassword, and to are required' });
+
+    const profile = readProfile();
+    const c = profile.candidate || {};
+    const name = c.full_name || 'Candidate';
+    const phone = c.phone || '';
+    const loc = profile.location?.city || '';
+
+    let replyBody = '';
+    const type = (replyType || 'interview').toLowerCase();
+
+    if (type === 'interview') {
+      replyBody = `Dear Hiring Team,\n\nThank you for your invitation. I would be delighted to attend an interview at your earliest convenience. I am available on weekdays, preferably in the afternoon (2 PM - 5 PM IST).\n\nPlease let me know if you need any additional information or documents from my side.\n\nLooking forward to speaking with you.\n\nBest regards,\n${name}\n${phone || ''}`.trim();
+    } else if (type === 'follow_up') {
+      replyBody = `Dear Hiring Team,\n\nI hope this message finds you well. I am writing to follow up on my application for the role. I remain very interested in the opportunity and would appreciate any update on the status of my application.\n\nThank you for your time and consideration.\n\nBest regards,\n${name}\n${phone || ''}`.trim();
+    } else if (type === 'accept_offer') {
+      replyBody = `Dear Hiring Team,\n\nThank you for the offer. I am thrilled to accept and look forward to joining the team. Please let me know the next steps regarding onboarding and any documents you need from my side.\n\nBest regards,\n${name}\n${phone || ''}`.trim();
+    } else if (type === 'negotiate') {
+      const comp = profile.compensation?.target_range || '5-6 LPA';
+      replyBody = `Dear Hiring Team,\n\nThank you for the offer. I am very excited about the role and the opportunity to contribute to your team. Before I accept, I was hoping we could discuss the compensation package. Based on my experience and the market rate for this role in ${loc || 'Mumbai'}, I was expecting something in the range of ${comp}. I am confident I can deliver strong value and would love to make this work.\n\nI look forward to hearing your thoughts.\n\nBest regards,\n${name}\n${phone || ''}`.trim();
+    } else {
+      replyBody = `Dear Team,\n\nThank you for your message.\n\nBest regards,\n${name}`.trim();
+    }
+
+    res.json({ replyBody, subject: `Re: ${subject || ''}` });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /auto-pipeline — evaluate a JD via opencode (career-ops agent), save report + tracker row
+app.post('/auto-pipeline', async (req, res) => {
+  let evaluation = { score: 'N/A', fit: '', strengths: [], gaps: [] };
+  let jdText = '';
+
+  try {
+    const { url, company, role } = req.body;
+    if (!url) return res.status(400).json({ error: 'url required' });
+
+    // Fetch JD content for opencode context
+    try {
+      const resp = await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36' },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (resp.ok) {
+        const html = await resp.text();
+        jdText = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 8000);
+      }
+    } catch { /* fetch failed — opencode will handle it */ }
+
+    // Delegate to opencode — the career-ops AI agent
+    const prompt = jdText
+      ? `Evaluate this job posting using career-ops auto-pipeline mode. Return ONLY a JSON object (no markdown, no code fences) with these fields: {"score": "X.X", "fit": "1-2 sentence fit assessment", "strengths": ["s1","s2"], "gaps": ["g1"]}. Score is 1.0-5.0. Be honest and conservative. Job URL: ${url} Company: ${company || 'Unknown'} Role: ${role || 'Unknown'} JD text: ${jdText.slice(0, 6000)}`
+      : `Evaluate this job posting using career-ops auto-pipeline mode. Return ONLY a JSON object (no markdown, no code fences) with these fields: {"score": "X.X", "fit": "1-2 sentence fit assessment", "strengths": ["s1","s2"], "gaps": ["g1"]}. Score is 1.0-5.0. Be honest and conservative. Job URL: ${url} Company: ${company || 'Unknown'} Role: ${role || 'Unknown'}`;
+
+    const result = await new Promise((resolve, reject) => {
+      const proc = spawn('opencode', ['run', prompt], {
+        cwd: __dirname,
+        env: { ...process.env, PATH: `/root/.opencode/bin:${process.env.PATH}` },
+        timeout: 120000,
+      });
+      let stdout = '';
+      let stderr = '';
+      proc.stdout.on('data', d => { stdout += d.toString(); });
+      proc.stderr.on('data', d => { stderr += d.toString(); });
+      proc.on('close', code => {
+        if (code === 0) resolve(stdout);
+        else reject(new Error(`opencode exited ${code}: ${stderr.slice(0, 300)}`));
+      });
+      proc.on('error', reject);
+    });
+
+    // Parse JSON from opencode response (handle markdown fences, prefixes)
+    try {
+      const jsonMatch = result.match(/\{[\s\S]*?\}/);
+      if (jsonMatch) {
+        evaluation = JSON.parse(jsonMatch[0]);
+      } else {
+        evaluation = { score: 'N/A', fit: result.slice(0, 200) };
+      }
+    } catch {
+      evaluation = { score: 'N/A', fit: result.slice(0, 200) };
+    }
+  } catch (e) {
+    evaluation = { score: 'N/A', fit: `Error: ${e.message}` };
+  }
+
+  const score = evaluation.score || 'N/A';
+  const companySlug = (req.body.company || 'unknown').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  const today = new Date().toISOString().slice(0, 10);
+
+  // Find next report number
+  let nextNum = 1;
+  try {
+    const existing = existsSync(join(__dirname, 'reports'))
+      ? readdirSync(join(__dirname, 'reports')).filter(f => f.endsWith('.md')).map(f => parseInt(f.split('-')[0])).filter(n => !isNaN(n))
+      : [];
+    nextNum = existing.length > 0 ? Math.max(...existing) + 1 : 1;
+  } catch { nextNum = 1; }
+  const numStr = String(nextNum).padStart(3, '0');
+
+  // Save report
+  const reportDir = join(__dirname, 'reports');
+  if (!existsSync(reportDir)) mkdirSync(reportDir, { recursive: true });
+  const reportPath = join(reportDir, `${numStr}-${companySlug}-${today}.md`);
+  const reportContent = `# Evaluation Report #${numStr}
+
+**Company:** ${req.body.company || 'Unknown'}
+**Role:** ${req.body.role || 'Unknown'}
+**URL:** ${req.body.url || ''}
+**Date:** ${today}
+**Score:** ${score}/5
+**PDF:** ❌
+
+## Fit Assessment
+${evaluation.fit || 'N/A'}
+
+## Strengths
+${(evaluation.strengths || []).map(s => `- ${s}`).join('\n') || '- N/A'}
+
+## Gaps
+${(evaluation.gaps || []).map(g => `- ${g}`).join('\n') || '- None identified'}
+`;
+  writeFileSync(reportPath, reportContent, 'utf-8');
+
+  // Update tracker — append TSV to batch/tracker-additions
+  const additionsDir = join(__dirname, 'batch/tracker-additions');
+  if (!existsSync(additionsDir)) mkdirSync(additionsDir, { recursive: true });
+  const tsvPath = join(additionsDir, `${numStr}-${companySlug}.tsv`);
+  const tsvLine = `${numStr}\t${today}\t${req.body.company || 'Unknown'}\t${req.body.role || 'Unknown'}\tEvaluated\t${score}/5\t❌\t[${numStr}](reports/${numStr}-${companySlug}-${today}.md)\tAuto-pipeline (opencode)`;
+  writeFileSync(tsvPath, tsvLine + '\n', 'utf-8');
+
+  // Run merge-tracker to apply the addition
+  try {
+    spawnSync('node', ['merge-tracker.mjs'], { cwd: __dirname, encoding: 'utf-8', timeout: 10000 });
+  } catch { /* non-fatal */ }
+
+  res.json({
+    score,
+    reportNum: nextNum,
+    reportPath: `${numStr}-${companySlug}-${today}.md`,
+    fit: evaluation.fit,
+    strengths: evaluation.strengths || [],
+    gaps: evaluation.gaps || [],
+  });
+});
+
+// POST /email/credentials — save Gmail credentials to .bridge.env and update runtime env
+app.post('/email/credentials', (req, res) => {
+  try {
+    const { gmailUser, appPassword } = req.body;
+    if (!gmailUser || !appPassword) {
+      return res.status(400).json({ success: false, error: 'gmailUser and appPassword are required' });
+    }
+
+    // Update runtime env
+    process.env.GMAIL_USER = gmailUser;
+    process.env.GMAIL_APP_PASSWORD = appPassword;
+
+    // Persist to .bridge.env
+    const envPath = join(__dirname, '.bridge.env');
+    const lines = [];
+    if (existsSync(envPath)) {
+      const existing = readFileSync(envPath, 'utf-8').split('\n');
+      for (const line of existing) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) { lines.push(line); continue; }
+        const eq = trimmed.indexOf('=');
+        if (eq > 0) {
+          const key = trimmed.slice(0, eq).trim();
+          if (key === 'GMAIL_USER' || key === 'GMAIL_APP_PASSWORD') continue; // replace
+        }
+        lines.push(line);
+      }
+    }
+    lines.push(`GMAIL_USER=${gmailUser}`);
+    lines.push(`GMAIL_APP_PASSWORD=${appPassword}`);
+    writeFileSync(envPath, lines.join('\n') + '\n', 'utf-8');
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// POST /liveness — check job posting URLs for liveness via check-liveness.mjs
+app.post('/liveness', (req, res) => {
+  try {
+    const { urls } = req.body;
+    if (!Array.isArray(urls) || urls.length === 0) {
+      return res.status(400).json({ error: 'urls array is required' });
+    }
+    const script = join(__dirname, 'check-liveness.mjs');
+    if (!existsSync(script)) {
+      return res.status(500).json({ error: 'check-liveness.mjs not found' });
+    }
+    // Write URLs to a temp file, run the checker
+    const tmpFile = join(__dirname, 'data', `_liveness_check_${Date.now()}.txt`);
+    writeFileSync(tmpFile, urls.join('\n'), 'utf-8');
+    try {
+      const r = spawnSync('node', [script, '--file', tmpFile], {
+        cwd: __dirname,
+        encoding: 'utf-8',
+        timeout: 60000
+      });
+      try { unlinkSync(tmpFile); } catch {}
+      if (r.status !== 0) {
+        return res.status(500).json({ error: r.stderr || 'liveness check failed' });
+      }
+      try {
+        res.json(JSON.parse((r.stdout || '{}').trim()));
+      } catch {
+        // Parse line-by-line results
+        const lines = (r.stdout || '').split('\n').filter(Boolean);
+        const results = lines.map(line => {
+          try { return JSON.parse(line); } catch { return { url: line, status: 'unknown' }; }
+        });
+        res.json({ results });
+      }
+    } catch (e) {
+      try { unlinkSync(tmpFile); } catch {}
+      res.status(500).json({ error: e.message });
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /followups — get follow-up cadence from followup-cadence.mjs
+app.get('/followups', (req, res) => {
+  try {
+    const script = join(__dirname, 'followup-cadence.mjs');
+    if (!existsSync(script)) {
+      return res.status(500).json({ error: 'followup-cadence.mjs not found' });
+    }
+    const r = spawnSync('node', [script, '--json'], {
+      cwd: __dirname,
+      encoding: 'utf-8',
+      timeout: 30000
+    });
+    if (r.status !== 0) {
+      return res.status(500).json({ error: r.stderr || 'followup-cadence failed' });
+    }
+    try {
+      res.json(JSON.parse((r.stdout || '[]').trim()));
+    } catch {
+      // Fallback: return raw output wrapped in array
+      const lines = (r.stdout || '').split('\n').filter(Boolean);
+      res.json({ followups: lines });
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /email/classify — classify an email via opencode (replaces direct Anthropic calls)
+app.post('/email/classify', async (req, res) => {
+  try {
+    const { from, fromEmail, subject, preview } = req.body;
+    if (!subject) return res.status(400).json({ error: 'subject required' });
+
+    const prompt = `You are a job-search email classifier. Classify this email as one of: job_reply, job_alert, spam.
+Return ONLY a JSON object (no markdown, no code fences): {"classification": "job_reply|job_alert|spam", "confidence": 0.0-1.0, "reason": "brief explanation"}
+
+Email:
+From: ${from || 'Unknown'} <${fromEmail || 'unknown'}>
+Subject: ${subject}
+Preview: ${(preview || '').slice(0, 500)}`;
+
+    const result = await new Promise((resolve, reject) => {
+      const proc = spawn('opencode', ['run', prompt], {
+        cwd: __dirname,
+        env: { ...process.env, PATH: `/root/.opencode/bin:${process.env.PATH}` },
+        timeout: 60000,
+      });
+      let stdout = '';
+      let stderr = '';
+      proc.stdout.on('data', d => { stdout += d.toString(); });
+      proc.stderr.on('data', d => { stderr += d.toString(); });
+      proc.on('close', code => {
+        if (code === 0) resolve(stdout);
+        else reject(new Error(`opencode exited ${code}: ${stderr.slice(0, 300)}`));
+      });
+      proc.on('error', reject);
+    });
+
+    // Parse JSON from response
+    let classification = { classification: 'spam', confidence: 0.5, reason: 'parse_error' };
+    try {
+      const jsonMatch = result.match(/\{[\s\S]*?\}/);
+      if (jsonMatch) classification = JSON.parse(jsonMatch[0]);
+    } catch { /* fallback to default */ }
+
+    res.json(classification);
+  } catch (e) {
+    res.json({ classification: 'spam', confidence: 0.0, reason: `Error: ${e.message}` });
+  }
+});
+
+// POST /email/cover-letter — generate a cover letter via opencode (replaces direct Anthropic calls)
+app.post('/email/cover-letter', async (req, res) => {
+  try {
+    const { company, role, resume, jd } = req.body;
+    if (!company || !role) return res.status(400).json({ error: 'company and role required' });
+
+    const prompt = `Write a concise, tailored job application email body (3-4 paragraphs).
+Structure: introduction, relevant highlights from the resume, why this role, closing.
+Never invent claims. Reorder and emphasize existing experience from the resume.
+
+RESUME:
+${(resume || '').slice(0, 4000)}
+
+JOB: ${role} at ${company}
+${jd ? `JD: ${jd.slice(0, 3000)}` : ''}
+
+Return ONLY the email body text (no markdown, no JSON, no code fences).`;
+
+    const result = await new Promise((resolve, reject) => {
+      const proc = spawn('opencode', ['run', prompt], {
+        cwd: __dirname,
+        env: { ...process.env, PATH: `/root/.opencode/bin:${process.env.PATH}` },
+        timeout: 120000,
+      });
+      let stdout = '';
+      let stderr = '';
+      proc.stdout.on('data', d => { stdout += d.toString(); });
+      proc.stderr.on('data', d => { stderr += d.toString(); });
+      proc.on('close', code => {
+        if (code === 0) resolve(stdout);
+        else reject(new Error(`opencode exited ${code}: ${stderr.slice(0, 300)}`));
+      });
+      proc.on('error', reject);
+    });
+
+    // Strip markdown fences if present
+    let coverLetter = result.trim();
+    coverLetter = coverLetter.replace(/^```[\s\S]*?\n/, '').replace(/\n```$/, '').trim();
+
+    res.json({ coverLetter });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── start ─────────────────────────────────────────────────────────
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`career-ops bridge server running on http://0.0.0.0:${PORT}`);
+  console.log(`Tracker: ${TRACKER_PATH}`);
+  console.log(`Profile: ${PROFILE_PATH}`);
+});
