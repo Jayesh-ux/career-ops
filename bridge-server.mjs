@@ -686,15 +686,16 @@ app.get('/scan/stream', async (req, res) => {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
   });
-  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  const send = (event, data) => { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); if (res.flush) res.flush(); };
 
   try {
     const kw = (req.query.keywords || '').split(',').map(k => k.toLowerCase().trim()).filter(Boolean);
     const locs = (req.query.locations || '').split(',').map(l => l.toLowerCase().trim()).filter(Boolean);
 
     const portalsPath = join(__dirname, 'portals.yml');
-    if (!existsSync(portalsPath)) { send('done', { total: 0 }); return res.end(); }
+    if (!existsSync(portalsPath)) { send('done', { results: [], summary: { portalsScanned: 0, totalFound: 0, filteredByKeywords: 0, duplicatesSkipped: 0, netNew: 0 } }); return res.end(); }
     const py = yaml.load(readFileSync(portalsPath, 'utf-8'));
     const companies = py?.tracked_companies || [];
     const boards = py?.search_queries || [];
@@ -716,7 +717,13 @@ app.get('/scan/stream', async (req, res) => {
       }
     }
 
-    const providers = await loadProviders(join(__dirname, 'providers'));
+    let providers;
+    try {
+      providers = await loadProviders(join(__dirname, 'providers'));
+    } catch (e) {
+      console.error('[scan/stream] loadProviders failed:', e.message);
+      providers = new Map();
+    }
     const results = [];
     let totalBeforeFilter = 0;
     const providerTargets = [];
