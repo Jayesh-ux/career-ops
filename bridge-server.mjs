@@ -13,6 +13,41 @@ import { loadProviders, resolveProvider } from './providers/_registry.mjs';
 import { makeHttpCtx } from './providers/_http.mjs';
 
 const require = createRequire(import.meta.url);
+
+// ── Environment check ──────────────────────────────────────────────
+// Detect proot-distro: bridge server MUST run in Termux directly,
+// NOT inside `proot-distro login`, because proot isolates the
+// network namespace and ports won't be reachable from the Android host.
+function detectProot() {
+  // proot-distro sets PROOT_DISTRO env var
+  if (process.env.PROOT_DISTRO) return true;
+  // In proot, /proc/1/root differs from /
+  try {
+    const proc1 = readFileSync('/proc/1/root', 'utf-8').trim();
+    if (proc1 && proc1 !== '/' && proc1 !== '') return true;
+  } catch { /* /proc not available — assume not proot */ }
+  // Termux sets PREFIX to /data/data/com.termux/files/usr
+  const prefix = process.env.PREFIX || '';
+  if (prefix && !prefix.includes('com.termux')) return true;
+  return false;
+}
+
+if (detectProot()) {
+  console.error('');
+  console.error('╔══════════════════════════════════════════════════════════╗');
+  console.error('║  ERROR: This server MUST run in Termux directly!       ║');
+  console.error('║                                                      ║');
+  console.error('║  Do NOT run it inside proot-distro.                   ║');
+  console.error('║  proot-distro isolates the network namespace,         ║');
+  console.error('║  so the Android app cannot reach this server.         ║');
+  console.error('║                                                      ║');
+  console.error('║  Run this instead:                                    ║');
+  console.error('║    cd ~/career-ops                                   ║');
+  console.error('║    node bridge-server.mjs                             ║');
+  console.error('╚══════════════════════════════════════════════════════════╝');
+  console.error('');
+  process.exit(1);
+}
 const Imap = require('imap');
 const { simpleParser } = require('mailparser');
 const nodemailer = require('nodemailer');
