@@ -680,6 +680,145 @@ app.post('/scan', async (req, res) => {
   }
 });
 
+// GET /scan/stream — SSE progress stream for portal scanning
+app.get('/scan/stream', async (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+  });
+  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+
+  try {
+    const kw = (req.query.keywords || '').split(',').map(k => k.toLowerCase().trim()).filter(Boolean);
+    const locs = (req.query.locations || '').split(',').map(l => l.toLowerCase().trim()).filter(Boolean);
+
+    const portalsPath = join(__dirname, 'portals.yml');
+    if (!existsSync(portalsPath)) { send('done', { total: 0 }); return res.end(); }
+    const py = yaml.load(readFileSync(portalsPath, 'utf-8'));
+    const companies = py?.tracked_companies || [];
+    const boards = py?.search_queries || [];
+
+    const blacklistPath = join(__dirname, 'data/blacklist.md');
+    const blacklist = new Set();
+    if (existsSync(blacklistPath)) {
+      for (const line of readFileSync(blacklistPath, 'utf-8').split('\n')) {
+        const m = line.match(/^\s*[-*]\s*(.+)/);
+        if (m) blacklist.add(m[1].trim().toLowerCase());
+      }
+    }
+
+    const scanHistory = new Map();
+    if (existsSync(SCAN_HISTORY)) {
+      for (const line of readFileSync(SCAN_HISTORY, 'utf-8').split('\n')) {
+        const parts = line.split('\t');
+        if (parts.length >= 2) scanHistory.set(parts[1], parts[0]);
+      }
+    }
+
+    const providers = await loadProviders(join(__dirname, 'providers'));
+    const results = [];
+    let totalBeforeFilter = 0;
+    const providerTargets = [];
+    const webSearchTargets = [];
+
+    for (const entry of companies) {
+      if (entry.enabled === false) continue;
+      if (blacklist.has((entry.name || '').toLowerCase())) continue;
+      const resolved = resolveProvider(entry, providers);
+      if (resolved && !resolved.error) providerTargets.push({ entry, provider: resolved.provider });
+      else if (entry.scan_query || entry.careers_url) webSearchTargets.push(entry);
+    }
+    for (const entry of boards) {
+      if (entry.enabled === false) continue;
+      const resolved = resolveProvider(entry, providers);
+      if (resolved && !resolved.error) providerTargets.push({ entry, provider: resolved.provider, isBoard: true });
+    }
+
+    const totalPortals = providerTargets.length + Math.min(webSearchTargets.length, 15);
+    let completed = 0;
+
+    send('start', { totalPortals, phase: 'providers' });
+
+    // Phase 1: provider scanning (sequential for progress)
+    for (const t of providerTargets) {
+      try {
+        const ctx = makeHttpCtx();
+        const jobs = await t.provider.fetch(t.entry, ctx);
+        totalBeforeFilter += jobs.length;
+        for (const job of jobs) {
+          const title = (job.title || '').toLowerCase();
+          const loc = (job.location || '').toLowerCase();
+          const matchesKw = kw.length === 0 || kw.some(k => title.includes(k));
+          const matchesLoc = locs.length === 0 || locs.some(l => loc.includes(l));
+          if (matchesKw && matchesLoc) {
+            results.push({ company: job.company || t.entry.name || '', role: job.title || '', location: job.location || '', url: job.url || '', matched: true, source: t.provider.id });
+          }
+        }
+      } catch { /* skip */ }
+      completed++;
+      send('progress', { completed, total: totalPortals, current: t.entry.name || 'unknown', found: results.length });
+    }
+
+    // Phase 2: web search fallback
+    if (webSearchTargets.length > 0) send('start', { totalPortals: webSearchTargets.length, phase: 'websearch' });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 25000);
+
+    for (const entry of webSearchTargets.slice(0, 15)) {
+      try {
+        if (!entry.careers_url) continue;
+        const resp = await fetch(entry.careers_url, { signal: controller.signal, headers: { 'User-Agent': 'Mozilla/5.0' } });
+        if (!resp.ok) continue;
+        const html = await resp.text();
+        const titlePattern = /<a[^>]*href="([^"]*)"[^>]*>([^<]*(?:developer|engineer|full.?stack|frontend|backend|react|node|python|java|intern)[^<]*)<\/a>/gi;
+        let m;
+        while ((m = titlePattern.exec(html)) !== null) {
+          const title = m[2].trim();
+          const lower = title.toLowerCase();
+          totalBeforeFilter++;
+          if (kw.length === 0 || kw.some(k => lower.includes(k))) {
+            const href = m[1].startsWith('http') ? m[1] : new URL(m[1], entry.careers_url).href;
+            if (!results.some(r => r.url === href)) {
+              results.push({ company: entry.name || '', role: title, location: '', url: href, matched: true, source: 'websearch' });
+            }
+          }
+        }
+      } catch { /* skip */ }
+      completed++;
+      send('progress', { completed, total: totalPortals, current: entry.name || 'web', found: results.length });
+    }
+    clearTimeout(timeout);
+
+    // Dedup
+    const seen = new Set();
+    const deduped = results.filter(r => { if (seen.has(r.url)) return false; seen.add(r.url); return true; });
+    const today = new Date().toISOString().slice(0, 10);
+    for (const r of deduped) {
+      if (r.url && !scanHistory.has(r.url)) {
+        try { appendFileSync(SCAN_HISTORY, `${today}\t${r.url}\t${r.source || 'bridge'}\n`); } catch { /* non-fatal */ }
+      }
+    }
+
+    send('done', {
+      results: deduped.slice(0, 100),
+      summary: {
+        portalsScanned: totalPortals,
+        totalFound: totalBeforeFilter,
+        filteredByKeywords: totalBeforeFilter - results.length,
+        duplicatesSkipped: results.length - deduped.length,
+        netNew: deduped.length,
+        tooBroad: deduped.length > 100,
+        narrowingHints: deduped.length > 100 ? ['Too many results — narrow keywords'] : [],
+      },
+    });
+    res.end();
+  } catch (e) {
+    send('error', { error: e.message });
+    res.end();
+  }
+});
+
 // POST /resume/upload — accepts PDF/DOCX, extracts text, returns structured profile + suggestions
 app.post('/resume/upload', upload.single('resume'), async (req, res) => {
   try {
@@ -1657,6 +1796,14 @@ app.post('/pipeline/evaluate', async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ── crash protection ───────────────────────────────────────────────
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] uncaughtException:', err.message);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[FATAL] unhandledRejection:', reason);
 });
 
 // ── start ─────────────────────────────────────────────────────────
