@@ -1590,7 +1590,7 @@ app.get('/pipeline', (req, res) => {
       // Parse lines like: "- https://company.com/jobs/123" or "- [Company] https://..."
       const urlMatch = trimmed.match(/https?:\/\/\S+/);
       if (urlMatch) {
-        const url = urlMatch[0].replace(/[)\]$/, '');
+        const url = urlMatch[0].replace(/[)\]]$/, '');
         const label = trimmed.replace(/^[-*]\s*/, '').replace(url, '').trim();
         // Check if this URL already has a tracker entry (already evaluated)
         const trackerText = existsSync(TRACKER_PATH) ? readFileSync(TRACKER_PATH, 'utf-8') : '';
