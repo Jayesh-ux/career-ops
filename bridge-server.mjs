@@ -1805,6 +1805,18 @@ app.post('/pipeline/evaluate', async (req, res) => {
   }
 });
 
+// ── auto-setup portals.yml from template if missing ─────────────────
+const PORTALS_EXAMPLE = join(__dirname, 'templates/portals.example.yml');
+const PORTALS_YAML = join(__dirname, 'portals.yml');
+if (!existsSync(PORTALS_YAML) && existsSync(PORTALS_EXAMPLE)) {
+  try {
+    copyFileSync(PORTALS_EXAMPLE, PORTALS_YAML);
+    console.log('[setup] Copied templates/portals.example.yml → portals.yml');
+  } catch (e) {
+    console.error('[setup] Failed to copy portals.yml:', e.message);
+  }
+}
+
 // ── crash protection ───────────────────────────────────────────────
 process.on('uncaughtException', (err) => {
   console.error('[FATAL] uncaughtException:', err.message);
