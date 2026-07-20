@@ -150,6 +150,30 @@ function runCli(script, args = []) {
   return { stdout: result.stdout || '', stderr: result.stderr || '', status: result.status, error: result.error };
 }
 
+async function runOpencode(prompt, timeoutMs = 120000) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('opencode', ['run', prompt], {
+      cwd: __dirname,
+      env: { ...process.env, PATH: `/root/.opencode/bin:${process.env.PATH}` },
+      timeout: timeoutMs,
+    });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', d => { stdout += d.toString(); });
+    proc.stderr.on('data', d => { stderr += d.toString(); });
+    proc.on('close', code => {
+      if (code === 0) resolve(stdout);
+      else reject(new Error(`opencode exited ${code}: ${stderr.slice(0, 300)}`));
+    });
+    proc.on('error', reject);
+  });
+}
+
+function parseJsonFromOutput(text) {
+  const m = text.match(/\{[\s\S]*?\}/);
+  return m ? (() => { try { return JSON.parse(m[0]); } catch { return null; } })() : null;
+}
+
 function nextReportNum() {
   if (!existsSync(join(__dirname, 'reports'))) mkdirSync(join(__dirname, 'reports'), { recursive: true });
   const existing = readFileSync(TRACKER_PATH, 'utf-8').split('\n');
@@ -1189,6 +1213,435 @@ Return ONLY the email body text (no markdown, no JSON, no code fences).`;
     coverLetter = coverLetter.replace(/^```[\s\S]*?\n/, '').replace(/\n```$/, '').trim();
 
     res.json({ coverLetter });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── new workflow endpoints ──────────────────────────────────────────
+
+// POST /email/draft — formal application email (hr_application, referral, cold, process_stuck)
+app.post('/email/draft', async (req, res) => {
+  try {
+    const { type, company, role, jd, contactName, reportNum } = req.body;
+    const cv = existsSync(join(__dirname, 'data/cv.md')) ? readFileSync(join(__dirname, 'data/cv.md'), 'utf-8').slice(0, 4000) : '';
+    const profile = readProfile();
+    const prompt = `You are a job application email drafter. Generate a formal application email.
+Type: ${type || 'hr_application'}
+Company: ${company || 'Unknown'}
+Role: ${role || 'Unknown'}
+Contact: ${contactName || 'Hiring Team'}
+${jd ? `JD: ${jd.slice(0, 3000)}` : ''}
+${reportNum ? `Report: #${reportNum}` : ''}
+
+CV excerpt: ${cv}
+Candidate name: ${profile?.candidate?.full_name || 'Candidate'}
+Candidate email: ${profile?.candidate?.email || ''}
+Candidate phone: ${profile?.candidate?.phone || ''}
+
+Return JSON: {"subject": "...", "body": "...", "contactBlock": "..."}`;
+
+    const result = await runOpencode(prompt);
+    const parsed = parseJsonFromOutput(result);
+    res.json(parsed || { subject: '', body: result.trim().slice(0, 2000), contactBlock: '' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /outreach — LinkedIn recruiter/hiring manager outreach (contacto)
+app.post('/outreach', async (req, res) => {
+  try {
+    const { company, role, contactType, jd, contactName } = req.body;
+    const cv = existsSync(join(__dirname, 'data/cv.md')) ? readFileSync(join(__dirname, 'data/cv.md'), 'utf-8').slice(0, 4000) : '';
+    const prompt = `You are a job outreach message generator. Create a ≤300 character LinkedIn connection request.
+Company: ${company || 'Unknown'}
+Role: ${role || 'Unknown'}
+Contact type: ${contactType || 'recruiter'}
+Contact name: ${contactName || ''}
+${jd ? `JD: ${jd.slice(0, 2000)}` : ''}
+CV excerpt: ${cv}
+
+Rules: max 300 chars. No corporate speak. No "passionate about". Lead with value.
+Return JSON: {"message": "...", "charCount": N, "contactType": "..."}`;
+
+    const result = await runOpencode(prompt);
+    const parsed = parseJsonFromOutput(result);
+    res.json(parsed || { message: result.trim().slice(0, 300), charCount: result.trim().length, contactType: contactType || 'recruiter' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /deep — company research (6-axis)
+app.post('/deep', async (req, res) => {
+  try {
+    const { company, role } = req.body;
+    const prompt = `Research this company for a job application. Return JSON with 6 axes:
+Company: ${company}
+${role ? `Role: ${role}` : ''}
+
+Return JSON: {"ai_strategy": "...", "recent_moves": "...", "engineering_culture": "...", "challenges": "...", "competitors": "...", "candidate_angle": "..."}`;
+
+    const result = await runOpencode(prompt, 180000);
+    const parsed = parseJsonFromOutput(result);
+    res.json(parsed || { summary: result.trim().slice(0, 3000) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /interview-prep — company-specific interview preparation
+app.post('/interview-prep', async (req, res) => {
+  try {
+    const { company, role, reportNum } = req.body;
+    const cv = existsSync(join(__dirname, 'data/cv.md')) ? readFileSync(join(__dirname, 'data/cv.md'), 'utf-8').slice(0, 4000) : '';
+    const report = reportNum ? (() => {
+      try { const f = readdirSync(join(__dirname, 'reports')).filter(f => f.startsWith(String(reportNum).padStart(3, '0'))); return f.length ? readFileSync(join(__dirname, 'reports', f[0]), 'utf-8').slice(0, 4000) : ''; } catch { return ''; }
+    })() : '';
+    const prompt = `Generate interview prep for this company.
+Company: ${company}
+Role: ${role || ''}
+CV: ${cv}
+${report ? `Report: ${report}` : ''}
+
+Return JSON: {"likely_questions": ["q1","q2","q3","q4","q5"], "star_stories": [{"situation":"...","task":"...","action":"...","result":"..."}], "company_red_flags": ["..."], "questions_to_ask": ["..."], "key_talking_points": ["..."]}`;
+
+    const result = await runOpencode(prompt, 180000);
+    const parsed = parseJsonFromOutput(result);
+    res.json(parsed || { summary: result.trim().slice(0, 3000) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /batch — batch evaluate multiple URLs
+app.post('/batch', async (req, res) => {
+  try {
+    const { urls } = req.body;
+    if (!Array.isArray(urls) || urls.length === 0) return res.status(400).json({ error: 'urls array required' });
+    const results = [];
+    for (const item of urls.slice(0, 10)) {
+      const url = typeof item === 'string' ? item : item.url;
+      const company = typeof item === 'string' ? '' : item.company || '';
+      const role = typeof item === 'string' ? '' : item.role || '';
+      try {
+        const prompt = `Evaluate this job. Return JSON: {"score":"X.X","fit":"...","strengths":["..."],"gaps":["..."]} Job: ${role} at ${company} URL: ${url}`;
+        const r = await runOpencode(prompt, 60000);
+        const parsed = parseJsonFromOutput(r);
+        results.push({ url, company, role, ...(parsed || { score: 'N/A', fit: r.trim().slice(0, 200) }) });
+      } catch (e) {
+        results.push({ url, company, role, score: 'N/A', fit: `Error: ${e.message}` });
+      }
+    }
+    res.json({ results });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /pdf — generate CV PDF
+app.post('/pdf', async (req, res) => {
+  try {
+    const script = join(__dirname, 'generate-pdf.mjs');
+    if (!existsSync(script)) return res.status(500).json({ error: 'generate-pdf.mjs not found' });
+    const r = spawnSync('node', [script], { cwd: __dirname, encoding: 'utf-8', timeout: 60000 });
+    if (r.status !== 0) return res.status(500).json({ error: r.stderr || 'PDF generation failed' });
+    const pdfFiles = readdirSync(join(__dirname, 'output')).filter(f => f.endsWith('.pdf'));
+    const latest = pdfFiles.sort().pop();
+    res.json({ success: true, pdfPath: latest || '', outputDir: 'output/' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /salary-gap — salary gap analysis
+app.get('/salary-gap', (req, res) => {
+  try {
+    const script = join(__dirname, 'salary-gap.mjs');
+    if (!existsSync(script)) return res.json({ observations: [], gaps: [] });
+    const r = spawnSync('node', [script, '--json'], { cwd: __dirname, encoding: 'utf-8', timeout: 30000 });
+    if (r.status !== 0) return res.json({ observations: [], gaps: [] });
+    try { res.json(JSON.parse(r.stdout.trim() || '{}')); } catch { res.json({ raw: r.stdout }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /cv — edit cv.md
+app.put('/cv', (req, res) => {
+  try {
+    const { content } = req.body;
+    if (!content) return res.status(400).json({ error: 'content required' });
+    const cvDir = join(__dirname, 'data');
+    if (!existsSync(cvDir)) mkdirSync(cvDir, { recursive: true });
+    writeFileSync(join(cvDir, 'cv.md'), content, 'utf-8');
+    res.json({ success: true, length: content.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /cv — read cv.md
+app.get('/cv', (req, res) => {
+  try {
+    const cvPath = join(__dirname, 'data/cv.md');
+    if (!existsSync(cvPath)) return res.json({ content: '' });
+    res.json({ content: readFileSync(cvPath, 'utf-8') });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET/POST /blacklist — manage do-not-apply list
+app.get('/blacklist', (req, res) => {
+  try {
+    const blPath = join(__dirname, 'data/blacklist.md');
+    if (!existsSync(blPath)) return res.json({ companies: [] });
+    const lines = readFileSync(blPath, 'utf-8').split('\n');
+    const companies = lines.map(l => { const m = l.match(/^\s*[-*]\s*(.+)/); return m ? m[1].trim() : ''; }).filter(Boolean);
+    res.json({ companies });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/blacklist', (req, res) => {
+  try {
+    const { company, action } = req.body;
+    if (!company) return res.status(400).json({ error: 'company required' });
+    const blPath = join(__dirname, 'data/blacklist.md');
+    const blDir = join(__dirname, 'data');
+    if (!existsSync(blDir)) mkdirSync(blDir, { recursive: true });
+    let lines = existsSync(blPath) ? readFileSync(blPath, 'utf-8').split('\n') : ['# Blacklist', ''];
+    if (action === 'remove') {
+      lines = lines.filter(l => !l.toLowerCase().includes(company.toLowerCase()));
+    } else {
+      if (!lines.some(l => l.toLowerCase().includes(company.toLowerCase()))) {
+        lines.push(`- ${company}`);
+      }
+    }
+    writeFileSync(blPath, lines.join('\n'), 'utf-8');
+    const companies = lines.map(l => { const m = l.match(/^\s*[-*]\s*(.+)/); return m ? m[1].trim() : ''; }).filter(Boolean);
+    res.json({ companies });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /scan-history — view scan dedup history
+app.get('/scan-history', (req, res) => {
+  try {
+    const histPath = join(__dirname, 'data/scan-history.tsv');
+    if (!existsSync(histPath)) return res.json({ entries: [] });
+    const lines = readFileSync(histPath, 'utf-8').split('\n').filter(Boolean);
+    const entries = lines.slice(1).map(l => {
+      const p = l.split('\t');
+      return { url: p[0] || '', firstSeen: p[1] || '', portal: p[2] || '', title: p[3] || '', company: p[4] || '', status: p[5] || '', location: p[6] || '' };
+    });
+    res.json({ entries: entries.slice(-200) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /followup/draft — generate follow-up email draft
+app.post('/followup/draft', async (req, res) => {
+  try {
+    const { company, role, followupCount, contactEmail, appliedDate } = req.body;
+    const cv = existsSync(join(__dirname, 'data/cv.md')) ? readFileSync(join(__dirname, 'data/cv.md'), 'utf-8').slice(0, 4000) : '';
+    const prompt = `Generate a follow-up email for a job application.
+Company: ${company}
+Role: ${role}
+Follow-up #${(followupCount || 0) + 1}
+Applied: ${appliedDate || 'recently'}
+Contact: ${contactEmail || 'Hiring Team'}
+CV excerpt: ${cv}
+
+Rules: Never use "just checking in" or "circling back". Lead with value. Under 150 words.
+Return JSON: {"subject": "...", "body": "..."}`;
+
+    const result = await runOpencode(prompt);
+    const parsed = parseJsonFromOutput(result);
+    res.json(parsed || { subject: '', body: result.trim().slice(0, 1500) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /paste-reply — classify a pasted reply email
+app.post('/paste-reply', async (req, res) => {
+  try {
+    const { from, fromEmail, subject, body } = req.body;
+    const prompt = `Classify this email reply from a recruiter/employer.
+From: ${from || ''} <${fromEmail || ''}>
+Subject: ${subject || ''}
+Body: ${(body || '').slice(0, 2000)}
+
+Return JSON: {"classification": "interview|offer|rejection|recruiter_reply|noise", "confidence": 0.0-1.0, "summary": "1-line summary", "suggestedAction": "what to do next"}`;
+
+    const result = await runOpencode(prompt, 60000);
+    const parsed = parseJsonFromOutput(result);
+    res.json(parsed || { classification: 'noise', confidence: 0.5, summary: result.trim().slice(0, 200), suggestedAction: 'Review manually' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /dedup — tracker dedup + normalize
+app.post('/dedup', (req, res) => {
+  try {
+    const dedupScript = join(__dirname, 'dedup-tracker.mjs');
+    const normScript = join(__dirname, 'normalize-statuses.mjs');
+    let dedupResult = '', normResult = '';
+    if (existsSync(dedupScript)) {
+      const r = spawnSync('node', [dedupScript], { cwd: __dirname, encoding: 'utf-8', timeout: 30000 });
+      dedupResult = r.stdout || '';
+    }
+    if (existsSync(normScript)) {
+      const r = spawnSync('node', [normScript], { cwd: __dirname, encoding: 'utf-8', timeout: 30000 });
+      normResult = r.stdout || '';
+    }
+    res.json({ dedup: dedupResult.trim(), normalize: normResult.trim() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /tracker/stats — tracker statistics
+app.get('/tracker/stats', (req, res) => {
+  try {
+    const lines = trackerLines();
+    const colmap = findHeaderCols(lines);
+    const apps = parseTrackerRows(lines, colmap);
+    const total = apps.length;
+    const byStatus = {};
+    let totalScore = 0, scoreCount = 0, pdfCount = 0, reportCount = 0;
+    for (const a of apps) {
+      byStatus[a.status] = (byStatus[a.status] || 0) + 1;
+      const s = parseFloat(a.score);
+      if (!isNaN(s)) { totalScore += s; scoreCount++; }
+      if (a.pdf === '✅') pdfCount++;
+      if (a.report) reportCount++;
+    }
+    res.json({
+      total,
+      byStatus,
+      avgScore: scoreCount > 0 ? (totalScore / scoreCount).toFixed(1) : 'N/A',
+      pdfPercent: total > 0 ? Math.round(pdfCount / total * 100) : 0,
+      reportPercent: total > 0 ? Math.round(reportCount / total * 100) : 0,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /reports/:id — fetch evaluation report content
+app.get('/reports/:id', (req, res) => {
+  try {
+    const { id } = req.params;
+    const reportsDir = join(__dirname, 'reports');
+    if (!existsSync(reportsDir)) return res.status(404).json({ error: 'No reports directory' });
+    const files = readdirSync(reportsDir).filter(f => f.endsWith('.md'));
+    // Match by report number prefix (zero-padded or not)
+    const match = files.find(f => {
+      const num = f.split('-')[0];
+      return num === id || num === String(parseInt(id)).padStart(3, '0');
+    });
+    if (!match) return res.status(404).json({ error: `Report #${id} not found` });
+    const content = readFileSync(join(reportsDir, match), 'utf-8');
+    res.json({ id, filename: match, content });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /reports — list all reports with metadata
+app.get('/reports', (req, res) => {
+  try {
+    const reportsDir = join(__dirname, 'reports');
+    if (!existsSync(reportsDir)) return res.json({ reports: [] });
+    const files = readdirSync(reportsDir).filter(f => f.endsWith('.md')).sort().reverse();
+    const reports = files.map(f => {
+      const content = readFileSync(join(reportsDir, f), 'utf-8');
+      const num = f.split('-')[0];
+      const company = f.split('-').slice(1, -2).join('-').replace(/-/g, ' ');
+      const date = f.match(/\d{4}-\d{2}-\d{2}/)?.[0] || '';
+      const score = content.match(/\*\*Score:\*\*\s*(\S+)/)?.[1] || 'N/A';
+      return { id: num, filename: f, company, date, score, preview: content.slice(0, 200) };
+    });
+    res.json({ reports });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /pipeline — list pending URLs from data/pipeline.md
+app.get('/pipeline', (req, res) => {
+  try {
+    const pipelinePath = join(__dirname, 'data/pipeline.md');
+    if (!existsSync(pipelinePath)) return res.json({ entries: [] });
+    const text = readFileSync(pipelinePath, 'utf-8');
+    const lines = text.split('\n');
+    const entries = [];
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      // Parse lines like: "- https://company.com/jobs/123" or "- [Company] https://..."
+      const urlMatch = trimmed.match(/https?:\/\/\S+/);
+      if (urlMatch) {
+        const url = urlMatch[0].replace(/[)\]$/, '');
+        const label = trimmed.replace(/^[-*]\s*/, '').replace(url, '').trim();
+        // Check if this URL already has a tracker entry (already evaluated)
+        const trackerText = existsSync(TRACKER_PATH) ? readFileSync(TRACKER_PATH, 'utf-8') : '';
+        const alreadyEvaluated = trackerText.includes(url);
+        entries.push({ url, label, evaluated: alreadyEvaluated });
+      }
+    }
+    res.json({ entries });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /pipeline/evaluate — evaluate a pipeline entry and remove from pipeline
+app.post('/pipeline/evaluate', async (req, res) => {
+  try {
+    const { url, company, role } = req.body;
+    if (!url) return res.status(400).json({ error: 'url required' });
+    const prompt = `Evaluate this job posting using career-ops auto-pipeline mode. Return ONLY a JSON object with: {"score":"X.X","fit":"...","strengths":["..."],"gaps":["..."]}. Job: ${role || 'Unknown'} at ${company || 'Unknown'} URL: ${url}`;
+    const stdout = await runOpencode(prompt, 120000);
+    let evaluation = { score: 'N/A', fit: '', strengths: [], gaps: [] };
+    try { evaluation = JSON.parse(stdout.match(/\{[\s\S]*?\}/)?.[0] || '{}'); } catch { /* keep defaults */ }
+    // Save report + tracker (same as auto-pipeline)
+    const score = evaluation.score || 'N/A';
+    const slug = (company || 'unknown').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    const today = new Date().toISOString().slice(0, 10);
+    let nextNum = 1;
+    try {
+      const existing = existsSync(join(__dirname, 'reports'))
+        ? readdirSync(join(__dirname, 'reports')).filter(f => f.endsWith('.md')).map(f => parseInt(f.split('-')[0])).filter(n => !isNaN(n))
+        : [];
+      nextNum = existing.length > 0 ? Math.max(...existing) + 1 : 1;
+    } catch { nextNum = 1; }
+    const numStr = String(nextNum).padStart(3, '0');
+    const reportDir = join(__dirname, 'reports');
+    if (!existsSync(reportDir)) mkdirSync(reportDir, { recursive: true });
+    writeFileSync(join(reportDir, `${numStr}-${slug}-${today}.md`), `# Report #${numStr}\n\n**Company:** ${company || 'Unknown'}\n**Role:** ${role || 'Unknown'}\n**URL:** ${url}\n**Score:** ${score}/5\n\n## Fit\n${evaluation.fit || 'N/A'}\n\n## Strengths\n${(evaluation.strengths || []).map(s => `- ${s}`).join('\n') || '- N/A'}\n\n## Gaps\n${(evaluation.gaps || []).map(g => `- ${g}`).join('\n') || '- None'}\n`, 'utf-8');
+    const additionsDir = join(__dirname, 'batch/tracker-additions');
+    if (!existsSync(additionsDir)) mkdirSync(additionsDir, { recursive: true });
+    writeFileSync(join(additionsDir, `${numStr}-${slug}.tsv`), `${numStr}\t${today}\t${company || 'Unknown'}\t${role || 'Unknown'}\tEvaluated\t${score}/5\t❌\t[${numStr}](reports/${numStr}-${slug}-${today}.md)\tPipeline evaluate\n`, 'utf-8');
+    try { spawnSync('node', ['merge-tracker.mjs'], { cwd: __dirname, encoding: 'utf-8', timeout: 10000 }); } catch { /* non-fatal */ }
+    // Remove evaluated URL from pipeline.md
+    try {
+      const pipelinePath = join(__dirname, 'data/pipeline.md');
+      if (existsSync(pipelinePath)) {
+        const lines = readFileSync(pipelinePath, 'utf-8').split('\n');
+        const filtered = lines.filter(l => !l.includes(url));
+        writeFileSync(pipelinePath, filtered.join('\n'), 'utf-8');
+      }
+    } catch { /* non-fatal */ }
+    res.json({ score, reportNum: nextNum, fit: evaluation.fit, strengths: evaluation.strengths, gaps: evaluation.gaps });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
