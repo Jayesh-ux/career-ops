@@ -104,3 +104,4 @@ plan/
 
 # Bridge server credentials
 .bridge.env
+career-ops-app-debug.apk
