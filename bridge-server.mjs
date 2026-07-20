@@ -18,6 +18,11 @@ const { simpleParser } = require('mailparser');
 const nodemailer = require('nodemailer');
 let mammoth = null;
 try { mammoth = require('mammoth'); } catch { /* optional */ }
+let pdfParse = null;
+try { pdfParse = require('pdf-parse'); } catch { /* optional */ }
+
+let pdftotextAvailable = true;
+try { const r = spawnSync('which', ['pdftotext'], { encoding: 'utf-8' }); if (r.status !== 0) pdftotextAvailable = false; } catch { pdftotextAvailable = false; }
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || '8787', 10);
@@ -684,8 +689,15 @@ app.post('/resume/upload', upload.single('resume'), async (req, res) => {
     let text = '';
 
     if (ext.endsWith('.pdf')) {
-      const r = spawnSync('pdftotext', [filePath, '-'], { encoding: 'utf-8', timeout: 30000 });
-      text = (r.stdout || '').trim();
+      if (pdftotextAvailable) {
+        const r = spawnSync('pdftotext', [filePath, '-'], { encoding: 'utf-8', timeout: 30000 });
+        text = (r.stdout || '').trim();
+      }
+      if (!text && pdfParse) {
+        const buf = readFileSync(filePath);
+        const r = await pdfParse(buf);
+        text = (r.text || '').trim();
+      }
     } else if (ext.endsWith('.docx') && mammoth) {
       const buf = readFileSync(filePath);
       const r = await mammoth.extractRawText({ buffer: buf });
