@@ -3074,132 +3074,71 @@ app.post('/chat/stream', async (req, res) => {
       return finish();
     }
 
-    // Try event stream with a 15s grace period — if no events arrive, fall back to polling
-    let gotAnyEvent = false;
-    let eventError = null;
+    // Poll opencode until idle, then fetch the response
+    const POLL_MS = 1500;
+    const MAX_WAIT = 180000; // 3 min
+    const deadline = Date.now() + MAX_WAIT;
+    let pollCount = 0;
+    let sawBusy = false;
+    let idleCount = 0;
 
-    const STREAM_TIMEOUT_MS = 240000; // 4 min hard cap
-    const EVENT_GRACE_MS = 15000;     // fall back to polling after 15s of no events
+    while (Date.now() < deadline && !settled) {
+      await new Promise(r => setTimeout(r, POLL_MS));
+      pollCount++;
 
-    try {
-      const eventResult = await client.event.subscribe();
-      const events = eventResult.stream;
+      const statusResult = await client.session.status({}).catch(() => ({ data: {} }));
+      const st = statusResult.data?.[sessionId]?.type;
 
-      const eventLoop = (async () => {
-        for await (const event of events) {
-          gotAnyEvent = true;
-          if (event.type === 'message.part.delta') {
-            const delta = event.properties?.delta;
-            if (delta) send('text_delta', { text: delta });
-          } else if (event.type === 'session.status') {
-            if (event.properties?.status?.type === 'idle') {
-              send('done', { sessionId });
-              finish();
-              return;
-            }
-          } else if (event.type === 'session.error') {
-            send('error', { error: event.properties?.error });
-            finish();
-            return;
-          }
+      if (st === 'busy' || st === 'retry') {
+        sawBusy = true;
+        idleCount = 0;
+        if (pollCount % 4 === 0) {
+          console.log(`[chat/stream] Working... ${Math.round(pollCount * POLL_MS / 1000)}s (${st})`);
+          send('text_delta', { text: `\n...working (${Math.round(pollCount * POLL_MS / 1000)}s)...\n` });
         }
-      })();
-
-      const eventRace = Promise.race([
-        eventLoop.then(() => 'ended'),
-        new Promise(r => setTimeout(() => r('timeout'), EVENT_GRACE_MS))
-      ]);
-
-      const eventOutcome = await eventRace;
-
-      if (eventOutcome === 'timeout' && !gotAnyEvent) {
-        console.log(`[chat/stream] No events in ${EVENT_GRACE_MS}ms — switching to polling fallback`);
-        throw new Error('EVENT_STREAM_EMPTY');
-      }
-    } catch (e) {
-      eventError = e;
-    }
-
-    // FALLBACK: poll session.status + messages (same logic as /chat endpoint)
-    if (!settled) {
-      console.log(`[chat/stream] Using polling fallback`);
-      const POLL_MS = 1000;
-      const deadline = Date.now() + STREAM_TIMEOUT_MS;
-      let pollCount = 0;
-      let sawBusy = false;
-      let idleCount = 0;
-
-      while (Date.now() < deadline && !settled) {
-        await new Promise(r => setTimeout(r, POLL_MS));
-        pollCount++;
-
-        const statusResult = await client.session.status({}).catch(() => ({ data: {} }));
-        const st = statusResult.data?.[sessionId]?.type;
-
-        if (st === 'busy' || st === 'retry') {
-          sawBusy = true;
-          idleCount = 0;
-          if (pollCount % 15 === 0) {
-            console.log(`[chat/stream] Polling... ${pollCount}s (${st})`);
-            send('text_delta', { text: `\n\n_...still working (${pollCount}s)...\n` });
-          }
-          continue;
-        }
-
-        if (sawBusy) {
-          idleCount++;
-          if (idleCount >= 2) {
-            console.log(`[chat/stream] Idle after ${pollCount}s`);
-            break;
-          }
-        }
+        continue;
       }
 
-      // Fetch messages — scan ALL assistant messages for text content
-      const msgsResult = await client.session.messages({
-        path: { id: sessionId },
-        query: { limit: 30 }
-      });
-      const msgs = Array.isArray(msgsResult.data) ? msgsResult.data : [];
-      const assistants = msgs.filter(m => m.info?.role === 'assistant');
-
-      let content = '';
-      let toolOutputs = [];
-
-      for (let i = assistants.length - 1; i >= 0; i--) {
-        const parts = assistants[i].parts || [];
-        const text = parts.filter(p => p.type === 'text').map(p => p.text).join('\n');
-        if (text && text.trim().length > 0) {
-          content = text;
-          toolOutputs = parts.filter(p => p.type === 'tool').map(tp => ({
-            tool: tp.tool, status: tp.state?.status,
-            output: tp.state?.output || '', input: tp.state?.input || ''
-          }));
+      if (sawBusy) {
+        idleCount++;
+        if (idleCount >= 2) {
+          console.log(`[chat/stream] Idle after ${pollCount} polls`);
           break;
         }
-        const tools = parts.filter(p => p.type === 'tool').map(tp => ({
-          tool: tp.tool, status: tp.state?.status,
-          output: tp.state?.output || '', input: tp.state?.input || ''
-        }));
-        if (tools.length > 0 && toolOutputs.length === 0) toolOutputs = tools;
       }
 
-      if (!content && toolOutputs.length > 0) {
-        const completed = toolOutputs.filter(t => t.status === 'completed');
-        if (completed.length > 0) content = formatToolSummary(completed);
+      // Not busy, never saw busy — opencode might have finished before we started polling
+      if (!sawBusy && pollCount >= 3) {
+        console.log(`[chat/stream] No busy seen in ${pollCount} polls, proceeding`);
+        break;
       }
-      if (!content) content = 'Processing complete. Check the tracker for updates.';
-
-      const parsed = parseActionBlocks(content);
-      const toolActions = parseToolOutputs(toolOutputs);
-      parsed.actions.push(...toolActions);
-
-      // Send full accumulated text as a single delta
-      if (parsed.text) send('text_delta', { text: parsed.text });
-      if (parsed.actions.length > 0) send('text_delta', { text: '\n\n' + JSON.stringify(parsed.actions) });
-      send('done', { sessionId });
-      finish();
     }
+
+    // Fetch the response
+    const msgsResult = await client.session.messages({
+      path: { id: sessionId },
+      query: { limit: 20 }
+    });
+    const msgs = Array.isArray(msgsResult.data) ? msgsResult.data : [];
+    const assistants = msgs.filter(m => m.info?.role === 'assistant');
+
+    let content = '';
+
+    for (let i = assistants.length - 1; i >= 0; i--) {
+      const parts = assistants[i].parts || [];
+      const text = parts.filter(p => p.type === 'text').map(p => p.text).join('\n');
+      if (text && text.trim().length > 0) {
+        content = text;
+        break;
+      }
+    }
+
+    if (!content) content = 'Done. Check tracker for updates.';
+
+    // Send the response as a single text_delta
+    send('text_delta', { text: content });
+    send('done', { sessionId });
+    finish();
   } catch (e) {
     send('error', { error: e.message });
     finish();
