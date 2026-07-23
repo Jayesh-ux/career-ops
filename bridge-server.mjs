@@ -2,15 +2,22 @@
 
 import express from 'express';
 import cors from 'cors';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, unlinkSync, readdirSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, unlinkSync, readdirSync, statSync, symlinkSync, copyFileSync } from 'fs';
 import { spawnSync, spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join, basename } from 'path';
 import yaml from 'js-yaml';
 import multer from 'multer';
+
+// Ensure the opencode binary in this directory is discoverable by @opencode-ai/sdk
+const __selfDir = dirname(fileURLToPath(import.meta.url));
+if (!process.env.PATH.split(':').includes(__selfDir)) {
+  process.env.PATH = __selfDir + ':' + process.env.PATH;
+}
 import { createRequire } from 'module';
 import { loadProviders, resolveProvider } from './providers/_registry.mjs';
 import { makeHttpCtx } from './providers/_http.mjs';
+import { createOpencode, createOpencodeClient } from '@opencode-ai/sdk';
 
 const require = createRequire(import.meta.url);
 
@@ -62,6 +69,82 @@ try { const r = spawnSync('which', ['pdftotext'], { encoding: 'utf-8' }); if (r.
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || '8787', 10);
 
+// ── Multi-user data layer ──────────────────────────────────────────
+// When X-User-Id header is present, all data paths resolve under
+// /data/users/{userId}/ instead of the project root.
+const USERS_ROOT = join(__dirname, 'data', 'users');
+
+function resolveUserDataDir(userId) {
+  // userId is the user's email (URL-encoded as path segment)
+  const safeId = String(userId || '').toLowerCase().replace(/[^a-z0-9@.+-]/g, '_');
+  if (!safeId) return null;
+  const dir = join(USERS_ROOT, safeId);
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true });
+    mkdirSync(join(dir, 'data'), { recursive: true });
+    mkdirSync(join(dir, 'reports'), { recursive: true });
+    mkdirSync(join(dir, 'config'), { recursive: true });
+    mkdirSync(join(dir, 'modes'), { recursive: true });
+    mkdirSync(join(dir, 'batch'), { recursive: true });
+    mkdirSync(join(dir, 'batch/tracker-additions'), { recursive: true });
+
+    // Symlink .opencode/ so opencode CLI finds SKILL.md when cwd = userDir
+    const opencodeLink = join(dir, '.opencode');
+    if (!existsSync(opencodeLink)) {
+      try { symlinkSync(join(__dirname, '.opencode'), opencodeLink); } catch { /* non-fatal */ }
+    }
+
+    // Symlink cv.md and config/ so opencode reads user's data from cwd root
+    const cvLink = join(dir, 'cv.md');
+    const userCv = join(dir, 'data', 'cv.md');
+    if (!existsSync(cvLink) && existsSync(userCv)) {
+      try { symlinkSync(userCv, cvLink); } catch { /* non-fatal */ }
+    }
+    const configLink = join(dir, 'config');
+    if (!existsSync(join(dir, 'config', 'profile.yml')) && existsSync(join(__dirname, 'config', 'profile.yml'))) {
+      try { copyFileSync(join(__dirname, 'config', 'profile.yml'), join(dir, 'config', 'profile.yml')); } catch { /* non-fatal */ }
+    }
+
+    // Symlink modes/ so _profile.md and _shared.md are available
+    const modesLink = join(dir, 'modes');
+    if (!existsSync(modesLink)) {
+      try { symlinkSync(join(__dirname, 'modes'), modesLink); } catch { /* non-fatal */ }
+    }
+
+    console.log(`[multi-user] Created user directory: ${dir}`);
+  }
+  return dir;
+}
+
+function resolvePerUserPath(userId, relativePath) {
+  const userDir = resolveUserDataDir(userId);
+  if (!userDir) return join(__dirname, relativePath);
+  return join(userDir, relativePath);
+}
+
+// Per-user OAuth2 credential store
+function getUserOAuth(userId) {
+  const userDir = resolveUserDataDir(userId);
+  if (!userDir) return null;
+  const oauthPath = join(userDir, '.oauth2.json');
+  if (!existsSync(oauthPath)) return null;
+  try {
+    return JSON.parse(readFileSync(oauthPath, 'utf-8'));
+  } catch { return null; }
+}
+
+function setUserOAuth(userId, creds) {
+  const userDir = resolveUserDataDir(userId);
+  if (!userDir) throw new Error('Invalid userId');
+  const oauthPath = join(userDir, '.oauth2.json');
+  writeFileSync(oauthPath, JSON.stringify(creds, null, 2), 'utf-8');
+}
+
+function ensureUserDirs() {
+  if (!existsSync(USERS_ROOT)) mkdirSync(USERS_ROOT, { recursive: true });
+}
+ensureUserDirs();
+
 // Load .bridge.env if present (sets GMAIL_USER, GMAIL_APP_PASSWORD, etc.)
 try {
   const envFile = join(__dirname, '.bridge.env');
@@ -84,6 +167,51 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+// ── Multi-user middleware ───────────────────────────────────────────
+// Reads X-User-Id header and sets req.userCtx with per-user paths.
+// Backwards-compatible: requests without X-User-Id use the root (legacy single-user).
+app.use((req, res, next) => {
+  const userId = req.headers['x-user-id'] || '';
+  if (userId) {
+    const userDir = resolveUserDataDir(userId);
+    req.userCtx = {
+      userId,
+      userDir,
+      dataDir: join(userDir, 'data'),
+      reportsDir: join(userDir, 'reports'),
+      configDir: join(userDir, 'config'),
+      modesDir: join(userDir, 'modes'),
+      cvPath: join(userDir, 'data', 'cv.md'),
+      trackerPath: join(userDir, 'data', 'applications.md'),
+      profilePath: join(userDir, 'config', 'profile.yml'),
+      scanHistory: join(userDir, 'data', 'scan-history.tsv'),
+      additionsDir: join(userDir, 'batch', 'tracker-additions'),
+      blacklistPath: join(userDir, 'data', 'blacklist.md'),
+      pipelinePath: join(userDir, 'data', 'pipeline.md'),
+      oauthPath: join(userDir, '.oauth2.json'),
+    };
+  } else {
+    // Legacy single-user mode: point at project root
+    req.userCtx = {
+      userId: '',
+      userDir: __dirname,
+      dataDir: join(__dirname, 'data'),
+      reportsDir: join(__dirname, 'reports'),
+      configDir: join(__dirname, 'config'),
+      modesDir: join(__dirname, 'modes'),
+      cvPath: join(__dirname, 'data', 'cv.md'),
+      trackerPath: TRACKER_PATH,
+      profilePath: PROFILE_PATH,
+      scanHistory: SCAN_HISTORY,
+      additionsDir: ADDITIONS_DIR,
+      blacklistPath: join(__dirname, 'data', 'blacklist.md'),
+      pipelinePath: join(__dirname, 'data', 'pipeline.md'),
+      oauthPath: null,
+    };
+  }
+  next();
+});
+
 // ── helpers ────────────────────────────────────────────────────────
 
 /** Strip markdown formatting from text (bold, italic, code, headings, etc.) */
@@ -97,6 +225,55 @@ function stripMarkdown(s) {
     .replace(/^#{1,6}\s*/gm, '')        // # headings
     .replace(/^[-*+]\s+/gm, '')         // list markers
     .trim();
+}
+
+// ── Gmail OAuth2 helper ───────────────────────────────────────────
+// Exchanges refresh token for short-lived access token
+const GMAIL_TOKEN_URL = 'https://oauth2.googleapis.com/token';
+let cachedGmailToken = null;
+let gmailTokenExpiry = 0;
+
+async function getGmailAccessToken() {
+  const clientId = process.env.GMAIL_CLIENT_ID;
+  const clientSecret = process.env.GMAIL_CLIENT_SECRET;
+  const refreshToken = process.env.GMAIL_REFRESH_TOKEN;
+
+  if (!clientId || !clientSecret || !refreshToken) {
+    throw new Error('Gmail OAuth2 not configured — set GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN in .bridge.env');
+  }
+
+  // Return cached token if still valid (with 5min buffer)
+  if (cachedGmailToken && Date.now() < gmailTokenExpiry - 300000) {
+    return cachedGmailToken;
+  }
+
+  const resp = await fetch(GMAIL_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: clientId,
+      client_secret: clientSecret,
+      refresh_token: refreshToken,
+      grant_type: 'refresh_token',
+    }),
+  });
+
+  if (!resp.ok) {
+    const err = await resp.text();
+    throw new Error(`Gmail token refresh failed: ${resp.status} ${err.slice(0, 200)}`);
+  }
+
+  const data = await resp.json();
+  if (!data.access_token) throw new Error('Gmail token refresh returned no access_token');
+
+  cachedGmailToken = data.access_token;
+  gmailTokenExpiry = Date.now() + (data.expires_in || 3600) * 1000;
+  return cachedGmailToken;
+}
+
+/** Build XOAUTH2 string for IMAP authentication */
+function buildXoauth2String(email, accessToken) {
+  return `user=${email}\x01auth=Bearer ${accessToken}\x01\x01`;
 }
 
 const PROFILE_PATH = join(__dirname, 'config/profile.yml');
@@ -119,6 +296,39 @@ function readProfile() {
 
 function writeProfile(data) {
   writeFileSync(PROFILE_PATH, yaml.dump(data, { indent: 2, lineWidth: -1, noRefs: true }));
+}
+
+function readUserCv(req) {
+  const p = req.userCtx?.cvPath || join(__dirname, 'data/cv.md');
+  return existsSync(p) ? readFileSync(p, 'utf-8').slice(0, 4000) : '';
+}
+
+function readUserProfileRaw(req) {
+  const p = req.userCtx?.profilePath || PROFILE_PATH;
+  if (!existsSync(p)) return {};
+  try { return yaml.load(readFileSync(p, 'utf-8')) || {}; } catch { return {}; }
+}
+
+function userReportDir(req) {
+  return req.userCtx?.reportsDir || join(__dirname, 'reports');
+}
+
+function userAdditionsDir(req) {
+  return req.userCtx?.additionsDir || ADDITIONS_DIR;
+}
+
+function userTrackerPath(req) {
+  return req.userCtx?.trackerPath || TRACKER_PATH;
+}
+
+function userCwd(req) {
+  return req.userCtx?.userDir || __dirname;
+}
+
+function nextReportNumForDir(dir) {
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const existing = readdirSync(dir).filter(f => f.endsWith('.md')).map(f => parseInt(f.split('-')[0])).filter(n => !isNaN(n));
+  return existing.length > 0 ? Math.max(...existing) + 1 : 1;
 }
 
 function trackerLines() {
@@ -190,10 +400,10 @@ function runCli(script, args = []) {
   return { stdout: result.stdout || '', stderr: result.stderr || '', status: result.status, error: result.error };
 }
 
-async function runOpencode(prompt, timeoutMs = 120000) {
+async function runOpencode(prompt, timeoutMs = 120000, cwd) {
   return new Promise((resolve, reject) => {
     const proc = spawn('opencode', ['run', prompt], {
-      cwd: __dirname,
+      cwd: cwd || __dirname,
       env: { ...process.env, PATH: `/root/.opencode/bin:${process.env.PATH}` },
       timeout: timeoutMs,
     });
@@ -250,10 +460,216 @@ app.get('/doctor', (req, res) => {
   }
 });
 
-// GET /profile — returns full profile from config/profile.yml
+// ── POST /users/:email/oauth/exchange ──────────────────────────────
+// Exchange authorization code for OAuth2 tokens and store per-user.
+// Body: { code, clientId, clientSecret, redirectUri? }
+app.post('/users/:email/oauth/exchange', async (req, res) => {
+  try {
+    const email = decodeURIComponent(req.params.email);
+    const { code, clientId, clientSecret, redirectUri } = req.body;
+    if (!code || !clientId || !clientSecret) {
+      return res.status(400).json({ error: 'code, clientId, and clientSecret are required' });
+    }
+
+    const tokenUrl = 'https://oauth2.googleapis.com/token';
+    const resp = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        client_id: clientId,
+        client_secret: clientSecret,
+        redirect_uri: redirectUri || 'http://localhost:8787/users/oauth/callback',
+        grant_type: 'authorization_code',
+      }),
+    });
+
+    if (!resp.ok) {
+      const err = await resp.text();
+      return res.status(400).json({ error: `Token exchange failed: ${resp.status} ${err.slice(0, 300)}` });
+    }
+
+    const data = await resp.json();
+    const creds = {
+      email,
+      clientId,
+      clientSecret,
+      accessToken: data.access_token || '',
+      refreshToken: data.refresh_token || '',
+      expiresAt: data.expires_in ? Date.now() + data.expires_in * 1000 : 0,
+      tokenType: data.token_type || 'Bearer',
+      scope: data.scope || '',
+      storedAt: new Date().toISOString(),
+    };
+
+    setUserOAuth(email, creds);
+
+    res.json({
+      success: true,
+      email,
+      hasRefreshToken: !!creds.refreshToken,
+      expiresIn: data.expires_in || 3600,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── GET /users/:email/oauth/status ─────────────────────────────────
+// Check if a user has valid OAuth2 credentials stored.
+app.get('/users/:email/oauth/status', (req, res) => {
+  try {
+    const email = decodeURIComponent(req.params.email);
+    const creds = getUserOAuth(email);
+    if (!creds) {
+      return res.json({ configured: false, email });
+    }
+    const isExpired = creds.expiresAt && Date.now() > creds.expiresAt;
+    res.json({
+      configured: true,
+      email,
+      hasRefreshToken: !!creds.refreshToken,
+      isExpired,
+      expiresAt: creds.expiresAt ? new Date(creds.expiresAt).toISOString() : null,
+      storedAt: creds.storedAt,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── GET /users/:email/oauth/callback ───────────────────────────────
+// OAuth2 redirect handler — the user lands here after Google consent.
+app.get('/users/:email/oauth/callback', (req, res) => {
+  const { code, error } = req.query;
+  if (error) {
+    return res.status(400).send(`<html><body><h2>Authorization failed</h2><p>${error}</p></body></html>`);
+  }
+  res.send(`<html><body><h2>Authorization successful</h2><p>You can close this tab and return to career-ops.</p><script>setTimeout(()=>window.close(),2000)</script></body></html>`);
+});
+
+// ── POST /users/:email/setup ───────────────────────────────────────
+// Initialize a new user's directory structure with skeleton files.
+// Called from Android onboarding after profile form submission.
+app.post('/users/:email/setup', (req, res) => {
+  try {
+    const email = decodeURIComponent(req.params.email);
+    const { name, targetRoles, location, compensation } = req.body;
+    const userDir = resolveUserDataDir(email);
+    if (!userDir) return res.status(400).json({ error: 'Invalid email' });
+
+    // Create cv.md skeleton
+    const cvPath = join(userDir, 'data', 'cv.md');
+    if (!existsSync(cvPath)) {
+      const cvContent = `# ${name || 'Candidate'}\n\n## Summary\n\n${targetRoles ? `Target roles: ${Array.isArray(targetRoles) ? targetRoles.join(', ') : targetRoles}` : 'Job seeker'}\n\n## Experience\n\n## Education\n\n## Skills\n`;
+      writeFileSync(cvPath, cvContent, 'utf-8');
+    }
+
+    // Create profile.yml
+    const profilePath = join(userDir, 'config', 'profile.yml');
+    if (!existsSync(profilePath)) {
+      const profile = {
+        candidate: { full_name: name || '', email },
+        target_roles: { primary: Array.isArray(targetRoles) ? targetRoles : [targetRoles || ''] },
+        location: { city: location || '' },
+        compensation: { target_range: compensation || '' },
+      };
+      writeFileSync(profilePath, yaml.dump(profile, { indent: 2, lineWidth: -1, noRefs: true }), 'utf-8');
+    }
+
+    // Create tracker skeleton
+    const trackerPath = join(userDir, 'data', 'applications.md');
+    if (!existsSync(trackerPath)) {
+      writeFileSync(trackerPath, '# Applications Tracker\n\n| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n|---|------|---------|------|-------|--------|-----|--------|------|\n', 'utf-8');
+    }
+
+    // Create blacklist skeleton
+    const blPath = join(userDir, 'data', 'blacklist.md');
+    if (!existsSync(blPath)) {
+      writeFileSync(blPath, '# Blacklist\n\nCompanies to avoid applying to.\n', 'utf-8');
+    }
+
+    // Create pipeline skeleton
+    const pipePath = join(userDir, 'data', 'pipeline.md');
+    if (!existsSync(pipePath)) {
+      writeFileSync(pipePath, '# Pipeline\n\nPending job URLs to evaluate.\n', 'utf-8');
+    }
+
+    res.json({
+      success: true,
+      email,
+      userDir: `/data/users/${email.replace(/[^a-z0-9@.+-]/gi, '_')}`,
+      files: ['data/cv.md', 'config/profile.yml', 'data/applications.md', 'data/blacklist.md', 'data/pipeline.md', '.oauth2.json'],
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── GET /users/:email/files ────────────────────────────────────────
+// List all files in a user's data directory.
+app.get('/users/:email/files', (req, res) => {
+  try {
+    const email = decodeURIComponent(req.params.email);
+    const userDir = resolveUserDataDir(email);
+    if (!userDir) return res.status(400).json({ error: 'Invalid email' });
+
+    function walkDir(dir, prefix = '') {
+      const results = [];
+      if (!existsSync(dir)) return results;
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) {
+          results.push(...walkDir(join(dir, entry.name), relPath));
+        } else if (entry.name !== '.oauth2.json') {
+          const stat = statSync(join(dir, entry.name));
+          results.push({ path: relPath, size: stat.size, modified: stat.mtime.toISOString() });
+        }
+      }
+      return results;
+    }
+
+    const files = walkDir(userDir);
+    res.json({ email, files });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── GET /users/:email/files/:filepath(*) ───────────────────────────
+// Read a specific file from a user's data directory.
+app.get('/users/:email/files/{*filepath}', (req, res) => {
+  try {
+    const email = decodeURIComponent(req.params.email);
+    const filePath = req.params.filepath || req.params[0] || '';
+    const userDir = resolveUserDataDir(email);
+    if (!userDir) return res.status(400).json({ error: 'Invalid email' });
+
+    const fullPath = join(userDir, filePath);
+    // Security: ensure the resolved path is within the user directory
+    if (!fullPath.startsWith(userDir)) {
+      return res.status(403).json({ error: 'Path traversal not allowed' });
+    }
+    if (!existsSync(fullPath)) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+
+    const content = readFileSync(fullPath, 'utf-8');
+    res.json({ path: filePath, content });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /profile — returns full profile from config/profile.yml (per-user or root)
 app.get('/profile', (req, res) => {
   try {
-    const p = readProfile();
+    const profilePath = req.userCtx.profilePath;
+    function readP() {
+      if (!existsSync(profilePath)) return {};
+      return yaml.load(readFileSync(profilePath, 'utf-8')) || {};
+    }
+    const p = readP();
     const c = p.candidate || {};
     const t = p.target_roles || {};
     const n = p.narrative || {};
@@ -285,11 +701,21 @@ app.get('/profile', (req, res) => {
   }
 });
 
-// PUT /profile — update profile fields in config/profile.yml
+// PUT /profile — update profile fields in config/profile.yml (per-user or root)
 app.put('/profile', (req, res) => {
   try {
     const { name, email, phone, portfolio, linkedin, targetRoles, location, headline, compensation } = req.body;
-    const p = readProfile();
+    const profilePath = req.userCtx.profilePath;
+    function readP() {
+      if (!existsSync(profilePath)) return {};
+      return yaml.load(readFileSync(profilePath, 'utf-8')) || {};
+    }
+    function writeP(data) {
+      const dir = dirname(profilePath);
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      writeFileSync(profilePath, yaml.dump(data, { indent: 2, lineWidth: -1, noRefs: true }));
+    }
+    const p = readP();
     if (!p.candidate) p.candidate = {};
     if (name != null) p.candidate.full_name = name;
     if (email != null) p.candidate.email = email;
@@ -312,23 +738,26 @@ app.put('/profile', (req, res) => {
       if (!p.compensation) p.compensation = {};
       p.compensation.target_range = compensation;
     }
-    writeProfile(p);
+    writeP(p);
 
     // Also sync search keywords to portals.yml title_filter.positive
+    // Guard: only overwrite if non-empty — empty arrays from profile saves must not clobber existing filters
     const { searchKeywords, searchLocations } = req.body;
-    if (searchKeywords != null || searchLocations != null) {
-      const portalsPath = join(__dirname, 'portals.yml');
+    const safeKeywords = Array.isArray(searchKeywords) ? searchKeywords.filter(k => k && typeof k === 'string' && k.trim()) : [];
+    const safeLocations = Array.isArray(searchLocations) ? searchLocations.filter(l => l && typeof l === 'string' && l.trim()) : [];
+    if (safeKeywords.length > 0 || safeLocations.length > 0) {
+      const portalsPath = join(req.userCtx.userDir, 'portals.yml');
       let portals = {};
       if (existsSync(portalsPath)) {
         try { portals = yaml.load(readFileSync(portalsPath, 'utf-8')) || {}; } catch { /* keep empty */ }
       }
-      if (searchKeywords != null) {
+      if (safeKeywords.length > 0) {
         if (!portals.title_filter) portals.title_filter = {};
-        portals.title_filter.positive = searchKeywords;
+        portals.title_filter.positive = safeKeywords;
       }
-      if (searchLocations != null) {
+      if (safeLocations.length > 0) {
         if (!portals.title_filter) portals.title_filter = {};
-        portals.title_filter.location = searchLocations;
+        portals.title_filter.location = safeLocations;
       }
       writeFileSync(portalsPath, yaml.dump(portals, { lineWidth: -1 }), 'utf-8');
     }
@@ -350,7 +779,11 @@ app.put('/profile', (req, res) => {
 // GET /tracker
 app.get('/tracker', (req, res) => {
   try {
-    const lines = trackerLines();
+    function trackerL() {
+      if (!existsSync(req.userCtx.trackerPath)) return [];
+      return readFileSync(req.userCtx.trackerPath, 'utf-8').split('\n');
+    }
+    const lines = trackerL();
     const colmap = findHeaderCols(lines);
     const rows = parseTrackerRows(lines, colmap);
     res.json({ applications: rows.map(r => ({
@@ -376,21 +809,29 @@ app.put('/tracker/:id/status', (req, res) => {
     const { status } = req.body;
     if (!status) return res.status(400).json({ error: 'status is required' });
 
-    // Load canonical states from states.yml
-    let validStates = [];
-    if (existsSync(STATES_PATH)) {
-      const s = yaml.load(readFileSync(STATES_PATH, 'utf-8'));
-      if (s && s.states) validStates = s.states.map(st => st.label.toLowerCase());
-    }
+    // For per-user mode, we need to set CWD or pass tracker path to set-status.mjs
+    // The set-status.mjs reads data/applications.md by default; for multi-user we set the
+    // working directory to the user's data dir so it finds the right tracker file.
+    const userDir = req.userCtx.userDir;
+    const envOverride = { ...process.env, FORCE_COLOR: '0' };
 
-    const r = runCli('set-status.mjs', [id, status, '--json']);
+    const r = spawnSync('node', [join(__dirname, 'set-status.mjs'), id, status, '--json'], {
+      cwd: req.userCtx.userId ? userDir : __dirname,
+      encoding: 'utf-8',
+      timeout: 120_000,
+      env: envOverride,
+    });
     if (r.status !== 0) {
       const errMsg = r.stderr || r.stdout || `set-status exited with code ${r.status}`;
       return res.status(400).json({ error: errMsg });
     }
 
     // Return updated tracker
-    const lines = trackerLines();
+    function trackerL() {
+      if (!existsSync(req.userCtx.trackerPath)) return [];
+      return readFileSync(req.userCtx.trackerPath, 'utf-8').split('\n');
+    }
+    const lines = trackerL();
     const colmap = findHeaderCols(lines);
     const rows = parseTrackerRows(lines, colmap);
     res.json({ applications: rows.map(r => ({
@@ -409,19 +850,37 @@ app.post('/tracker/add', (req, res) => {
     const { company, role, location, contactEmail, notes } = req.body;
     if (!company || !role) return res.status(400).json({ error: 'company and role are required' });
 
-    if (!existsSync(ADDITIONS_DIR)) mkdirSync(ADDITIONS_DIR, { recursive: true });
+    const addDir = req.userCtx.additionsDir || ADDITIONS_DIR;
+    if (!existsSync(addDir)) mkdirSync(addDir, { recursive: true });
 
-    const num = nextReportNum();
+    // Find next report number from per-user or root tracker
+    const trackerPath = req.userCtx.trackerPath || TRACKER_PATH;
+    let max = 0;
+    if (existsSync(trackerPath)) {
+      const existing = readFileSync(trackerPath, 'utf-8').split('\n');
+      for (const line of existing) {
+        if (!line.startsWith('|')) continue;
+        const m = line.match(/^\|\s*(\d+)/);
+        if (m) max = Math.max(max, parseInt(m[1], 10));
+      }
+    }
+    const num = max + 1;
     const date = new Date().toISOString().split('T')[0];
     const slug = company.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-    const tsvPath = join(ADDITIONS_DIR, `${num}-${slug}.tsv`);
+    const tsvPath = join(addDir, `${num}-${slug}.tsv`);
 
     // Format: num\tdate\tcompany\trole\tstatus\tscore\tpdf\treport\tnotes
     const tsvContent = `${num}\t${date}\t${company}\t${role}\tApplied\tN/A\t❌\t[num](reports/xxx)\t${notes || ''}\n`;
     writeFileSync(tsvPath, tsvContent);
 
-    // Run merge-tracker
-    const r = runCli('merge-tracker.mjs', []);
+    // Run merge-tracker (for per-user mode, set cwd to userDir so it finds the right tracker)
+    const userDir = req.userCtx.userDir;
+    const r = spawnSync('node', [join(__dirname, 'merge-tracker.mjs')], {
+      cwd: req.userCtx.userId ? userDir : __dirname,
+      encoding: 'utf-8',
+      timeout: 120_000,
+      env: { ...process.env, FORCE_COLOR: '0' },
+    });
     if (r.status !== 0 && r.status !== null) {
       return res.status(500).json({ error: r.stderr || 'merge-tracker failed', id: num, success: false });
     }
@@ -432,36 +891,139 @@ app.post('/tracker/add', (req, res) => {
   }
 });
 
-// POST /email/send
+// POST /email/send — supports both app password and OAuth2 (per-user and legacy)
 app.post('/email/send', async (req, res) => {
   try {
     const { email, appPassword, company, role, body, to, pdfPath } = req.body;
-    if (!email || !appPassword || !body) {
-      return res.status(400).json({ error: 'email, appPassword, and body are required' });
+    if (!email || !body) {
+      return res.status(400).json({ error: 'email and body are required' });
+    }
+
+    // Determine auth method: per-user OAuth2 > legacy OAuth2 > app password
+    const userOAuth = req.userCtx.userId ? getUserOAuth(req.userCtx.userId) : null;
+    const hasUserOAuth2 = userOAuth && userOAuth.refreshToken;
+    const hasLegacyOAuth2 = process.env.GMAIL_CLIENT_ID && process.env.GMAIL_CLIENT_SECRET && process.env.GMAIL_REFRESH_TOKEN;
+    let authConfig;
+    let authMethod = 'unknown';
+
+    if (hasUserOAuth2) {
+      // Per-user OAuth2: use their stored tokens
+      let accessToken = userOAuth.accessToken;
+      if (!accessToken || (userOAuth.expiresAt && Date.now() > userOAuth.expiresAt - 300000)) {
+        // Refresh the token
+        const tokenResp = await fetch(GMAIL_TOKEN_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            client_id: userOAuth.clientId,
+            client_secret: userOAuth.clientSecret,
+            refresh_token: userOAuth.refreshToken,
+            grant_type: 'refresh_token',
+          }),
+        });
+        if (!tokenResp.ok) throw new Error(`Per-user token refresh failed: ${tokenResp.status}`);
+        const tokenData = await tokenResp.json();
+        accessToken = tokenData.access_token;
+        // Update stored credentials with new access token
+        userOAuth.accessToken = accessToken;
+        userOAuth.expiresAt = tokenData.expires_in ? Date.now() + tokenData.expires_in * 1000 : 0;
+        setUserOAuth(req.userCtx.userId, userOAuth);
+      }
+      authConfig = {
+        type: 'OAuth2',
+        user: email,
+        clientId: userOAuth.clientId,
+        clientSecret: userOAuth.clientSecret,
+        accessToken,
+      };
+      authMethod = 'per_user_oauth2';
+    } else if (hasLegacyOAuth2) {
+      const accessToken = await getGmailAccessToken();
+      authConfig = {
+        type: 'OAuth2',
+        user: email,
+        clientId: process.env.GMAIL_CLIENT_ID,
+        clientSecret: process.env.GMAIL_CLIENT_SECRET,
+        accessToken,
+      };
+      authMethod = 'legacy_oauth2';
+    } else if (appPassword) {
+      authConfig = { user: email, pass: appPassword };
+      authMethod = 'app_password';
+    } else {
+      return res.status(400).json({ error: 'Either appPassword or OAuth2 credentials (per-user or legacy) required' });
     }
 
     const transporter = nodemailer.createTransport({
       host: 'smtp.gmail.com', port: 587, secure: false,
-      auth: { user: email, pass: appPassword },
+      auth: authConfig,
     });
 
     const mailOpts = {
       from: email,
       to: to || email,
-      subject: `Application for ${role} at ${company}`,
+      subject: `Application for ${role || 'Unknown Role'} at ${company || 'Unknown Company'}`,
       text: body,
     };
     if (pdfPath && existsSync(pdfPath)) mailOpts.attachments = [{ path: pdfPath }];
 
     const info = await transporter.sendMail(mailOpts);
-    res.json({ success: true, applicationId: 0 });
+    res.json({ success: true, applicationId: 0, method: authMethod });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
 // Shared IMAP fetch — single implementation used by /email/inbox and /email/triage
-function fetchEmails(email, password, { daysBack = 30, maxEmails = 50, timeout = 30000 } = {}) {
+// Supports both app password and OAuth2 (XOAUTH2), per-user and legacy
+async function fetchEmails(email, password, { daysBack = 30, maxEmails = 50, timeout = 30000, userOAuth = null } = {}) {
+  // Determine auth method: per-user OAuth2 > legacy OAuth2 > app password
+  const hasUserOAuth2 = userOAuth && userOAuth.refreshToken;
+  const hasLegacyOAuth2 = process.env.GMAIL_CLIENT_ID && process.env.GMAIL_CLIENT_SECRET && process.env.GMAIL_REFRESH_TOKEN;
+  let imapConfig;
+
+  if (hasUserOAuth2) {
+    let accessToken = userOAuth.accessToken;
+    if (!accessToken || (userOAuth.expiresAt && Date.now() > userOAuth.expiresAt - 300000)) {
+      const tokenResp = await fetch(GMAIL_TOKEN_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id: userOAuth.clientId,
+          client_secret: userOAuth.clientSecret,
+          refresh_token: userOAuth.refreshToken,
+          grant_type: 'refresh_token',
+        }),
+      });
+      if (tokenResp.ok) {
+        const tokenData = await tokenResp.json();
+        accessToken = tokenData.access_token;
+        userOAuth.accessToken = accessToken;
+        userOAuth.expiresAt = tokenData.expires_in ? Date.now() + tokenData.expires_in * 1000 : 0;
+      }
+    }
+    imapConfig = {
+      user: email,
+      xoauth2: buildXoauth2String(email, accessToken),
+      host: 'imap.gmail.com', port: 993, tls: true,
+      tlsOptions: { rejectUnauthorized: false },
+    };
+  } else if (hasLegacyOAuth2) {
+    const accessToken = await getGmailAccessToken();
+    imapConfig = {
+      user: email,
+      xoauth2: buildXoauth2String(email, accessToken),
+      host: 'imap.gmail.com', port: 993, tls: true,
+      tlsOptions: { rejectUnauthorized: false },
+    };
+  } else {
+    imapConfig = {
+      user: email, password,
+      host: 'imap.gmail.com', port: 993, tls: true,
+      tlsOptions: { rejectUnauthorized: false },
+    };
+  }
+
   return new Promise((resolve) => {
     const emails = [];
     let done = false;
@@ -474,11 +1036,7 @@ function fetchEmails(email, password, { daysBack = 30, maxEmails = 50, timeout =
       resolve(emails);
     };
 
-    const imap = new Imap({
-      user: email, password,
-      host: 'imap.gmail.com', port: 993, tls: true,
-      tlsOptions: { rejectUnauthorized: false },
-    });
+    const imap = new Imap(imapConfig);
 
     imap.once('ready', () => {
       imap.openBox('INBOX', false, (err) => {
@@ -531,15 +1089,108 @@ function fetchEmails(email, password, { daysBack = 30, maxEmails = 50, timeout =
   });
 }
 
-// GET /email/inbox
+// ── Spam filter for inbox emails ──────────────────────────────────
+// Flags obvious spam/non-recruiter mail without auto-deleting
+function classifyEmailSpam(email) {
+  const from = (email.fromEmail || '').toLowerCase();
+  const subject = (email.subject || '').toLowerCase();
+  const body = (email.body || '').toLowerCase();
+  const preview = (email.preview || '').toLowerCase();
+
+  // Spam signals
+  const spamSignals = [];
+  let spamScore = 0;
+
+  // No-reply senders
+  if (from.includes('no-reply') || from.includes('noreply') || from.includes('donotreply')) {
+    spamSignals.push('no-reply sender');
+    spamScore += 3;
+  }
+
+  // Marketing/promotional senders
+  if (from.includes('marketing') || from.includes('newsletter') || from.includes('promo') || from.includes('offers')) {
+    spamSignals.push('marketing sender');
+    spamScore += 3;
+  }
+
+  // Unsubscribe indicators
+  if (body.includes('unsubscribe') || body.includes('click here to stop') || body.includes('opt out')) {
+    spamSignals.push('contains unsubscribe link');
+    spamScore += 2;
+  }
+
+  // Job board alerts (not direct recruiter replies)
+  if (from.includes('indeed') || from.includes('linkedin') || from.includes('naukri') || from.includes('glassdoor')) {
+    spamSignals.push('job board alert');
+    spamScore += 2;
+  }
+
+  // Sales/spam patterns
+  if (subject.includes('limited time') || subject.includes('act now') || subject.includes('congratulations you won')) {
+    spamSignals.push('sales/spam language');
+    spamScore += 3;
+  }
+
+  // Very short body with links (typical spam)
+  if (body.length < 100 && (body.includes('http') || body.includes('click'))) {
+    spamSignals.push('short body with links');
+    spamScore += 2;
+  }
+
+  // Legitimate recruiter signals (reduce spam score)
+  if (body.includes('interview') || body.includes('position') || body.includes('role') || body.includes('resume')) {
+    spamScore -= 2;
+  }
+  if (body.includes('hiring') || body.includes('apply') || body.includes('candidate')) {
+    spamScore -= 1;
+  }
+
+  return {
+    isSpam: spamScore >= 3,
+    spamScore,
+    signals: spamSignals,
+  };
+}
+
+// GET /email/inbox — supports both app password and OAuth2, with spam filtering
 app.get('/email/inbox', async (req, res) => {
   const email = req.query.email || process.env.GMAIL_USER;
   const appPassword = req.query.appPassword || process.env.GMAIL_APP_PASSWORD;
-  if (!email || !appPassword) {
-    return res.status(400).json({ error: 'email and appPassword required — set GMAIL_USER/GMAIL_APP_PASSWORD env vars or pass as query params' });
+  const userOAuth = req.userCtx.userId ? getUserOAuth(req.userCtx.userId) : null;
+  const hasUserOAuth2 = userOAuth && userOAuth.refreshToken;
+  const hasLegacyOAuth2 = process.env.GMAIL_CLIENT_ID && process.env.GMAIL_CLIENT_SECRET && process.env.GMAIL_REFRESH_TOKEN;
+  const includeSpam = req.query.includeSpam === 'true'; // opt-in to see spam
+
+  if (!email) {
+    return res.status(400).json({ error: 'email required — set GMAIL_USER env var or pass as query param' });
   }
-  const emails = await fetchEmails(email, appPassword);
-  res.json({ emails });
+  if (!appPassword && !hasUserOAuth2 && !hasLegacyOAuth2) {
+    return res.status(400).json({ error: 'Either appPassword or OAuth2 credentials required — set GMAIL_APP_PASSWORD or provide OAuth2 via /users/:email/oauth/exchange' });
+  }
+
+  try {
+    const allEmails = await fetchEmails(email, appPassword, { userOAuth });
+
+    // Classify spam for each email
+    const classified = allEmails.map(e => ({
+      ...e,
+      spam: classifyEmailSpam(e),
+    }));
+
+    // Split into legitimate and spam
+    const legitimate = classified.filter(e => !e.spam.isSpam);
+    const spam = classified.filter(e => e.spam.isSpam);
+
+    res.json({
+      emails: includeSpam ? classified : legitimate,
+      total: allEmails.length,
+      legitimateCount: legitimate.length,
+      spamCount: spam.length,
+      method: hasUserOAuth2 ? 'per_user_oauth2' : (hasLegacyOAuth2 ? 'legacy_oauth2' : 'app_password'),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // POST /scan — uses real career-ops provider system (57 portals) + web search fallback
@@ -556,8 +1207,8 @@ app.post('/scan', async (req, res) => {
     const companies = py?.tracked_companies || [];
     const boards = py?.search_queries || [];
 
-    // Load blacklist — same format as career-ops CLI
-    const blacklistPath = join(__dirname, 'data/blacklist.md');
+    // Load blacklist — same format as career-ops CLI (per-user or root)
+    const blacklistPath = req.userCtx.blacklistPath || join(__dirname, 'data/blacklist.md');
     const blacklist = new Set();
     if (existsSync(blacklistPath)) {
       const blLines = readFileSync(blacklistPath, 'utf-8').split('\n');
@@ -567,10 +1218,11 @@ app.post('/scan', async (req, res) => {
       }
     }
 
-    // Load scan history for dedup — same TSV as career-ops CLI
+    // Load scan history for dedup — same TSV as career-ops CLI (per-user or root)
+    const scanHistPath = req.userCtx.scanHistory || SCAN_HISTORY;
     const scanHistory = new Map();
-    if (existsSync(SCAN_HISTORY)) {
-      const histLines = readFileSync(SCAN_HISTORY, 'utf-8').split('\n');
+    if (existsSync(scanHistPath)) {
+      const histLines = readFileSync(scanHistPath, 'utf-8').split('\n');
       for (const line of histLines) {
         const parts = line.split('\t');
         if (parts.length >= 2) scanHistory.set(parts[1], parts[0]);
@@ -579,6 +1231,7 @@ app.post('/scan', async (req, res) => {
 
     const providers = await loadProviders(join(__dirname, 'providers'));
     const results = [];
+    const keywordMatched = []; // jobs that pass keyword filter (used for location fallback)
     const errored = [];
     let totalBeforeFilter = 0;
 
@@ -601,7 +1254,7 @@ app.post('/scan', async (req, res) => {
       if (resolved && !resolved.error) providerTargets.push({ entry, provider: resolved.provider, isBoard: true });
     }
 
-    // Provider results
+    // Provider results — two-tier: keyword match first, then location filter
     await Promise.all(providerTargets.map(async (t) => {
       try {
         const ctx = makeHttpCtx();
@@ -611,16 +1264,11 @@ app.post('/scan', async (req, res) => {
           const title = (job.title || '').toLowerCase();
           const loc = (job.location || '').toLowerCase();
           const matchesKw = kw.length === 0 || kw.some(k => title.includes(k));
-          const matchesLoc = locs.length === 0 || locs.some(l => loc.includes(l));
-          if (matchesKw && matchesLoc) {
-            results.push({
-              company: job.company || t.entry.name || '',
-              role: job.title || '',
-              location: job.location || '',
-              url: job.url || '',
-              matched: true,
-              source: t.provider.id,
-            });
+          if (matchesKw) {
+            const entry = { company: job.company || t.entry.name || '', role: job.title || '', location: job.location || '', url: job.url || '', matched: true, source: t.provider.id };
+            keywordMatched.push(entry);
+            const matchesLoc = locs.length === 0 || locs.some(l => loc.includes(l));
+            if (matchesLoc) results.push(entry);
           }
         }
       } catch (e) {
@@ -648,18 +1296,12 @@ app.post('/scan', async (req, res) => {
           const title = m[2].trim();
           const lower = title.toLowerCase();
           totalBeforeFilter++;
-          const matchesKw = kw.length === 0 || kw.some(k => lower.includes(k));
-          if (matchesKw) {
+          if (kw.length === 0 || kw.some(k => lower.includes(k))) {
             const href = m[1].startsWith('http') ? m[1] : new URL(m[1], entry.careers_url).href;
-            if (!results.some(r => r.url === href)) {
-              results.push({
-                company: entry.name || '',
-                role: title,
-                location: '',
-                url: href,
-                matched: true,
-                source: 'websearch',
-              });
+            if (!keywordMatched.some(r => r.url === href)) {
+              const entry2 = { company: entry.name || '', role: title, location: '', url: href, matched: true, source: 'websearch' };
+              keywordMatched.push(entry2);
+              results.push(entry2);
             }
           }
         }
@@ -668,6 +1310,14 @@ app.post('/scan', async (req, res) => {
       }
     }));
     clearTimeout(timeout);
+
+    // Location fallback: if locations were set but zero results passed both filters,
+    // fall back to keyword-only matches so the user gets something instead of nothing
+    let locationTier = 'exact';
+    if (locs.length > 0 && results.length === 0 && keywordMatched.length > 0) {
+      results.push(...keywordMatched);
+      locationTier = 'fallback';
+    }
 
     // Dedup by url
     const seen = new Set();
@@ -679,7 +1329,8 @@ app.post('/scan', async (req, res) => {
     });
     const duplicatesSkipped = beforeDedup - deduped.length;
     const netNew = deduped.length;
-    const filteredByKeywords = totalBeforeFilter - beforeDedup;
+    const filteredByKeywords = totalBeforeFilter - keywordMatched.length;
+    const filteredByLocation = keywordMatched.length - (locationTier === 'fallback' ? keywordMatched.length : results.length);
     const portalsScanned = providerTargets.length + Math.min(webSearchTargets.length, 15);
 
     // Track scan history — append new URLs to data/scan-history.tsv (same as scan.mjs)
@@ -694,9 +1345,12 @@ app.post('/scan', async (req, res) => {
     const narrowingHints = [];
     if (kw.length === 0) narrowingHints.push('No keyword filter — all roles matched');
     if (locs.length === 0) narrowingHints.push('No location filter — results include all locations');
+    if (locationTier === 'fallback') narrowingHints.push(`No exact location matches — showing keyword-matched results instead`);
     if (netNew > 100) narrowingHints.push(`${netNew} results is a lot — consider narrowing keywords or adding a location`);
 
     res.json({
+      total: totalBeforeFilter,
+      newFound: netNew,
       results: deduped.slice(0, 100),
       errors: errored,
       webFallback: webSearchTargets.length,
@@ -704,8 +1358,10 @@ app.post('/scan', async (req, res) => {
         portalsScanned,
         totalFound: totalBeforeFilter,
         filteredByKeywords,
+        filteredByLocation,
         duplicatesSkipped,
         netNew,
+        locationTier,
         tooBroad: netNew > 100,
         narrowingHints,
       },
@@ -759,7 +1415,8 @@ app.get('/scan/stream', async (req, res) => {
       console.error('[scan/stream] loadProviders failed:', e.message);
       providers = new Map();
     }
-    const results = [];
+    let results = [];
+    let keywordMatched = []; // all keyword-matched jobs (before location filter)
     let totalBeforeFilter = 0;
     const providerTargets = [];
     const webSearchTargets = [];
@@ -792,9 +1449,11 @@ app.get('/scan/stream', async (req, res) => {
           const title = (job.title || '').toLowerCase();
           const loc = (job.location || '').toLowerCase();
           const matchesKw = kw.length === 0 || kw.some(k => title.includes(k));
-          const matchesLoc = locs.length === 0 || locs.some(l => loc.includes(l));
-          if (matchesKw && matchesLoc) {
-            results.push({ company: job.company || t.entry.name || '', role: job.title || '', location: job.location || '', url: job.url || '', matched: true, source: t.provider.id });
+          if (matchesKw) {
+            const entry = { company: job.company || t.entry.name || '', role: job.title || '', location: job.location || '', url: job.url || '', matched: true, source: t.provider.id };
+            keywordMatched.push(entry);
+            const matchesLoc = locs.length === 0 || locs.some(l => loc.includes(l));
+            if (matchesLoc) results.push(entry);
           }
         }
       } catch { /* skip */ }
@@ -821,8 +1480,12 @@ app.get('/scan/stream', async (req, res) => {
           totalBeforeFilter++;
           if (kw.length === 0 || kw.some(k => lower.includes(k))) {
             const href = m[1].startsWith('http') ? m[1] : new URL(m[1], entry.careers_url).href;
-            if (!results.some(r => r.url === href)) {
-              results.push({ company: entry.name || '', role: title, location: '', url: href, matched: true, source: 'websearch' });
+            if (!keywordMatched.some(r => r.url === href)) {
+              const entry2 = { company: entry.name || '', role: title, location: '', url: href, matched: true, source: 'websearch' };
+              keywordMatched.push(entry2);
+              if (!results.some(r => r.url === href)) {
+                results.push(entry2);
+              }
             }
           }
         }
@@ -831,6 +1494,14 @@ app.get('/scan/stream', async (req, res) => {
       send('progress', { completed, total: totalPortals, current: entry.name || 'web', found: results.length });
     }
     clearTimeout(timeout);
+
+    // Location fallback: if locations were specified but nothing matched both keyword AND location,
+    // fall back to keyword-only results so the user sees something
+    let locationFallback = false;
+    if (results.length === 0 && keywordMatched.length > 0 && locs.length > 0) {
+      results = keywordMatched;
+      locationFallback = true;
+    }
 
     // Dedup
     const seen = new Set();
@@ -843,13 +1514,17 @@ app.get('/scan/stream', async (req, res) => {
     }
 
     send('done', {
+      total: totalBeforeFilter,
+      newFound: deduped.length,
       results: deduped.slice(0, 100),
       summary: {
         portalsScanned: totalPortals,
         totalFound: totalBeforeFilter,
-        filteredByKeywords: totalBeforeFilter - results.length,
+        filteredByKeywords: totalBeforeFilter - keywordMatched.length,
+        filteredByLocation: keywordMatched.length - results.length + (locationFallback ? keywordMatched.length - deduped.length : 0),
         duplicatesSkipped: results.length - deduped.length,
         netNew: deduped.length,
+        locationFallback,
         tooBroad: deduped.length > 100,
         narrowingHints: deduped.length > 100 ? ['Too many results — narrow keywords'] : [],
       },
@@ -891,10 +1566,11 @@ app.post('/resume/upload', upload.single('resume'), async (req, res) => {
 
     if (!text) return res.status(400).json({ error: 'Could not extract text from file' });
 
-    // Write raw text to data/cv.md — the canonical CV file for career-ops
-    const cvDir = join(__dirname, 'data');
+    // Write raw text to data/cv.md — the canonical CV file for career-ops (per-user or root)
+    const cvDir = req.userCtx.dataDir || join(__dirname, 'data');
     if (!existsSync(cvDir)) mkdirSync(cvDir, { recursive: true });
-    writeFileSync(join(cvDir, 'cv.md'), text, 'utf-8');
+    const cvWritePath = req.userCtx.cvPath || join(cvDir, 'cv.md');
+    writeFileSync(cvWritePath, text, 'utf-8');
 
     // Parse profile from text
     const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
@@ -962,12 +1638,20 @@ app.post('/resume/upload', upload.single('resume'), async (req, res) => {
       (bodyText.match(CITY_PATTERN) || []).map(l => l.charAt(0).toUpperCase() + l.slice(1).toLowerCase())
     )].slice(0, 5);
 
-    const existing = readProfile();
+    const existing = (() => {
+      const pPath = req.userCtx.profilePath || PROFILE_PATH;
+      if (!existsSync(pPath)) return {};
+      return yaml.load(readFileSync(pPath, 'utf-8')) || {};
+    })();
     if (!existing.candidate) existing.candidate = {};
     if (name && !existing.candidate?.full_name) { existing.candidate.full_name = name; }
     if (email) existing.candidate.email = email;
     if (phone) existing.candidate.phone = phone;
-    writeProfile(existing);
+    // Write back to per-user or root profile
+    const profileWritePath = req.userCtx.profilePath || PROFILE_PATH;
+    const profileDir = dirname(profileWritePath);
+    if (!existsSync(profileDir)) mkdirSync(profileDir, { recursive: true });
+    writeFileSync(profileWritePath, yaml.dump(existing, { indent: 2, lineWidth: -1, noRefs: true }));
 
     const portfolioUrl = links.find(l => l.includes('github') || l.includes('portfolio')) || '';
     const linkedinUrl = links.find(l => l.includes('linkedin')) || '';
@@ -1001,7 +1685,9 @@ app.post('/resume/upload', upload.single('resume'), async (req, res) => {
     }
 
     res.json({
+      success: true,
       name, email, phone,
+      skills: suggestedKeywords,
       portfolio: portfolioUrl,
       linkedin: linkedinUrl,
       suggestedKeywords,
@@ -1020,9 +1706,13 @@ app.post('/email/triage', async (req, res) => {
   const { email, appPassword } = req.body;
   const user = email || process.env.GMAIL_USER;
   const pass = appPassword || process.env.GMAIL_APP_PASSWORD;
-  if (!user || !pass) return res.status(400).json({ error: 'email and appPassword required' });
+  const userOAuth = req.userCtx.userId ? getUserOAuth(req.userCtx.userId) : null;
+  const hasUserOAuth2 = userOAuth && userOAuth.refreshToken;
+  const hasLegacyOAuth2 = process.env.GMAIL_CLIENT_ID && process.env.GMAIL_CLIENT_SECRET && process.env.GMAIL_REFRESH_TOKEN;
+  if (!user) return res.status(400).json({ error: 'email required' });
+  if (!pass && !hasUserOAuth2 && !hasLegacyOAuth2) return res.status(400).json({ error: 'appPassword or OAuth2 credentials required' });
 
-  const allEmails = await fetchEmails(user, pass);
+  const allEmails = await fetchEmails(user, pass, { userOAuth });
   const triaged = allEmails.map(e => {
     const subj = (e.subject || '').toLowerCase();
     const body = (e.body || '').toLowerCase();
@@ -1122,22 +1812,7 @@ app.post('/auto-pipeline', async (req, res) => {
       ? `Evaluate this job posting using career-ops auto-pipeline mode. Return ONLY a JSON object (no markdown, no code fences) with these fields: {"score": "X.X", "fit": "1-2 sentence fit assessment", "strengths": ["s1","s2"], "gaps": ["g1"]}. Score is 1.0-5.0. Be honest and conservative. Job URL: ${url} Company: ${company || 'Unknown'} Role: ${role || 'Unknown'} JD text: ${jdText.slice(0, 6000)}`
       : `Evaluate this job posting using career-ops auto-pipeline mode. Return ONLY a JSON object (no markdown, no code fences) with these fields: {"score": "X.X", "fit": "1-2 sentence fit assessment", "strengths": ["s1","s2"], "gaps": ["g1"]}. Score is 1.0-5.0. Be honest and conservative. Job URL: ${url} Company: ${company || 'Unknown'} Role: ${role || 'Unknown'}`;
 
-    const result = await new Promise((resolve, reject) => {
-      const proc = spawn('opencode', ['run', prompt], {
-        cwd: __dirname,
-        env: { ...process.env, PATH: `/root/.opencode/bin:${process.env.PATH}` },
-        timeout: 120000,
-      });
-      let stdout = '';
-      let stderr = '';
-      proc.stdout.on('data', d => { stdout += d.toString(); });
-      proc.stderr.on('data', d => { stderr += d.toString(); });
-      proc.on('close', code => {
-        if (code === 0) resolve(stdout);
-        else reject(new Error(`opencode exited ${code}: ${stderr.slice(0, 300)}`));
-      });
-      proc.on('error', reject);
-    });
+    const result = await runOpencode(prompt, 120000, userCwd(req));
 
     // Parse JSON from opencode response (handle markdown fences, prefixes)
     try {
@@ -1158,18 +1833,12 @@ app.post('/auto-pipeline', async (req, res) => {
   const companySlug = (req.body.company || 'unknown').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
   const today = new Date().toISOString().slice(0, 10);
 
-  // Find next report number
-  let nextNum = 1;
-  try {
-    const existing = existsSync(join(__dirname, 'reports'))
-      ? readdirSync(join(__dirname, 'reports')).filter(f => f.endsWith('.md')).map(f => parseInt(f.split('-')[0])).filter(n => !isNaN(n))
-      : [];
-    nextNum = existing.length > 0 ? Math.max(...existing) + 1 : 1;
-  } catch { nextNum = 1; }
+  // Find next report number (per-user)
+  const reportDir = userReportDir(req);
+  const nextNum = nextReportNumForDir(reportDir);
   const numStr = String(nextNum).padStart(3, '0');
 
-  // Save report
-  const reportDir = join(__dirname, 'reports');
+  // Save report to user's directory
   if (!existsSync(reportDir)) mkdirSync(reportDir, { recursive: true });
   const reportPath = join(reportDir, `${numStr}-${companySlug}-${today}.md`);
   const reportContent = `# Evaluation Report #${numStr}
@@ -1192,16 +1861,16 @@ ${(evaluation.gaps || []).map(g => `- ${g}`).join('\n') || '- None identified'}
 `;
   writeFileSync(reportPath, reportContent, 'utf-8');
 
-  // Update tracker — append TSV to batch/tracker-additions
-  const additionsDir = join(__dirname, 'batch/tracker-additions');
+  // Update tracker — append TSV to user's batch/tracker-additions
+  const additionsDir = userAdditionsDir(req);
   if (!existsSync(additionsDir)) mkdirSync(additionsDir, { recursive: true });
   const tsvPath = join(additionsDir, `${numStr}-${companySlug}.tsv`);
   const tsvLine = `${numStr}\t${today}\t${req.body.company || 'Unknown'}\t${req.body.role || 'Unknown'}\tEvaluated\t${score}/5\t❌\t[${numStr}](reports/${numStr}-${companySlug}-${today}.md)\tAuto-pipeline (opencode)`;
   writeFileSync(tsvPath, tsvLine + '\n', 'utf-8');
 
-  // Run merge-tracker to apply the addition
+  // Run merge-tracker from user dir or root
   try {
-    spawnSync('node', ['merge-tracker.mjs'], { cwd: __dirname, encoding: 'utf-8', timeout: 10000 });
+    spawnSync('node', ['merge-tracker.mjs'], { cwd: userCwd(req), encoding: 'utf-8', timeout: 10000 });
   } catch { /* non-fatal */ }
 
   res.json({
@@ -1214,21 +1883,51 @@ ${(evaluation.gaps || []).map(g => `- ${g}`).join('\n') || '- None identified'}
   });
 });
 
-// POST /email/credentials — save Gmail credentials to .bridge.env and update runtime env
+// POST /email/credentials — save Gmail credentials
+// With X-User-Id header: saves to per-user .oauth2.json
+// Without header: saves to .bridge.env (legacy single-user)
 app.post('/email/credentials', (req, res) => {
   try {
-    const { gmailUser, appPassword } = req.body;
-    if (!gmailUser || !appPassword) {
-      return res.status(400).json({ success: false, error: 'gmailUser and appPassword are required' });
+    const { gmailUser, appPassword, clientId, clientSecret, refreshToken } = req.body;
+    if (!gmailUser) {
+      return res.status(400).json({ success: false, error: 'gmailUser is required' });
     }
 
-    // Update runtime env
+    // Per-user mode: store in user's directory
+    if (req.userCtx.userId && clientId && refreshToken) {
+      const creds = {
+        email: gmailUser,
+        clientId,
+        clientSecret,
+        accessToken: '',
+        refreshToken,
+        expiresAt: 0,
+        tokenType: 'Bearer',
+        scope: 'openid https://mail.google.com/',
+        storedAt: new Date().toISOString(),
+      };
+      setUserOAuth(req.userCtx.userId, creds);
+
+      // Also update runtime env for legacy fallback paths
+      process.env.GMAIL_USER = gmailUser;
+      process.env.GMAIL_CLIENT_ID = clientId;
+      process.env.GMAIL_CLIENT_SECRET = clientSecret;
+      process.env.GMAIL_REFRESH_TOKEN = refreshToken;
+
+      return res.json({ success: true, method: 'per_user_oauth2', storage: 'user_dir' });
+    }
+
+    // Legacy single-user mode: update runtime env and .bridge.env
     process.env.GMAIL_USER = gmailUser;
-    process.env.GMAIL_APP_PASSWORD = appPassword;
+    if (appPassword) process.env.GMAIL_APP_PASSWORD = appPassword;
+    if (clientId) process.env.GMAIL_CLIENT_ID = clientId;
+    if (clientSecret) process.env.GMAIL_CLIENT_SECRET = clientSecret;
+    if (refreshToken) process.env.GMAIL_REFRESH_TOKEN = refreshToken;
 
     // Persist to .bridge.env
     const envPath = join(__dirname, '.bridge.env');
     const lines = [];
+    const keysToSet = ['GMAIL_USER', 'GMAIL_APP_PASSWORD', 'GMAIL_CLIENT_ID', 'GMAIL_CLIENT_SECRET', 'GMAIL_REFRESH_TOKEN'];
     if (existsSync(envPath)) {
       const existing = readFileSync(envPath, 'utf-8').split('\n');
       for (const line of existing) {
@@ -1237,16 +1936,23 @@ app.post('/email/credentials', (req, res) => {
         const eq = trimmed.indexOf('=');
         if (eq > 0) {
           const key = trimmed.slice(0, eq).trim();
-          if (key === 'GMAIL_USER' || key === 'GMAIL_APP_PASSWORD') continue; // replace
+          if (keysToSet.includes(key)) continue; // replace
         }
         lines.push(line);
       }
     }
     lines.push(`GMAIL_USER=${gmailUser}`);
-    lines.push(`GMAIL_APP_PASSWORD=${appPassword}`);
+    if (appPassword) lines.push(`GMAIL_APP_PASSWORD=${appPassword}`);
+    if (clientId) lines.push(`GMAIL_CLIENT_ID=${clientId}`);
+    if (clientSecret) lines.push(`GMAIL_CLIENT_SECRET=${clientSecret}`);
+    if (refreshToken) lines.push(`GMAIL_REFRESH_TOKEN=${refreshToken}`);
     writeFileSync(envPath, lines.join('\n') + '\n', 'utf-8');
 
-    res.json({ success: true });
+    // Clear cached token so next request uses new credentials
+    cachedGmailToken = null;
+    gmailTokenExpiry = 0;
+
+    res.json({ success: true, method: clientId ? 'legacy_oauth2' : 'app_password', storage: 'bridge.env' });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
@@ -1295,6 +2001,55 @@ app.post('/liveness', (req, res) => {
   }
 });
 
+// POST /gmail/test — verify Gmail SMTP credentials work
+app.post('/gmail/test', async (req, res) => {
+  try {
+    const nodemailer = require('nodemailer');
+    const email = req.body.email || process.env.GMAIL_USER;
+    const password = req.body.appPassword || process.env.GMAIL_APP_PASSWORD;
+    const oauthCreds = req.userCtx?.oauthPath ? getUserOAuth(req.userCtx.userId) : null;
+
+    if (!email) {
+      return res.status(400).json({ success: false, error: 'No Gmail address configured. Set GMAIL_USER in .bridge.env or provide email in request body.' });
+    }
+
+    // Try OAuth2 first if available
+    if (oauthCreds?.refreshToken && oauthCreds?.clientId) {
+      try {
+        const accessToken = await getGmailAccessToken();
+        const transporter = nodemailer.createTransport({
+          host: 'smtp.gmail.com',
+          port: 465,
+          secure: true,
+          auth: { type: 'OAuth2', user: email, clientId: oauthCreds.clientId, clientSecret: oauthCreds.clientSecret, refreshToken: oauthCreds.refreshToken, accessToken },
+        });
+        await transporter.verify();
+        return res.json({ success: true, method: 'oauth2', email, message: 'Gmail OAuth2 connection verified successfully.' });
+      } catch (e) {
+        // Fall through to app password
+      }
+    }
+
+    // Try app password
+    if (password) {
+      try {
+        const transporter = nodemailer.createTransport({
+          host: 'smtp.gmail.com', port: 465, secure: true,
+          auth: { user: email, pass: password },
+        });
+        await transporter.verify();
+        return res.json({ success: true, method: 'app_password', email, message: 'Gmail app password verified successfully.' });
+      } catch (e) {
+        return res.json({ success: false, method: 'app_password', error: `App password verification failed: ${e.message}. Generate a new one at https://myaccount.google.com/apppasswords` });
+      }
+    }
+
+    res.json({ success: false, error: `No credentials available for ${email}. Either set GMAIL_APP_PASSWORD in .bridge.env or configure OAuth2 via /users/${email}/oauth/exchange.` });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 // GET /followups — get follow-up cadence from followup-cadence.mjs
 app.get('/followups', (req, res) => {
   try {
@@ -1315,7 +2070,7 @@ app.get('/followups', (req, res) => {
     } catch {
       // Fallback: return raw output wrapped in array
       const lines = (r.stdout || '').split('\n').filter(Boolean);
-      res.json({ followups: lines });
+      res.json({ entries: lines });
     }
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1336,22 +2091,7 @@ From: ${from || 'Unknown'} <${fromEmail || 'unknown'}>
 Subject: ${subject}
 Preview: ${(preview || '').slice(0, 500)}`;
 
-    const result = await new Promise((resolve, reject) => {
-      const proc = spawn('opencode', ['run', prompt], {
-        cwd: __dirname,
-        env: { ...process.env, PATH: `/root/.opencode/bin:${process.env.PATH}` },
-        timeout: 60000,
-      });
-      let stdout = '';
-      let stderr = '';
-      proc.stdout.on('data', d => { stdout += d.toString(); });
-      proc.stderr.on('data', d => { stderr += d.toString(); });
-      proc.on('close', code => {
-        if (code === 0) resolve(stdout);
-        else reject(new Error(`opencode exited ${code}: ${stderr.slice(0, 300)}`));
-      });
-      proc.on('error', reject);
-    });
+    const result = await runOpencode(prompt, 60000, userCwd(req));
 
     // Parse JSON from response
     let classification = { classification: 'spam', confidence: 0.5, reason: 'parse_error' };
@@ -1372,34 +2112,21 @@ app.post('/email/cover-letter', async (req, res) => {
     const { company, role, resume, jd } = req.body;
     if (!company || !role) return res.status(400).json({ error: 'company and role required' });
 
+    const userCv = resume || readUserCv(req);
+
     const prompt = `Write a concise, tailored job application email body (3-4 paragraphs).
 Structure: introduction, relevant highlights from the resume, why this role, closing.
 Never invent claims. Reorder and emphasize existing experience from the resume.
 
 RESUME:
-${(resume || '').slice(0, 4000)}
+${userCv.slice(0, 4000)}
 
 JOB: ${role} at ${company}
 ${jd ? `JD: ${jd.slice(0, 3000)}` : ''}
 
 Return ONLY the email body text (no markdown, no JSON, no code fences).`;
 
-    const result = await new Promise((resolve, reject) => {
-      const proc = spawn('opencode', ['run', prompt], {
-        cwd: __dirname,
-        env: { ...process.env, PATH: `/root/.opencode/bin:${process.env.PATH}` },
-        timeout: 120000,
-      });
-      let stdout = '';
-      let stderr = '';
-      proc.stdout.on('data', d => { stdout += d.toString(); });
-      proc.stderr.on('data', d => { stderr += d.toString(); });
-      proc.on('close', code => {
-        if (code === 0) resolve(stdout);
-        else reject(new Error(`opencode exited ${code}: ${stderr.slice(0, 300)}`));
-      });
-      proc.on('error', reject);
-    });
+    const result = await runOpencode(prompt, 120000, userCwd(req));
 
     // Strip markdown fences if present
     let coverLetter = result.trim();
@@ -1417,8 +2144,8 @@ Return ONLY the email body text (no markdown, no JSON, no code fences).`;
 app.post('/email/draft', async (req, res) => {
   try {
     const { type, company, role, jd, contactName, reportNum } = req.body;
-    const cv = existsSync(join(__dirname, 'data/cv.md')) ? readFileSync(join(__dirname, 'data/cv.md'), 'utf-8').slice(0, 4000) : '';
-    const profile = readProfile();
+    const cv = readUserCv(req);
+    const profile = readUserProfileRaw(req);
     const prompt = `You are a job application email drafter. Generate a formal application email.
 Type: ${type || 'hr_application'}
 Company: ${company || 'Unknown'}
@@ -1434,7 +2161,7 @@ Candidate phone: ${profile?.candidate?.phone || ''}
 
 Return JSON: {"subject": "...", "body": "...", "contactBlock": "..."}`;
 
-    const result = await runOpencode(prompt);
+    const result = await runOpencode(prompt, 120000, userCwd(req));
     const parsed = parseJsonFromOutput(result);
     res.json(parsed || { subject: '', body: result.trim().slice(0, 2000), contactBlock: '' });
   } catch (e) {
@@ -1446,7 +2173,7 @@ Return JSON: {"subject": "...", "body": "...", "contactBlock": "..."}`;
 app.post('/outreach', async (req, res) => {
   try {
     const { company, role, contactType, jd, contactName } = req.body;
-    const cv = existsSync(join(__dirname, 'data/cv.md')) ? readFileSync(join(__dirname, 'data/cv.md'), 'utf-8').slice(0, 4000) : '';
+    const cv = readUserCv(req);
     const prompt = `You are a job outreach message generator. Create a ≤300 character LinkedIn connection request.
 Company: ${company || 'Unknown'}
 Role: ${role || 'Unknown'}
@@ -1458,7 +2185,7 @@ CV excerpt: ${cv}
 Rules: max 300 chars. No corporate speak. No "passionate about". Lead with value.
 Return JSON: {"message": "...", "charCount": N, "contactType": "..."}`;
 
-    const result = await runOpencode(prompt);
+    const result = await runOpencode(prompt, 120000, userCwd(req));
     const parsed = parseJsonFromOutput(result);
     res.json(parsed || { message: result.trim().slice(0, 300), charCount: result.trim().length, contactType: contactType || 'recruiter' });
   } catch (e) {
@@ -1476,7 +2203,7 @@ ${role ? `Role: ${role}` : ''}
 
 Return JSON: {"ai_strategy": "...", "recent_moves": "...", "engineering_culture": "...", "challenges": "...", "competitors": "...", "candidate_angle": "..."}`;
 
-    const result = await runOpencode(prompt, 180000);
+    const result = await runOpencode(prompt, 180000, userCwd(req));
     const parsed = parseJsonFromOutput(result);
     res.json(parsed || { summary: result.trim().slice(0, 3000) });
   } catch (e) {
@@ -1488,9 +2215,10 @@ Return JSON: {"ai_strategy": "...", "recent_moves": "...", "engineering_culture"
 app.post('/interview-prep', async (req, res) => {
   try {
     const { company, role, reportNum } = req.body;
-    const cv = existsSync(join(__dirname, 'data/cv.md')) ? readFileSync(join(__dirname, 'data/cv.md'), 'utf-8').slice(0, 4000) : '';
+    const cv = readUserCv(req);
+    const reportDir = userReportDir(req);
     const report = reportNum ? (() => {
-      try { const f = readdirSync(join(__dirname, 'reports')).filter(f => f.startsWith(String(reportNum).padStart(3, '0'))); return f.length ? readFileSync(join(__dirname, 'reports', f[0]), 'utf-8').slice(0, 4000) : ''; } catch { return ''; }
+      try { const f = readdirSync(reportDir).filter(f => f.startsWith(String(reportNum).padStart(3, '0'))); return f.length ? readFileSync(join(reportDir, f[0]), 'utf-8').slice(0, 4000) : ''; } catch { return ''; }
     })() : '';
     const prompt = `Generate interview prep for this company.
 Company: ${company}
@@ -1500,7 +2228,7 @@ ${report ? `Report: ${report}` : ''}
 
 Return JSON: {"likely_questions": ["q1","q2","q3","q4","q5"], "star_stories": [{"situation":"...","task":"...","action":"...","result":"..."}], "company_red_flags": ["..."], "questions_to_ask": ["..."], "key_talking_points": ["..."]}`;
 
-    const result = await runOpencode(prompt, 180000);
+    const result = await runOpencode(prompt, 180000, userCwd(req));
     const parsed = parseJsonFromOutput(result);
     res.json(parsed || { summary: result.trim().slice(0, 3000) });
   } catch (e) {
@@ -1520,7 +2248,7 @@ app.post('/batch', async (req, res) => {
       const role = typeof item === 'string' ? '' : item.role || '';
       try {
         const prompt = `Evaluate this job. Return JSON: {"score":"X.X","fit":"...","strengths":["..."],"gaps":["..."]} Job: ${role} at ${company} URL: ${url}`;
-        const r = await runOpencode(prompt, 60000);
+        const r = await runOpencode(prompt, 60000, userCwd(req));
         const parsed = parseJsonFromOutput(r);
         results.push({ url, company, role, ...(parsed || { score: 'N/A', fit: r.trim().slice(0, 200) }) });
       } catch (e) {
@@ -1561,24 +2289,25 @@ app.get('/salary-gap', (req, res) => {
   }
 });
 
-// PUT /cv — edit cv.md
+// PUT /cv — edit cv.md (per-user or root)
 app.put('/cv', (req, res) => {
   try {
     const { content } = req.body;
     if (!content) return res.status(400).json({ error: 'content required' });
-    const cvDir = join(__dirname, 'data');
+    const cvDir = req.userCtx.dataDir || join(__dirname, 'data');
     if (!existsSync(cvDir)) mkdirSync(cvDir, { recursive: true });
-    writeFileSync(join(cvDir, 'cv.md'), content, 'utf-8');
+    const cvPath = req.userCtx.cvPath || join(cvDir, 'cv.md');
+    writeFileSync(cvPath, content, 'utf-8');
     res.json({ success: true, length: content.length });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// GET /cv — read cv.md
+// GET /cv — read cv.md (per-user or root)
 app.get('/cv', (req, res) => {
   try {
-    const cvPath = join(__dirname, 'data/cv.md');
+    const cvPath = req.userCtx.cvPath || join(__dirname, 'data/cv.md');
     if (!existsSync(cvPath)) return res.json({ content: '' });
     res.json({ content: readFileSync(cvPath, 'utf-8') });
   } catch (e) {
@@ -1586,10 +2315,10 @@ app.get('/cv', (req, res) => {
   }
 });
 
-// GET/POST /blacklist — manage do-not-apply list
+// GET/POST /blacklist — manage do-not-apply list (per-user or root)
 app.get('/blacklist', (req, res) => {
   try {
-    const blPath = join(__dirname, 'data/blacklist.md');
+    const blPath = req.userCtx.blacklistPath || join(__dirname, 'data/blacklist.md');
     if (!existsSync(blPath)) return res.json({ companies: [] });
     const lines = readFileSync(blPath, 'utf-8').split('\n');
     const companies = lines.map(l => { const m = l.match(/^\s*[-*]\s*(.+)/); return m ? m[1].trim() : ''; }).filter(Boolean);
@@ -1603,8 +2332,8 @@ app.post('/blacklist', (req, res) => {
   try {
     const { company, action } = req.body;
     if (!company) return res.status(400).json({ error: 'company required' });
-    const blPath = join(__dirname, 'data/blacklist.md');
-    const blDir = join(__dirname, 'data');
+    const blPath = req.userCtx.blacklistPath || join(__dirname, 'data/blacklist.md');
+    const blDir = dirname(blPath);
     if (!existsSync(blDir)) mkdirSync(blDir, { recursive: true });
     let lines = existsSync(blPath) ? readFileSync(blPath, 'utf-8').split('\n') : ['# Blacklist', ''];
     if (action === 'remove') {
@@ -1642,7 +2371,7 @@ app.get('/scan-history', (req, res) => {
 app.post('/followup/draft', async (req, res) => {
   try {
     const { company, role, followupCount, contactEmail, appliedDate } = req.body;
-    const cv = existsSync(join(__dirname, 'data/cv.md')) ? readFileSync(join(__dirname, 'data/cv.md'), 'utf-8').slice(0, 4000) : '';
+    const cv = readUserCv(req);
     const prompt = `Generate a follow-up email for a job application.
 Company: ${company}
 Role: ${role}
@@ -1654,7 +2383,7 @@ CV excerpt: ${cv}
 Rules: Never use "just checking in" or "circling back". Lead with value. Under 150 words.
 Return JSON: {"subject": "...", "body": "..."}`;
 
-    const result = await runOpencode(prompt);
+    const result = await runOpencode(prompt, 120000, userCwd(req));
     const parsed = parseJsonFromOutput(result);
     res.json(parsed || { subject: '', body: result.trim().slice(0, 1500) });
   } catch (e) {
@@ -1673,7 +2402,7 @@ Body: ${(body || '').slice(0, 2000)}
 
 Return JSON: {"classification": "interview|offer|rejection|recruiter_reply|noise", "confidence": 0.0-1.0, "summary": "1-line summary", "suggestedAction": "what to do next"}`;
 
-    const result = await runOpencode(prompt, 60000);
+    const result = await runOpencode(prompt, 60000, userCwd(req));
     const parsed = parseJsonFromOutput(result);
     res.json(parsed || { classification: 'noise', confidence: 0.5, summary: result.trim().slice(0, 200), suggestedAction: 'Review manually' });
   } catch (e) {
@@ -1803,31 +2532,25 @@ app.post('/pipeline/evaluate', async (req, res) => {
     const { url, company, role } = req.body;
     if (!url) return res.status(400).json({ error: 'url required' });
     const prompt = `Evaluate this job posting using career-ops auto-pipeline mode. Return ONLY a JSON object with: {"score":"X.X","fit":"...","strengths":["..."],"gaps":["..."]}. Job: ${role || 'Unknown'} at ${company || 'Unknown'} URL: ${url}`;
-    const stdout = await runOpencode(prompt, 120000);
+    const stdout = await runOpencode(prompt, 120000, userCwd(req));
     let evaluation = { score: 'N/A', fit: '', strengths: [], gaps: [] };
     try { evaluation = JSON.parse(stdout.match(/\{[\s\S]*?\}/)?.[0] || '{}'); } catch { /* keep defaults */ }
-    // Save report + tracker (same as auto-pipeline)
+    // Save report + tracker (per-user)
     const score = evaluation.score || 'N/A';
     const slug = (company || 'unknown').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
     const today = new Date().toISOString().slice(0, 10);
-    let nextNum = 1;
-    try {
-      const existing = existsSync(join(__dirname, 'reports'))
-        ? readdirSync(join(__dirname, 'reports')).filter(f => f.endsWith('.md')).map(f => parseInt(f.split('-')[0])).filter(n => !isNaN(n))
-        : [];
-      nextNum = existing.length > 0 ? Math.max(...existing) + 1 : 1;
-    } catch { nextNum = 1; }
+    const reportDir = userReportDir(req);
+    const nextNum = nextReportNumForDir(reportDir);
     const numStr = String(nextNum).padStart(3, '0');
-    const reportDir = join(__dirname, 'reports');
     if (!existsSync(reportDir)) mkdirSync(reportDir, { recursive: true });
     writeFileSync(join(reportDir, `${numStr}-${slug}-${today}.md`), `# Report #${numStr}\n\n**Company:** ${company || 'Unknown'}\n**Role:** ${role || 'Unknown'}\n**URL:** ${url}\n**Score:** ${score}/5\n\n## Fit\n${evaluation.fit || 'N/A'}\n\n## Strengths\n${(evaluation.strengths || []).map(s => `- ${s}`).join('\n') || '- N/A'}\n\n## Gaps\n${(evaluation.gaps || []).map(g => `- ${g}`).join('\n') || '- None'}\n`, 'utf-8');
-    const additionsDir = join(__dirname, 'batch/tracker-additions');
+    const additionsDir = userAdditionsDir(req);
     if (!existsSync(additionsDir)) mkdirSync(additionsDir, { recursive: true });
     writeFileSync(join(additionsDir, `${numStr}-${slug}.tsv`), `${numStr}\t${today}\t${company || 'Unknown'}\t${role || 'Unknown'}\tEvaluated\t${score}/5\t❌\t[${numStr}](reports/${numStr}-${slug}-${today}.md)\tPipeline evaluate\n`, 'utf-8');
-    try { spawnSync('node', ['merge-tracker.mjs'], { cwd: __dirname, encoding: 'utf-8', timeout: 10000 }); } catch { /* non-fatal */ }
-    // Remove evaluated URL from pipeline.md
+    try { spawnSync('node', ['merge-tracker.mjs'], { cwd: userCwd(req), encoding: 'utf-8', timeout: 10000 }); } catch { /* non-fatal */ }
+    // Remove evaluated URL from user's pipeline.md
     try {
-      const pipelinePath = join(__dirname, 'data/pipeline.md');
+      const pipelinePath = req.userCtx?.pipelinePath || join(__dirname, 'data/pipeline.md');
       if (existsSync(pipelinePath)) {
         const lines = readFileSync(pipelinePath, 'utf-8').split('\n');
         const filtered = lines.filter(l => !l.includes(url));
@@ -1835,6 +2558,39 @@ app.post('/pipeline/evaluate', async (req, res) => {
       }
     } catch { /* non-fatal */ }
     res.json({ score, reportNum: nextNum, fit: evaluation.fit, strengths: evaluation.strengths, gaps: evaluation.gaps });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── GET /export/:file — data export for backup/sharing ─────────────
+const EXPORT_WHITELIST = {
+  'daily-job-log':  join(__dirname, 'data/daily-job-log.md'),
+  'applications':   join(__dirname, 'data/applications.md'),
+  'cv':             join(__dirname, 'data/cv.md'),
+  'portals':        join(__dirname, 'portals.yml'),
+  'scan-history':   join(__dirname, 'data/scan-history.tsv'),
+  'blacklist':      join(__dirname, 'data/blacklist.md'),
+  'pipeline':       join(__dirname, 'data/pipeline.md'),
+  'profile':        join(__dirname, 'config/profile.yml'),
+};
+
+app.get('/export/:file', (req, res) => {
+  const key = req.params.file;
+  const filePath = EXPORT_WHITELIST[key];
+  if (!filePath || !existsSync(filePath)) {
+    return res.status(404).json({ error: `File not found: ${key}` });
+  }
+  try {
+    const stat = statSync(filePath);
+    const content = readFileSync(filePath, 'utf-8');
+    res.json({
+      name: key,
+      filename: basename(filePath),
+      content,
+      size: stat.size,
+      modified: stat.mtime.toISOString(),
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1866,3 +2622,438 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`Tracker: ${TRACKER_PATH}`);
   console.log(`Profile: ${PROFILE_PATH}`);
 });
+
+// ── OpenCode SDK integration ───────────────────────────────────────
+const opencodeSessions = new Map();
+const OPENCODE_URL = process.env.OPENCODE_URL || 'http://127.0.0.1:4096';
+const OPENCODE_PORT = 4096;
+
+function isTermux() {
+  return existsSync('/data/data/com.termux') || !!process.env.TERMUX_VERSION;
+}
+
+async function waitForOpencodeServer(url, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const r = await fetch(url + '/health', { signal: AbortSignal.timeout(1000) });
+      if (r.ok) return true;
+    } catch {}
+    await new Promise(r => setTimeout(r, 500));
+  }
+  return false;
+}
+
+async function initOpencode(userId, userDir) {
+  const key = userId || '__root__';
+  if (opencodeSessions.has(key)) return opencodeSessions.get(key);
+
+  let client;
+
+  // Strategy 1: Connect to an already-running opencode server
+  try {
+    const probe = await fetch(OPENCODE_URL + '/health', { signal: AbortSignal.timeout(2000) });
+    if (probe.ok) {
+      console.log(`[chat] Connecting to existing opencode server at ${OPENCODE_URL}`);
+      client = createOpencodeClient({
+        baseUrl: OPENCODE_URL,
+        directory: userDir || __dirname,
+      });
+    }
+  } catch {}
+
+  // Strategy 2: Spawn opencode serve
+  if (!client) {
+    if (isTermux()) {
+      // On Android/Termux: spawn via proot-distro (opencode binary needs glibc)
+      console.log(`[chat] Termux detected — launching opencode via proot-distro...`);
+      const prootBin = '/data/data/com.termux/files/usr/bin/proot-distro';
+      const prootProc = spawn(prootBin, [
+        'login', 'debian', '--',
+        'bash', '-c',
+        `cd /root/career-ops && echo "[proot] cwd: $(pwd)" && echo "[proot] opencode: $(ls -la ./opencode 2>&1)" && ./opencode serve --hostname=127.0.0.1 --port=${OPENCODE_PORT} 2>&1`
+      ], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, HOME: '/root' },
+        detached: true,
+      });
+      prootProc.unref();
+      prootProc.on('error', (e) => console.error(`[chat] proot spawn error: ${e.message}`));
+      prootProc.stdout?.on('data', (d) => {
+        const s = d.toString().trim();
+        if (s) console.log(`[proot:out] ${s}`);
+      });
+      prootProc.stderr?.on('data', (d) => {
+        const s = d.toString().trim();
+        if (s) console.log(`[proot:err] ${s}`);
+      });
+      prootProc.on('exit', (code) => console.log(`[proot] exited with code ${code}`));
+
+      console.log(`[chat] Waiting for opencode server on ${OPENCODE_URL}...`);
+      const ready = await waitForOpencodeServer(OPENCODE_URL, 30000);
+      if (!ready) {
+        throw new Error(
+          'opencode server did not start in 30s. Check proot output above for errors.'
+        );
+      }
+      console.log(`[chat] opencode server ready`);
+      client = createOpencodeClient({
+        baseUrl: OPENCODE_URL,
+        directory: userDir || __dirname,
+      });
+      // Warmup: wait for model provider to initialize after fresh server start
+      console.log('[chat] Warming up model provider (5s)...');
+      await new Promise(r => setTimeout(r, 5000));
+    } else {
+      // Desktop Linux/macOS: spawn directly
+      try {
+        console.log(`[chat] Spawning opencode serve locally...`);
+        const server = await createOpencode({
+          dir: userDir || __dirname,
+          permission: { bash: "allow", write: "allow", edit: "allow" },
+          timeout: 15000,
+        });
+        client = createOpencodeClient({
+          baseUrl: server.url,
+          directory: userDir || __dirname,
+        });
+      } catch (e) {
+        throw new Error(`Failed to start opencode: ${e.message}`);
+      }
+    }
+  }
+
+  const sessionResult = await client.session.create({
+    body: { title: userId || 'default' }
+  });
+  const sessionId = sessionResult.data?.id;
+  if (!sessionId) {
+    throw new Error('Failed to create opencode session: ' + JSON.stringify(sessionResult.error || sessionResult));
+  }
+
+  opencodeSessions.set(key, { client, sessionId });
+  return { client, sessionId };
+}
+
+async function doctorCheck(userDir) {
+  const result = spawnSync('node', ['doctor.mjs', '--json'], {
+    cwd: userDir,
+    encoding: 'utf-8',
+    timeout: 30000
+  });
+  try {
+    return JSON.parse(result.stdout);
+  } catch {
+    return { onboardingNeeded: true, missing: ['applications.md'] };
+  }
+}
+
+// ── POST /chat — send message to opencode brain ─────────────────────
+app.post('/chat', async (req, res) => {
+  try {
+    const userId = req.userCtx?.userId;
+    const userDir = req.userCtx?.userDir;
+    const { message, sessionId: requestedSessionId } = req.body;
+    
+    if (!message) return res.status(400).json({ error: 'message required' });
+    
+    // Auto-detect guard: check if applications.md exists
+    const trackerPath = join(userDir, 'data', 'applications.md');
+    if (!existsSync(trackerPath)) {
+      console.log('[chat] applications.md missing, running doctor check...');
+      await doctorCheck(userDir);
+    }
+    
+    const { client, sessionId } = await initOpencode(userId, userDir);
+    console.log(`[chat] Session ${sessionId}, sending: "${message.slice(0, 80)}..."`);
+
+    // Step 1: Fire promptAsync (returns 204, non-blocking)
+    const asyncResult = await client.session.promptAsync({
+      path: { id: sessionId },
+      body: { 
+        parts: [{ type: "text", text: message }],
+        model: { providerID: "opencode", modelID: "big-pickle" }
+      }
+    });
+    
+    if (asyncResult.error) {
+      console.error('[chat] promptAsync error:', JSON.stringify(asyncResult.error));
+      return res.status(500).json({ error: 'opencode prompt failed', detail: asyncResult.error });
+    }
+    console.log('[chat] promptAsync sent OK, polling for completion...');
+
+    // Step 2: Poll session.status() until idle (max 120s for long operations like scan)
+    const STATUS_POLL_MS = 1500;
+    const MAX_WAIT_MS = 120000;
+    const deadline = Date.now() + MAX_WAIT_MS;
+    let idle = false;
+    let sawBusy = false;
+    
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, STATUS_POLL_MS));
+      try {
+        const statusResult = await client.session.status({});
+        const sessionStatus = statusResult.data?.[sessionId];
+        const statusType = sessionStatus?.type;
+        console.log(`[chat] status: ${statusType}`);
+        if (statusType === 'busy' || statusType === 'retry') {
+          sawBusy = true;
+        }
+        if (sawBusy && (statusType === 'idle' || !statusType)) {
+          idle = true;
+          break;
+        }
+      } catch (e) {
+        console.log(`[chat] status poll error: ${e.message}`);
+      }
+    }
+    
+    if (!idle) {
+      console.warn('[chat] Timed out waiting for idle, fetching messages anyway...');
+    }
+
+    // Step 3: Fetch messages and extract last assistant response
+    let content = '';
+    let allParts = [];
+    
+    let msgsResult = await client.session.messages({
+      path: { id: sessionId },
+      query: { limit: 20 }
+    });
+    
+    let msgs = msgsResult.data;
+    console.log(`[chat] messages() returned ${Array.isArray(msgs) ? msgs.length : 'non-array'} items`);
+    
+    // Retry: if 0 messages, the server may not have been ready. Wait and re-prompt.
+    if (!Array.isArray(msgs) || msgs.length === 0) {
+      console.log('[chat] No messages — retrying after 5s warmup...');
+      await new Promise(r => setTimeout(r, 5000));
+      
+      const retryAsync = await client.session.promptAsync({
+        path: { id: sessionId },
+        body: { 
+          parts: [{ type: "text", text: message }],
+          model: { providerID: "opencode", modelID: "big-pickle" }
+        }
+      });
+      if (retryAsync.error) {
+        console.error('[chat] Retry promptAsync error:', JSON.stringify(retryAsync.error));
+      } else {
+        console.log('[chat] Retry promptAsync sent, polling...');
+        const retryDeadline = Date.now() + MAX_WAIT_MS;
+        while (Date.now() < retryDeadline) {
+          await new Promise(r => setTimeout(r, STATUS_POLL_MS));
+          try {
+            const st = await client.session.status({});
+            const ss = st.data?.[sessionId];
+            console.log(`[chat] retry status: ${ss?.type}`);
+            if (!ss || ss.type === 'idle') break;
+          } catch {}
+        }
+        
+        msgsResult = await client.session.messages({
+          path: { id: sessionId },
+          query: { limit: 20 }
+        });
+        msgs = msgsResult.data;
+        console.log(`[chat] Retry messages() returned ${Array.isArray(msgs) ? msgs.length : 0} items`);
+      }
+    }
+    
+    if (Array.isArray(msgs)) {
+      const lastAssistant = msgs.filter(m => m.info?.role === 'assistant').pop();
+      if (lastAssistant) {
+        console.log(`[chat] Last assistant msg: id=${lastAssistant.info.id}, parts=${lastAssistant.parts?.length || 0}`);
+        allParts = lastAssistant.parts || [];
+        
+        // Log all part types for debugging
+        const typeCounts = {};
+        for (const p of allParts) {
+          typeCounts[p.type] = (typeCounts[p.type] || 0) + 1;
+        }
+        console.log('[chat] Part type breakdown:', JSON.stringify(typeCounts));
+        
+        // Extract text from text parts
+        content = allParts
+          .filter(p => p.type === 'text')
+          .map(p => p.text)
+          .join('\n');
+        
+        // If no text parts, check for tool output
+        if (!content) {
+          const toolParts = allParts.filter(p => p.type === 'tool');
+          console.log(`[chat] No text parts, found ${toolParts.length} tool parts`);
+          for (const tp of toolParts.slice(0, 3)) {
+            console.log(`[chat] Tool: ${tp.tool}, status: ${tp.state?.status}`);
+            if (tp.state?.status === 'completed') {
+              console.log(`[chat] Tool output (first 200): ${tp.state.output?.slice(0, 200)}`);
+            }
+          }
+          // If model ran tools but produced no text, report the tool execution
+          if (toolParts.length > 0) {
+            content = `I ran ${toolParts.length} operation(s). ` + 
+              toolParts.map(tp => {
+                const s = tp.state?.status;
+                return `${tp.tool}: ${s}`;
+              }).join(', ');
+          }
+        }
+      } else {
+        console.log('[chat] No assistant messages found');
+      }
+    }
+    
+    // Parse action blocks from content
+    const parsed = parseActionBlocks(content);
+    
+    res.json({
+      ...parsed,
+      success: true,
+      sessionId,
+      content: content || parsed.content || '',
+    });
+  } catch (e) {
+    console.error('[chat] Error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /chat/stream — SSE streaming for chat ──────────────────────
+app.post('/chat/stream', async (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+  });
+  
+  const send = (event, data) => {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+  
+  try {
+    const userId = req.userCtx?.userId;
+    const userDir = req.userCtx?.userDir;
+    const { message } = req.body;
+    
+    if (!message) { send('error', { error: 'message required' }); return res.end(); }
+    
+    // Auto-detect guard
+    const trackerPath = join(userDir, 'data', 'applications.md');
+    if (!existsSync(trackerPath)) {
+      await doctorCheck(userDir);
+    }
+    
+    const { client, sessionId } = await initOpencode(userId, userDir);
+    
+    // Subscribe to events BEFORE sending prompt
+    const eventResult = await client.event.subscribe();
+    const events = eventResult.stream;
+    
+    // Fire promptAsync (non-blocking)
+    const asyncResult = await client.session.promptAsync({
+      path: { id: sessionId },
+      body: { 
+        parts: [{ type: "text", text: message }],
+        model: { providerID: "opencode", modelID: "big-pickle" }
+      }
+    });
+    if (asyncResult.error) {
+      send('error', { error: asyncResult.error });
+      return res.end();
+    }
+    
+    // Stream events until session idle
+    for await (const event of events) {
+      if (event.type === 'message.part.delta') {
+        const delta = event.properties?.delta;
+        if (delta) {
+          send('text_delta', { text: delta });
+        }
+      } else if (event.type === 'session.status') {
+        if (event.properties?.status?.type === 'idle') {
+          send('done', { sessionId });
+          break;
+        }
+      } else if (event.type === 'session.error') {
+        send('error', { error: event.properties?.error });
+        break;
+      }
+    }
+    
+    res.end();
+  } catch (e) {
+    send('error', { error: e.message });
+    res.end();
+  }
+});
+
+// ── POST /chat/reset — reset user's opencode session ────────────────
+app.post('/chat/reset', (req, res) => {
+  const userId = req.userCtx?.userId;
+  const key = userId || '__root__';
+  if (opencodeSessions.has(key)) {
+    opencodeSessions.delete(key);
+    res.json({ success: true, message: 'Session reset' });
+  } else {
+    res.json({ success: true, message: 'No active session' });
+  }
+});
+
+// ── GET /debug — opencode server diagnostics ─────────────────────────
+app.get('/debug', async (req, res) => {
+  const info = {
+    opencodeUrl: OPENCODE_URL,
+    hasRunningSessions: opencodeSessions.size,
+    sessions: [...opencodeSessions.entries()].map(([k, v]) => ({ key: k, sessionId: v.sessionId })),
+    uptime: Math.floor(process.uptime()) + 's',
+  };
+  
+  // Probe opencode server
+  try {
+    const probe = await fetch(OPENCODE_URL + '/health', { signal: AbortSignal.timeout(3000) });
+    info.opencodeHealth = probe.ok ? 'ok' : 'error ' + probe.status;
+  } catch (e) {
+    info.opencodeHealth = 'unreachable: ' + e.message;
+  }
+  
+  // Check for user's opencode files
+  const userDir = req.userCtx?.userDir || __dirname;
+  const fs = await import('fs');
+  info.files = {
+    opencodeJson: fs.existsSync(join(userDir, 'opencode.json')),
+    cvMd: fs.existsSync(join(userDir, 'cv.md')),
+    profileYml: fs.existsSync(join(userDir, 'config', 'profile.yml')),
+    applicationsMd: fs.existsSync(join(userDir, 'data', 'applications.md')),
+    portalsYml: fs.existsSync(join(userDir, 'portals.yml')),
+  };
+  
+  res.json(info);
+});
+
+// ── Action block parser for TUI-to-GUI rendering ────────────────────
+function parseActionBlocks(text) {
+  const actions = [];
+  const actionRegex = /\[ACTION:(\w+)\]([\s\S]*?)\[\/ACTION\]/g;
+  let match;
+  
+  while ((match = actionRegex.exec(text)) !== null) {
+    const type = match[1];
+    const content = match[2].trim();
+    const lines = content.split('\n');
+    const data = {};
+    
+    for (const line of lines) {
+      const colonIndex = line.indexOf(':');
+      if (colonIndex > 0) {
+        const key = line.slice(0, colonIndex).trim();
+        const value = line.slice(colonIndex + 1).trim();
+        data[key] = value;
+      }
+    }
+    
+    actions.push({ type, data });
+  }
+  
+  const cleanText = text.replace(actionRegex, '').trim();
+  return { text: cleanText, actions };
+}

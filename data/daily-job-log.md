@@ -421,3 +421,47 @@ Sent 2 applications:
 - **#16 Sequelstring** → Replied with application form link (pending action)
 
 **Tracker:** Now at 78 entries
+
+---
+
+## Session — 2026-07-21 (Mon)
+
+**Time:** 2026-07-21T10:00:00+05:30
+**Mode:** Web search + .eml generation
+
+### Pipeline Audit
+- Full system audit completed (APK + bridge server + CLI engine)
+- Android app: 49 Kotlin files, 39 API endpoints, SSE streaming scan
+- Critical gap: Apply flow is STUBBED in the APK (runQuickApply returns help text)
+- 62 of 64 active entries overdue for follow-up
+- Response rate: 1.5% (1/65 applied)
+- Gmail OAuth2 setup script created (gmail-oauth-setup.mjs)
+
+### New Companies Found (3):
+1. **Innovista Digital Solutions** — Navi Mumbai (WFH) — Full Stack Developer — ₹40-42k/mo — React/.NET/Python — 0-2 yrs — contact@innovistadigi.com
+2. **Fidar Imex Pvt Ltd** — Vashi, Navi Mumbai — Junior Full Stack Developer — React+Node.js — fidarimexindia@gmail.com
+3. **RSVR Technologies** — Remote India — ReactJS Dev Intern — ₹20k/mo → ₹3 LPA PPO — 6 months — connect@rsvrtech.com
+
+### Follow-ups Generated:
+- **#55 Miko.ai** → Abdul Khan, follow-up email drafted (most critical — only response so far)
+- **#47 1Accord** → Mahadev Dalvi, follow-up drafted (was awaiting response)
+- **#73 FynTune** → jobs@fyntune.com, follow-up drafted (7 days since application)
+- **#74 Heizen** → hiring@heizen.work, follow-up drafted (7 days since application)
+- **#75 SmartinfoLogiks** → careers@smartinfologiks.com, follow-up drafted (7 days since application)
+
+### .eml Files Generated (8):
+- `output/followup-055-miko-2026-07-21.eml`
+- `output/followup-047-1accord-2026-07-21.eml`
+- `output/followup-073-fyntune-2026-07-21.eml`
+- `output/followup-074-heizen-2026-07-21.eml`
+- `output/followup-075-smartinfologiks-2026-07-21.eml`
+- `output/apply-079-innovista-2026-07-21.eml`
+- `output/apply-080-webkit24-2026-07-21.eml`
+- `output/apply-081-rsvr-2026-07-21.eml`
+
+### Blocked:
+- Gmail app password auth failed — cannot send emails or check inbox
+- OAuth2 setup script created but needs Google Cloud project credentials
+- User is setting up OAuth2 — once done, all 8 emails can be sent
+
+**Tracker:** Now at 78 entries (3 new pending: #79 Innovista, #80 webkit24, #81 RSVR)

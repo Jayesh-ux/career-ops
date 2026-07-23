@@ -1,0 +1,485 @@
+package com.careerops.app.data.model
+
+import com.google.gson.annotations.SerializedName
+
+data class DoctorResponse(
+    val onboardingNeeded: Boolean = false,
+    val missing: List<String> = emptyList(),
+    val warnings: List<String> = emptyList()
+)
+
+data class TrackerResponse(
+    val applications: List<TrackerEntry> = emptyList()
+)
+
+data class TrackerEntry(
+    val id: String = "",
+    val date: String = "",
+    val company: String = "",
+    val role: String = "",
+    val score: String = "",
+    val status: String = "",
+    val pdf: String = "",
+    val report: String = "",
+    val notes: String = ""
+)
+
+data class TrackerAddRequest(
+    val company: String,
+    val role: String,
+    val location: String = "",
+    val contactEmail: String = "",
+    val notes: String = ""
+)
+
+data class ProfileResponse(
+    val name: String = "",
+    val email: String = "",
+    val phone: String = "",
+    val headline: String = "",
+    val targetRoles: List<String> = emptyList(),
+    val location: String = "",
+    val compensation: String = ""
+)
+
+data class ProfileUpdateRequest(
+    val name: String? = null,
+    val email: String? = null,
+    val phone: String? = null,
+    val targetRoles: List<String>? = null,
+    val location: String? = null,
+    val compensation: String? = null,
+    val headline: String? = null,
+    val searchKeywords: List<String>? = null,
+    val searchLocations: List<String>? = null
+)
+
+data class CvResponse(
+    val content: String = ""
+)
+
+data class ResumeUploadResponse(
+    val success: Boolean = false,
+    val name: String = "",
+    val email: String = "",
+    val phone: String = "",
+    val skills: List<String> = emptyList(),
+    val profile: ProfileResponse = ProfileResponse()
+)
+
+data class InboxResponse(
+    val emails: List<InboxEmail> = emptyList(),
+    val total: Int = 0,
+    val legitimateCount: Int = 0,
+    val spamCount: Int = 0,
+    val method: String = ""
+)
+
+data class InboxEmail(
+    val from: String = "",
+    val subject: String = "",
+    val date: String = "",
+    val body: String = "",
+    val isSpam: Boolean = false,
+    val category: String = ""
+)
+
+data class TriageResponse(
+    val interviews: List<InboxEmail> = emptyList(),
+    val responses: List<InboxEmail> = emptyList(),
+    val spam: List<InboxEmail> = emptyList(),
+    val other: List<InboxEmail> = emptyList()
+)
+
+data class CredentialsRequest(
+    val gmailUser: String,
+    val appPassword: String? = null,
+    val clientId: String? = null,
+    val clientSecret: String? = null,
+    val refreshToken: String? = null
+)
+
+data class BlacklistResponse(
+    val companies: List<String> = emptyList()
+)
+
+data class OAuthExchangeRequest(
+    val code: String,
+    val clientId: String,
+    val clientSecret: String,
+    val redirectUri: String? = null
+)
+
+data class OAuthExchangeResponse(
+    val success: Boolean = false,
+    val email: String = "",
+    val hasRefreshToken: Boolean = false,
+    val expiresIn: Int = 0
+)
+
+data class OAuthStatusResponse(
+    val configured: Boolean = false,
+    val email: String = "",
+    val hasRefreshToken: Boolean = false,
+    val isExpired: Boolean = false,
+    val expiresAt: String? = null
+)
+
+data class UserSetupRequest(
+    val name: String,
+    val targetRoles: List<String>,
+    val location: String = "",
+    val compensation: String = ""
+)
+
+data class UserSetupResponse(
+    val success: Boolean = false,
+    val email: String = "",
+    val userDir: String = "",
+    val files: List<String> = emptyList()
+)
+
+data class UserFilesResponse(
+    val email: String = "",
+    val files: List<UserFile> = emptyList()
+)
+
+data class UserFile(
+    val path: String = "",
+    val size: Long = 0,
+    val modified: String = ""
+)
+
+data class ScanResult(
+    val company: String = "",
+    val role: String = "",
+    val url: String = "",
+    val source: String = "",
+    val location: String = "",
+    val salary: String = ""
+)
+
+data class AutoPipelineRequest(
+    val url: String,
+    val company: String? = null,
+    val role: String? = null
+)
+
+data class AutoPipelineResponse(
+    val url: String = "",
+    val company: String? = null,
+    val role: String? = null,
+    val score: String = "N/A",
+    val reportNum: Int = 0,
+    val reportPath: String = "",
+    val fit: String = "",
+    val strengths: List<String> = emptyList(),
+    val gaps: List<String> = emptyList()
+)
+
+data class ClassifyRequest(
+    val from: String? = null,
+    val fromEmail: String? = null,
+    val subject: String,
+    val preview: String? = null
+)
+
+data class ClassifyResponse(
+    val classification: String = "spam",
+    val confidence: Double = 0.0,
+    val reason: String = ""
+)
+
+data class CoverLetterRequest(
+    val company: String,
+    val role: String,
+    val resume: String? = null,
+    val jd: String? = null
+)
+
+data class CoverLetterResponse(
+    val coverLetter: String = ""
+)
+
+data class OutreachRequest(
+    val company: String? = null,
+    val role: String? = null,
+    val contactType: String = "recruiter",
+    val jd: String? = null,
+    val contactName: String? = null
+)
+
+data class OutreachResponse(
+    val message: String = "",
+    val charCount: Int = 0,
+    val contactType: String = "recruiter"
+)
+
+data class DeepResearchRequest(
+    val company: String,
+    val role: String? = null
+)
+
+data class DeepResearchResponse(
+    val ai_strategy: String = "",
+    val recent_moves: String = "",
+    val engineering_culture: String = "",
+    val challenges: String = "",
+    val competitors: String = "",
+    val candidate_angle: String = "",
+    val summary: String = ""
+)
+
+data class InterviewPrepRequest(
+    val company: String,
+    val role: String? = null,
+    val reportNum: Int? = null
+)
+
+data class InterviewPrepResponse(
+    val likely_questions: List<String> = emptyList(),
+    val star_stories: List<StarStory> = emptyList(),
+    val company_red_flags: List<String> = emptyList(),
+    val questions_to_ask: List<String> = emptyList(),
+    val key_talking_points: List<String> = emptyList(),
+    val summary: String = ""
+)
+
+data class StarStory(
+    val situation: String = "",
+    val task: String = "",
+    val action: String = "",
+    val result: String = ""
+)
+
+data class BatchRequest(
+    val urls: List<BatchItem>
+)
+
+data class BatchItem(
+    val url: String,
+    val company: String? = null,
+    val role: String? = null
+)
+
+data class BatchResponse(
+    val results: List<AutoPipelineResponse> = emptyList()
+)
+
+data class FollowupDraftRequest(
+    val company: String,
+    val role: String? = null,
+    val followupCount: Int = 0,
+    val contactEmail: String? = null,
+    val appliedDate: String? = null
+)
+
+data class FollowupDraftResponse(
+    val subject: String = "",
+    val body: String = ""
+)
+
+data class PasteReplyRequest(
+    val from: String? = null,
+    val fromEmail: String? = null,
+    val subject: String? = null,
+    val body: String? = null
+)
+
+data class PasteReplyResponse(
+    val classification: String = "noise",
+    val confidence: Double = 0.0,
+    val summary: String = "",
+    val suggestedAction: String = ""
+)
+
+data class PipelineEvaluateRequest(
+    val url: String,
+    val company: String? = null,
+    val role: String? = null
+)
+
+data class ScanRequest(
+    val keywords: List<String> = emptyList(),
+    val locations: List<String> = emptyList()
+)
+
+data class ScanResponse(
+    val results: List<ScanResult> = emptyList(),
+    val total: Int = 0,
+    val newFound: Int = 0
+)
+
+data class LivenessRequest(
+    val urls: List<String>
+)
+
+data class LivenessResponse(
+    val results: List<LivenessResult> = emptyList()
+)
+
+data class LivenessResult(
+    val url: String = "",
+    val alive: Boolean = false,
+    val status: String = ""
+)
+
+data class PdfResponse(
+    val success: Boolean = false,
+    val pdfPath: String = "",
+    val outputDir: String = ""
+)
+
+data class SalaryGapResponse(
+    val observations: List<Any> = emptyList(),
+    val gaps: List<Any> = emptyList()
+)
+
+data class TrackerStatsResponse(
+    val total: Int = 0,
+    val byStatus: Map<String, Int> = emptyMap(),
+    val avgScore: String = "N/A",
+    val pdfPercent: Int = 0,
+    val reportPercent: Int = 0
+)
+
+data class ReportEntry(
+    val id: String = "",
+    val filename: String = "",
+    val company: String = "",
+    val date: String = "",
+    val score: String = "N/A",
+    val preview: String = ""
+)
+
+data class ReportsListResponse(
+    val reports: List<ReportEntry> = emptyList()
+)
+
+data class ReportDetailResponse(
+    val id: String = "",
+    val filename: String = "",
+    val content: String = ""
+)
+
+data class PipelineEntry(
+    val url: String = "",
+    val label: String = "",
+    val evaluated: Boolean = false
+)
+
+data class PipelineResponse(
+    val entries: List<PipelineEntry> = emptyList()
+)
+
+data class FollowUpEntry(
+    val company: String = "",
+    val role: String = "",
+    val contactEmail: String = "",
+    val appliedDate: String = "",
+    val daysSince: Int = 0,
+    val nextFollowup: String = "",
+    val followupCount: Int = 0
+)
+
+data class FollowUpsResponse(
+    val entries: List<FollowUpEntry> = emptyList()
+)
+
+data class DedupResponse(
+    val dedup: String = "",
+    val normalize: String = ""
+)
+
+data class ExportResponse(
+    val name: String = "",
+    val filename: String = "",
+    val content: String = "",
+    val size: Long = 0,
+    val modified: String = ""
+)
+
+data class ScanHistoryEntry(
+    val url: String = "",
+    val date: String = "",
+    val company: String = ""
+)
+
+data class ScanHistoryResponse(
+    val entries: List<ScanHistoryEntry> = emptyList()
+)
+
+data class PortalEntry(
+    val name: String = "",
+    val url: String = "",
+    val type: String = "",
+    val queries: List<String> = emptyList()
+)
+
+data class PortalsResponse(
+    val portals: List<PortalEntry> = emptyList(),
+    val queries: List<String> = emptyList()
+)
+
+data class EmailReplyRequest(
+    val to: String,
+    val subject: String,
+    val body: String,
+    val inReplyTo: String? = null
+)
+
+// ── Chat (opencode integration) ─────────────────────────
+data class ChatRequest(
+    val message: String,
+    val sessionId: String? = null
+)
+
+data class ChatResponse(
+    val success: Boolean = false,
+    val sessionId: String = "",
+    val content: String = "",
+    val toolCalls: List<ToolCallInfo> = emptyList(),
+    val actions: List<ActionBlock> = emptyList(),
+    val error: String? = null
+)
+
+data class ToolCallInfo(
+    val id: String = "",
+    val name: String = "",
+    val arguments: Map<String, Any> = emptyMap(),
+    val result: String = ""
+)
+
+// ── Action block for TUI-to-GUI rendering ────────────────────────────
+data class ActionBlock(
+    val type: String = "",
+    val data: Map<String, String> = emptyMap()
+)
+
+// ── Email draft request/response ─────────────────────────────────────
+data class EmailDraftRequest(
+    val company: String,
+    val role: String? = null,
+    val type: String = "application"
+)
+
+data class EmailDraftResponse(
+    val success: Boolean = false,
+    val draft: EmailDraftData = EmailDraftData()
+)
+
+data class EmailDraftData(
+    val to: String = "",
+    val subject: String = "",
+    val body: String = "",
+    val contactBlock: String = ""
+)
+
+// ── Email send request (HITL enforced) ───────────────────────────────
+data class EmailSendRequest(
+    val to: String,
+    val subject: String,
+    val body: String,
+    val company: String? = null,
+    val role: String? = null
+)

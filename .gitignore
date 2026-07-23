@@ -105,3 +105,17 @@ plan/
 # Bridge server credentials
 .bridge.env
 *.apk
+
+# OpenCode binary (142MB, machine-specific)
+/opencode
+
+# Setup scripts (local dev)
+setup-backend.sh
+gmail-oauth-setup.mjs
+
+# Android app build artifacts
+career-ops-app/.gradle/
+career-ops-app/app/build/
+career-ops-app/build/
+career-ops-app/local.properties
+career-ops-app/app/release/
