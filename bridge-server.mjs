@@ -2683,11 +2683,40 @@ async function initOpencode(userId, userDir) {
     if (isTermux()) {
       // On Android/Termux: spawn via proot-distro (opencode binary needs glibc)
       console.log(`[chat] Termux detected — launching opencode via proot-distro...`);
+      
+      // Copy lightweight AGENTS_ANDROID.md into proot so opencode uses small context
+      const prootRootfs = '/data/data/com.termux/files/usr/var/lib/proot-distro/containers/debian/rootfs';
+      const androidAgentsSrc = join(__dirname, 'AGENTS_ANDROID.md');
+      const prootAgentsDst = join(prootRootfs, 'root/career-ops/AGENTS_ANDROID.md');
+      const prootAgentsFull = join(prootRootfs, 'root/career-ops/AGENTS.md');
+      const prootAgentsBackup = join(prootRootfs, 'root/career-ops/AGENTS.md.full');
+      try {
+        if (existsSync(androidAgentsSrc)) {
+          // Backup full AGENTS.md once
+          if (!existsSync(prootAgentsBackup) && existsSync(prootAgentsFull)) {
+            const { copyFileSync } = await import('fs');
+            copyFileSync(prootAgentsFull, prootAgentsBackup);
+            console.log('[chat] Backed up AGENTS.md → AGENTS.md.full in proot');
+          }
+          // Copy lightweight version into proot
+          const { copyFileSync } = await import('fs');
+          copyFileSync(androidAgentsSrc, prootAgentsDst);
+          // Swap it as AGENTS.md
+          if (existsSync(prootAgentsDst)) {
+            const { renameSync } = await import('fs');
+            renameSync(prootAgentsDst, prootAgentsFull);
+            console.log('[chat] Installed lightweight AGENTS_ANDROID.md → AGENTS.md in proot');
+          }
+        }
+      } catch (e) {
+        console.log(`[chat] AGENTS swap skipped: ${e.message}`);
+      }
+
       const prootBin = '/data/data/com.termux/files/usr/bin/proot-distro';
       const prootProc = spawn(prootBin, [
         'login', 'debian', '--',
         'bash', '-c',
-        `cd /root/career-ops && echo "[proot] cwd: $(pwd)" && echo "[proot] opencode: $(ls -la ./opencode 2>&1)" && ./opencode serve --hostname=127.0.0.1 --port=${OPENCODE_PORT} 2>&1`
+        `cd /root/career-ops && ./opencode serve --hostname=127.0.0.1 --port=${OPENCODE_PORT} 2>&1`
       ], {
         stdio: ['ignore', 'pipe', 'pipe'],
         env: { ...process.env, HOME: '/root' },
