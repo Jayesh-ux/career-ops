@@ -9,7 +9,7 @@ plugins {
 
 android {
     namespace = "com.careerops.app"
-        compileSdk = 35
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.careerops.app"
