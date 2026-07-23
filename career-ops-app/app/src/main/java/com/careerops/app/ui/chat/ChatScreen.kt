@@ -35,6 +35,7 @@ fun ChatScreen(
     val isProcessing = viewModel.isProcessing
     val showDebug = viewModel.showDebug
     val debugLog = viewModel.debugLog
+    val responseTimes = viewModel.responseTimes
     var inputText by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
     val debugListState = rememberLazyListState()
@@ -142,6 +143,22 @@ fun ChatScreen(
                             fontWeight = FontWeight.Bold,
                             fontFamily = FontFamily.Monospace
                         )
+                        
+                        // Response time stats
+                        if (responseTimes.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(4.dp))
+                            val avgTime = viewModel.getAverageResponseTime()
+                            val lastTime = viewModel.getLastResponseTime()
+                            val successCount = responseTimes.count { it.success }
+                            val failCount = responseTimes.count { !it.success }
+                            Text(
+                                text = "Avg: ${avgTime}ms | Last: ${lastTime}ms | Success: $successCount | Failed: $failCount",
+                                color = Color(0xFF44AAFF),
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+                        
                         Spacer(modifier = Modifier.height(4.dp))
                         LazyColumn(
                             state = debugListState,
@@ -181,8 +198,10 @@ fun ChatScreen(
                         is ChatMessage.User -> UserBubble(message)
                         is ChatMessage.System -> SystemBubble(message)
                         is ChatMessage.Typing -> TypingBubble(message)
+                        is ChatMessage.ToolStatus -> ToolStatusBubble(message)
                         is ChatMessage.JobCard -> JobCardBubble(message)
                         is ChatMessage.EmailDraft -> EmailDraftBubble(message)
+                        is ChatMessage.Evaluation -> EvaluationCard(message)
                     }
                 }
             }
@@ -346,6 +365,120 @@ fun EmailDraftBubble(message: ChatMessage.EmailDraft) {
                     Spacer(modifier = Modifier.width(4.dp))
                     Text("Edit")
                 }
+            }
+        }
+    }
+}
+
+@Composable
+fun ToolStatusBubble(message: ChatMessage.ToolStatus) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Start
+    ) {
+        Surface(
+            shape = RoundedCornerShape(16.dp, 16.dp, 16.dp, 4.dp),
+            color = MaterialTheme.colorScheme.tertiaryContainer,
+            modifier = Modifier.fillMaxWidth(0.7f)
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                Spacer(modifier = Modifier.width(8.dp))
+                Column {
+                    Text(
+                        text = message.label,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer
+                    )
+                    if (message.detail.isNotEmpty()) {
+                        Text(
+                            text = message.detail,
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onTertiaryContainer.copy(alpha = 0.7f)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun EvaluationCard(message: ChatMessage.Evaluation) {
+    Card(
+        modifier = Modifier.fillMaxWidth(0.92f),
+        shape = RoundedCornerShape(12.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer
+        )
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Default.Assessment,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    if (message.company.isNotEmpty()) {
+                        Text(
+                            text = message.company,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 16.sp
+                        )
+                    }
+                    if (message.role.isNotEmpty()) {
+                        Text(
+                            text = message.role,
+                            fontSize = 14.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+            
+            if (message.score.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.1f),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Score",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = message.score,
+                            fontSize = 20.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
+            }
+            
+            if (message.summary.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = message.summary,
+                    fontSize = 13.sp,
+                    lineHeight = 18.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
     }

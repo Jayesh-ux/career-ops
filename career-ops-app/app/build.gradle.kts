@@ -9,7 +9,7 @@ plugins {
 
 android {
     namespace = "com.careerops.app"
-    compileSdk = 35
+        compileSdk = 35
 
     defaultConfig {
         applicationId = "com.careerops.app"
@@ -19,6 +19,15 @@ android {
         versionName = "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file(System.getProperty("user.home") + "/.android/debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
     }
 
     buildTypes {
@@ -33,6 +42,7 @@ android {
         debug {
             isDebuggable = true
             applicationIdSuffix = ".debug"
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 

@@ -2618,7 +2618,7 @@ process.on('unhandledRejection', (reason) => {
 
 // ── start ─────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`career-ops bridge server running on http://0.0.0.0:${PORT}`);
+  console.log(`career-ops bridge server v2 running on http://0.0.0.0:${PORT}`);
   console.log(`Tracker: ${TRACKER_PATH}`);
   console.log(`Profile: ${PROFILE_PATH}`);
 });
@@ -2702,8 +2702,8 @@ async function initOpencode(userId, userDir) {
         directory: userDir || __dirname,
       });
       // Warmup: wait for model provider to initialize after fresh server start
-      console.log('[chat] Warming up model provider (5s)...');
-      await new Promise(r => setTimeout(r, 5000));
+      console.log('[chat] Warming up model provider (2s)...');
+      await new Promise(r => setTimeout(r, 2000));
     } else {
       // Desktop Linux/macOS: spawn directly
       try {
@@ -2753,158 +2753,110 @@ app.post('/chat', async (req, res) => {
   try {
     const userId = req.userCtx?.userId;
     const userDir = req.userCtx?.userDir;
-    const { message, sessionId: requestedSessionId } = req.body;
+    const { message } = req.body;
     
     if (!message) return res.status(400).json({ error: 'message required' });
     
-    // Auto-detect guard: check if applications.md exists
     const trackerPath = join(userDir, 'data', 'applications.md');
     if (!existsSync(trackerPath)) {
-      console.log('[chat] applications.md missing, running doctor check...');
       await doctorCheck(userDir);
     }
     
     const { client, sessionId } = await initOpencode(userId, userDir);
     console.log(`[chat] Session ${sessionId}, sending: "${message.slice(0, 80)}..."`);
 
-    // Step 1: Fire promptAsync (returns 204, non-blocking)
-    const asyncResult = await client.session.promptAsync({
+    await client.session.promptAsync({
       path: { id: sessionId },
       body: { 
         parts: [{ type: "text", text: message }],
         model: { providerID: "opencode", modelID: "big-pickle" }
       }
     });
-    
-    if (asyncResult.error) {
-      console.error('[chat] promptAsync error:', JSON.stringify(asyncResult.error));
-      return res.status(500).json({ error: 'opencode prompt failed', detail: asyncResult.error });
-    }
-    console.log('[chat] promptAsync sent OK, polling for completion...');
 
-    // Step 2: Poll session.status() until idle (max 120s for long operations like scan)
-    const STATUS_POLL_MS = 1500;
-    const MAX_WAIT_MS = 120000;
-    const deadline = Date.now() + MAX_WAIT_MS;
-    let idle = false;
+    const POLL_MS = 1000;
+    const MAX_WAIT = 300000;
+    const deadline = Date.now() + MAX_WAIT;
+    let pollCount = 0;
     let sawBusy = false;
-    
+    let idleCount = 0;
+
     while (Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, STATUS_POLL_MS));
-      try {
-        const statusResult = await client.session.status({});
-        const sessionStatus = statusResult.data?.[sessionId];
-        const statusType = sessionStatus?.type;
-        console.log(`[chat] status: ${statusType}`);
-        if (statusType === 'busy' || statusType === 'retry') {
-          sawBusy = true;
+      await new Promise(r => setTimeout(r, POLL_MS));
+      pollCount++;
+
+      const statusResult = await client.session.status({}).catch(() => ({ data: {} }));
+      const st = statusResult.data?.[sessionId]?.type;
+
+      if (st === 'busy' || st === 'retry') {
+        sawBusy = true;
+        idleCount = 0;
+        if (pollCount % 15 === 0) {
+          console.log(`[chat] Working... ${Math.round(pollCount)}s (${st})`);
         }
-        if (sawBusy && (statusType === 'idle' || !statusType)) {
-          idle = true;
+        continue;
+      }
+
+      if (sawBusy) {
+        idleCount++;
+        if (idleCount >= 2) {
+          console.log(`[chat] Idle confirmed after ${pollCount}s`);
           break;
         }
-      } catch (e) {
-        console.log(`[chat] status poll error: ${e.message}`);
       }
-    }
-    
-    if (!idle) {
-      console.warn('[chat] Timed out waiting for idle, fetching messages anyway...');
     }
 
-    // Step 3: Fetch messages and extract last assistant response
-    let content = '';
-    let allParts = [];
-    
-    let msgsResult = await client.session.messages({
+    // Fetch messages — scan ALL assistant messages for one with text
+    const msgsResult = await client.session.messages({
       path: { id: sessionId },
-      query: { limit: 20 }
+      query: { limit: 30 }
     });
     
-    let msgs = msgsResult.data;
-    console.log(`[chat] messages() returned ${Array.isArray(msgs) ? msgs.length : 'non-array'} items`);
+    const msgs = Array.isArray(msgsResult.data) ? msgsResult.data : [];
+    const assistants = msgs.filter(m => m.info?.role === 'assistant');
     
-    // Retry: if 0 messages, the server may not have been ready. Wait and re-prompt.
-    if (!Array.isArray(msgs) || msgs.length === 0) {
-      console.log('[chat] No messages — retrying after 5s warmup...');
-      await new Promise(r => setTimeout(r, 5000));
+    let content = '';
+    let toolOutputs = [];
+    
+    // Scan from newest to oldest for text content
+    for (let i = assistants.length - 1; i >= 0; i--) {
+      const parts = assistants[i].parts || [];
       
-      const retryAsync = await client.session.promptAsync({
-        path: { id: sessionId },
-        body: { 
-          parts: [{ type: "text", text: message }],
-          model: { providerID: "opencode", modelID: "big-pickle" }
-        }
-      });
-      if (retryAsync.error) {
-        console.error('[chat] Retry promptAsync error:', JSON.stringify(retryAsync.error));
-      } else {
-        console.log('[chat] Retry promptAsync sent, polling...');
-        const retryDeadline = Date.now() + MAX_WAIT_MS;
-        while (Date.now() < retryDeadline) {
-          await new Promise(r => setTimeout(r, STATUS_POLL_MS));
-          try {
-            const st = await client.session.status({});
-            const ss = st.data?.[sessionId];
-            console.log(`[chat] retry status: ${ss?.type}`);
-            if (!ss || ss.type === 'idle') break;
-          } catch {}
-        }
-        
-        msgsResult = await client.session.messages({
-          path: { id: sessionId },
-          query: { limit: 20 }
-        });
-        msgs = msgsResult.data;
-        console.log(`[chat] Retry messages() returned ${Array.isArray(msgs) ? msgs.length : 0} items`);
+      const text = parts.filter(p => p.type === 'text').map(p => p.text).join('\n');
+      if (text && text.trim().length > 0) {
+        content = text;
+        toolOutputs = parts.filter(p => p.type === 'tool').map(tp => ({
+          tool: tp.tool, status: tp.state?.status,
+          output: tp.state?.output || '', input: tp.state?.input || ''
+        }));
+        console.log(`[chat] Found text in msg ${i} (${text.length} chars)`);
+        break;
+      }
+      
+      // If this message has tool parts, collect them as fallback
+      const tools = parts.filter(p => p.type === 'tool').map(tp => ({
+        tool: tp.tool, status: tp.state?.status,
+        output: tp.state?.output || '', input: tp.state?.input || ''
+      }));
+      if (tools.length > 0 && toolOutputs.length === 0) {
+        toolOutputs = tools;
       }
     }
     
-    if (Array.isArray(msgs)) {
-      const lastAssistant = msgs.filter(m => m.info?.role === 'assistant').pop();
-      if (lastAssistant) {
-        console.log(`[chat] Last assistant msg: id=${lastAssistant.info.id}, parts=${lastAssistant.parts?.length || 0}`);
-        allParts = lastAssistant.parts || [];
-        
-        // Log all part types for debugging
-        const typeCounts = {};
-        for (const p of allParts) {
-          typeCounts[p.type] = (typeCounts[p.type] || 0) + 1;
-        }
-        console.log('[chat] Part type breakdown:', JSON.stringify(typeCounts));
-        
-        // Extract text from text parts
-        content = allParts
-          .filter(p => p.type === 'text')
-          .map(p => p.text)
-          .join('\n');
-        
-        // If no text parts, check for tool output
-        if (!content) {
-          const toolParts = allParts.filter(p => p.type === 'tool');
-          console.log(`[chat] No text parts, found ${toolParts.length} tool parts`);
-          for (const tp of toolParts.slice(0, 3)) {
-            console.log(`[chat] Tool: ${tp.tool}, status: ${tp.state?.status}`);
-            if (tp.state?.status === 'completed') {
-              console.log(`[chat] Tool output (first 200): ${tp.state.output?.slice(0, 200)}`);
-            }
-          }
-          // If model ran tools but produced no text, report the tool execution
-          if (toolParts.length > 0) {
-            content = `I ran ${toolParts.length} operation(s). ` + 
-              toolParts.map(tp => {
-                const s = tp.state?.status;
-                return `${tp.tool}: ${s}`;
-              }).join(', ');
-          }
-        }
-      } else {
-        console.log('[chat] No assistant messages found');
+    // Fallback: use tool outputs if no text
+    if (!content && toolOutputs.length > 0) {
+      const completed = toolOutputs.filter(t => t.status === 'completed');
+      if (completed.length > 0) {
+        content = formatToolSummary(completed);
       }
     }
     
-    // Parse action blocks from content
+    if (!content) {
+      content = 'Processing complete. Check the tracker for updates.';
+    }
+    
     const parsed = parseActionBlocks(content);
+    const toolActions = parseToolOutputs(toolOutputs);
+    parsed.actions.push(...toolActions);
     
     res.json({
       ...parsed,
@@ -2917,6 +2869,126 @@ app.post('/chat', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// ── Parse tool outputs into structured action blocks ────────────────
+function parseToolOutputs(toolOutputs) {
+  const actions = [];
+  
+  for (const tool of toolOutputs) {
+    if (tool.status !== 'completed' || !tool.output) continue;
+    
+    const output = tool.output;
+    
+    // Parse scan.mjs JSON output → job_card actions
+    if (tool.tool === 'bash' && (tool.input?.includes('scan.mjs') || tool.input?.includes('scan'))) {
+      try {
+        const scanData = JSON.parse(output);
+        if (scanData.results && Array.isArray(scanData.results)) {
+          for (const job of scanData.results.slice(0, 10)) {
+            actions.push({
+              type: 'job_card',
+              data: {
+                company: job.company || 'Unknown',
+                role: job.role || '',
+                url: job.url || '',
+                location: job.location || '',
+                source: job.source || '',
+                score: ''
+              }
+            });
+          }
+        }
+      } catch {
+        // Not JSON, try to extract job info from text
+        const lines = output.split('\n').filter(l => l.includes('http'));
+        for (const line of lines.slice(0, 5)) {
+          const urlMatch = line.match(/(https?:\/\/[^\s]+)/);
+          if (urlMatch) {
+            actions.push({
+              type: 'job_card',
+              data: {
+                company: line.split(/[|\-]/)[0]?.trim() || 'Unknown',
+                role: line.split(/[|\-]/)[1]?.trim() || '',
+                url: urlMatch[1],
+                location: '',
+                source: '',
+                score: ''
+              }
+            });
+          }
+        }
+      }
+    }
+    
+    // Parse evaluation report output → score action
+    if (tool.tool === 'bash' && (tool.input?.includes('evaluate') || tool.input?.includes('oferta'))) {
+      const scoreMatch = output.match(/Score:\s*(\d+\.?\d*)\s*\/\s*5/i);
+      if (scoreMatch) {
+        actions.push({
+          type: 'evaluation',
+          data: {
+            score: scoreMatch[1],
+            summary: output.slice(0, 500)
+          }
+        });
+      }
+    }
+    
+    // Parse email draft output → email_draft action
+    if (tool.tool === 'bash' && (tool.input?.includes('email') || tool.input?.includes('draft'))) {
+      try {
+        const emailData = JSON.parse(output);
+        if (emailData.to || emailData.subject) {
+          actions.push({
+            type: 'email_draft',
+            data: {
+              to: emailData.to || '',
+              subject: emailData.subject || '',
+              body: emailData.body || '',
+              company: emailData.company || '',
+              role: emailData.role || ''
+            }
+          });
+        }
+      } catch {}
+    }
+  }
+  
+  return actions;
+}
+
+// ── Format tool summary when no text response available ─────────────
+function formatToolSummary(completedTools) {
+  const summaries = [];
+  
+  for (const tool of completedTools) {
+    if (tool.input?.includes('scan.mjs')) {
+      try {
+        const data = JSON.parse(tool.output);
+        const count = data.results?.length || data.total || 0;
+        summaries.push(`Found ${count} job listings`);
+      } catch {
+        const urlCount = (tool.output.match(/https?:\/\//g) || []).length;
+        if (urlCount > 0) {
+          summaries.push(`Found ${urlCount} job listings`);
+        } else {
+          summaries.push('Scan completed');
+        }
+      }
+    } else if (tool.input?.includes('evaluate') || tool.input?.includes('oferta')) {
+      const scoreMatch = tool.output.match(/Score:\s*(\d+\.?\d*)/i);
+      if (scoreMatch) {
+        summaries.push(`Evaluation complete — Score: ${scoreMatch[1]}/5`);
+      } else {
+        summaries.push('Evaluation complete');
+      }
+    } else {
+      summaries.push('Operation completed');
+    }
+  }
+  
+  return summaries.join('\n') || 'Processing complete.';
+}
 
 // ── POST /chat/stream — SSE streaming for chat ──────────────────────
 app.post('/chat/stream', async (req, res) => {

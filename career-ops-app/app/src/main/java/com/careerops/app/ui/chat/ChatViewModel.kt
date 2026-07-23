@@ -11,13 +11,17 @@ import com.careerops.app.data.model.*
 import com.careerops.app.data.remote.CareerOpsApi
 import com.careerops.app.util.UserPrefs
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import okhttp3.ResponseBody
 import javax.inject.Inject
 
 sealed class ChatMessage {
     data class User(val text: String) : ChatMessage()
     data class System(val text: String, val timestamp: String = "") : ChatMessage()
     data class Typing(val label: String = "Thinking...") : ChatMessage()
+    data class ToolStatus(val label: String, val detail: String = "") : ChatMessage()
     data class JobCard(
         val company: String,
         val role: String,
@@ -37,7 +41,22 @@ sealed class ChatMessage {
         val onSend: (() -> Unit)? = null,
         val onEdit: (() -> Unit)? = null
     ) : ChatMessage()
+    data class Evaluation(
+        val company: String = "",
+        val role: String = "",
+        val score: String = "",
+        val summary: String = "",
+        val reportPath: String = ""
+    ) : ChatMessage()
 }
+
+data class ResponseTimeEntry(
+    val timestamp: Long,
+    val messagePreview: String,
+    val responseTimeMs: Long,
+    val actionsCount: Int,
+    val success: Boolean
+)
 
 @HiltViewModel
 class ChatViewModel @Inject constructor(
@@ -57,6 +76,8 @@ class ChatViewModel @Inject constructor(
         private set
 
     val debugLog = mutableStateListOf<DebugEntry>()
+
+    val responseTimes = mutableStateListOf<ResponseTimeEntry>()
 
     private var currentSessionId: String? = null
 
@@ -90,30 +111,69 @@ class ChatViewModel @Inject constructor(
 
         viewModelScope.launch {
             try {
-                debugLog.add(DebugEntry("api", "Calling POST /chat..."))
-                val response = api.chat(ChatRequest(
+                debugLog.add(DebugEntry("api", "Calling POST /chat/stream..."))
+                val response = api.chatStream(ChatRequest(
                     message = text,
                     sessionId = currentSessionId
                 ))
                 
-                val elapsed = System.currentTimeMillis() - startTime
+                if (!response.isSuccessful) {
+                    removeTyping()
+                    val errorMsg = "HTTP ${response.code()}: ${response.errorBody()?.string() ?: "unknown"}"
+                    debugLog.add(DebugEntry("error", errorMsg))
+                    messages.add(ChatMessage.System("Error: $errorMsg"))
+                    isProcessing = false
+                    return@launch
+                }
+
+                val body = response.body()
+                if (body == null) {
+                    removeTyping()
+                    debugLog.add(DebugEntry("error", "Empty response body"))
+                    messages.add(ChatMessage.System("Error: Empty response from server"))
+                    isProcessing = false
+                    return@launch
+                }
+
+                // Parse SSE stream on IO thread
+                val streamResult = withContext(Dispatchers.IO) {
+                    parseSSEStream(body, startTime)
+                }
+
                 removeTyping()
-                currentSessionId = response.sessionId
-                
+                currentSessionId = streamResult.sessionId
+
+                val elapsed = System.currentTimeMillis() - startTime
+
+                // Track response time
+                responseTimes.add(
+                    ResponseTimeEntry(
+                        timestamp = startTime,
+                        messagePreview = text.take(30),
+                        responseTimeMs = elapsed,
+                        actionsCount = streamResult.actions.size,
+                        success = streamResult.error == null
+                    )
+                )
+
                 debugLog.add(DebugEntry("response",
-                    "ok=${response.success}, " +
-                    "session=${response.sessionId}, " +
-                    "content=${response.content.take(80)}, " +
-                    "actions=${response.actions.size}, " +
-                    "error=${response.error}, " +
+                    "session=${streamResult.sessionId}, " +
+                    "tokens=${streamResult.fullText.length}, " +
+                    "actions=${streamResult.actions.size}, " +
+                    "error=${streamResult.error}, " +
                     "time=${elapsed}ms"
                 ))
-                
-                if (response.success && response.content.isNotBlank()) {
-                    messages.add(ChatMessage.System(response.content))
+
+                // Display the accumulated streamed text
+                if (streamResult.fullText.isNotBlank()) {
+                    val cleaned = cleanContent(streamResult.fullText)
+                    if (cleaned.isNotBlank()) {
+                        messages.add(ChatMessage.System(cleaned))
+                    }
                 }
-                
-                for (action in response.actions) {
+
+                // Display action blocks
+                for (action in streamResult.actions) {
                     debugLog.add(DebugEntry("action", "type=${action.type}, data=${action.data}"))
                     when (action.type) {
                         "job_card" -> {
@@ -160,28 +220,167 @@ class ChatViewModel @Inject constructor(
                                 }
                             ))
                         }
+                        "evaluation" -> {
+                            messages.add(ChatMessage.Evaluation(
+                                company = action.data["company"] ?: "",
+                                role = action.data["role"] ?: "",
+                                score = action.data["score"] ?: "",
+                                summary = action.data["summary"] ?: "",
+                                reportPath = action.data["reportPath"] ?: ""
+                            ))
+                        }
                     }
                 }
-                
-                if (response.error != null) {
-                    messages.add(ChatMessage.System("Error: ${response.error}"))
+
+                if (streamResult.error != null) {
+                    messages.add(ChatMessage.System("Error: ${streamResult.error}"))
                 }
-                
-                if (!response.success && response.content.isBlank() && response.error == null) {
-                    debugLog.add(DebugEntry("warn", "Empty response — content blank, no error, no actions"))
-                    messages.add(ChatMessage.System("Empty response from server. Check debug panel for details."))
+
+                if (streamResult.fullText.isBlank() && streamResult.actions.isEmpty() && streamResult.error == null) {
+                    debugLog.add(DebugEntry("warn", "Empty stream — no text, no actions"))
+                    messages.add(ChatMessage.System("Empty response from server."))
                 }
             } catch (e: Exception) {
                 removeTyping()
                 val elapsed = System.currentTimeMillis() - startTime
                 val errorMsg = "${e.javaClass.simpleName}: ${e.message}"
                 debugLog.add(DebugEntry("error", "$errorMsg (${elapsed}ms)"))
-                Log.e(TAG, "Chat error", e)
+                Log.e(TAG, "Chat stream error", e)
                 messages.add(ChatMessage.System("Error: $errorMsg"))
+
+                responseTimes.add(
+                    ResponseTimeEntry(
+                        timestamp = startTime,
+                        messagePreview = text.take(30),
+                        responseTimeMs = elapsed,
+                        actionsCount = 0,
+                        success = false
+                    )
+                )
             } finally {
                 isProcessing = false
             }
         }
+    }
+
+    private data class StreamResult(
+        val fullText: String = "",
+        val sessionId: String? = null,
+        val actions: List<ActionBlock> = emptyList(),
+        val error: String? = null
+    )
+
+    /**
+     * Parse SSE stream from bridge server.
+     * Events: text_delta ({text}), done ({sessionId}), error ({error})
+     */
+    private fun parseSSEStream(body: ResponseBody, startTime: Long): StreamResult {
+        val source = body.source()
+        val textBuilder = StringBuilder()
+        var sessionId: String? = null
+        var error: String? = null
+        val actions = mutableListOf<ActionBlock>()
+        var currentEvent = ""
+        val dataBuffer = StringBuilder()
+
+        try {
+            while (!source.exhausted()) {
+                val line = source.readUtf8Line() ?: break
+
+                when {
+                    line.startsWith("event: ") -> {
+                        currentEvent = line.removePrefix("event: ").trim()
+                    }
+                    line.startsWith("data: ") -> {
+                        dataBuffer.clear()
+                        dataBuffer.append(line.removePrefix("data: "))
+                    }
+                    line.isEmpty() && currentEvent.isNotEmpty() -> {
+                        // End of SSE message — process the event
+                        val dataStr = dataBuffer.toString()
+                        try {
+                            val json = org.json.JSONObject(dataStr)
+                            when (currentEvent) {
+                                "text_delta" -> {
+                                    val delta = json.optString("text", "")
+                                    if (delta.isNotEmpty()) {
+                                        textBuilder.append(delta)
+                                    }
+                                }
+                                "done" -> {
+                                    sessionId = json.optString("sessionId", sessionId)
+                                }
+                                "error" -> {
+                                    error = json.optString("error", "Unknown error")
+                                }
+                            }
+                        } catch (e: Exception) {
+                            // Non-JSON data, skip
+                        }
+                        currentEvent = ""
+                        dataBuffer.clear()
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            if (error == null) {
+                error = "Stream read error: ${e.message}"
+            }
+        }
+
+        // Parse action blocks from accumulated text
+        val parsed = parseActionBlocks(textBuilder.toString())
+        actions.addAll(parsed.actions)
+
+        return StreamResult(
+            fullText = parsed.text,
+            sessionId = sessionId,
+            actions = actions,
+            error = error
+        )
+    }
+
+    /**
+     * Parse [ACTION:type]...[/ACTION] blocks from text.
+     */
+    private fun parseActionBlocks(text: String): ParsedOutput {
+        val actions = mutableListOf<ActionBlock>()
+        val actionRegex = Regex("\\[ACTION:(\\w+)\\]([\\s\\S]*?)\\[/ACTION\\]")
+        
+        val cleanText = actionRegex.replace(text) { match ->
+            val type = match.groupValues[1]
+            val content = match.groupValues[2].trim()
+            val lines = content.split("\n")
+            val data = mutableMapOf<String, String>()
+            
+            for (line in lines) {
+                val colonIndex = line.indexOf(':')
+                if (colonIndex > 0) {
+                    val key = line.substring(0, colonIndex).trim()
+                    val value = line.substring(colonIndex + 1).trim()
+                    data[key] = value
+                }
+            }
+            
+            actions.add(ActionBlock(type = type, data = data))
+            "" // Remove the action block from text
+        }.trim()
+
+        return ParsedOutput(text = cleanText, actions = actions)
+    }
+
+    private data class ParsedOutput(
+        val text: String,
+        val actions: List<ActionBlock>
+    )
+
+    fun getAverageResponseTime(): Long {
+        if (responseTimes.isEmpty()) return 0
+        return responseTimes.map { it.responseTimeMs }.average().toLong()
+    }
+
+    fun getLastResponseTime(): Long {
+        return responseTimes.lastOrNull()?.responseTimeMs ?: 0
     }
 
     private suspend fun draftApplication(company: String, role: String) {
@@ -248,6 +447,7 @@ class ChatViewModel @Inject constructor(
                 api.resetChat()
                 currentSessionId = null
                 messages.clear()
+                responseTimes.clear()
                 messages.add(ChatMessage.System("Session reset. How can I help you?"))
             } catch (e: Exception) {
                 messages.add(ChatMessage.System("Error: ${e.message}"))
@@ -260,6 +460,28 @@ class ChatViewModel @Inject constructor(
         if (typingIndex >= 0) {
             messages.removeAt(typingIndex)
         }
+    }
+
+    private fun cleanContent(raw: String): String {
+        var text = raw
+            .replace(Regex("\\[ACTION:[\\s\\S]*?\\[/ACTION\\]"), "")
+            .replace(Regex("<thinking>[\\s\\S]*?</thinking>"), "")
+            .replace(Regex("```[\\s\\S]*?```"), "")
+            .replace(Regex("`[^`]+`"), "")
+            .trim()
+        
+        val noisePatterns = listOf(
+            Regex("(?i)^(running|executing|tool|bash)[^\\n]*$"),
+            Regex("(?i)^\\[.*?\\]\\s*$"),
+            Regex("(?i)^Step \\d+:"),
+            Regex("(?i)^\\d+\\.\\s+"),
+            Regex("(?i)^>\\s+"),
+        )
+        val lines = text.split("\n").filter { line ->
+            noisePatterns.none { it.matches(line.trim()) }
+        }
+        
+        return lines.joinToString("\n").trim()
     }
 }
 

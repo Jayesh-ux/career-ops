@@ -5,23 +5,23 @@ import com.careerops.app.data.model.ApplicationStatus
 import com.careerops.app.data.model.JobPosting
 import com.careerops.app.data.model.PipelineItem
 import com.careerops.app.data.model.PortalScanResult
-import com.careerops.app.data.remote.AshbyApi
-import com.careerops.app.data.remote.GreenhouseApi
-import com.careerops.app.data.remote.LeverApi
+import com.careerops.app.data.remote.CareerOpsApi
 import com.careerops.app.util.TimestampProvider
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 import java.util.UUID
 import javax.inject.Inject
 import javax.inject.Singleton
 
 @Singleton
 class JobRepository @Inject constructor(
-    private val greenhouseApi: GreenhouseApi,
-    private val ashbyApi: AshbyApi,
-    private val leverApi: LeverApi,
+    private val api: CareerOpsApi,
     private val timestampProvider: TimestampProvider,
 ) {
     private val _applications = MutableStateFlow<List<ApplicationEntry>>(emptyList())
@@ -33,124 +33,120 @@ class JobRepository @Inject constructor(
     private val _scanHistory = MutableStateFlow<List<PortalScanResult>>(emptyList())
     val scanHistory: Flow<List<PortalScanResult>> = _scanHistory.asStateFlow()
 
+    private val _lastSyncTime = MutableStateFlow(0L)
+    val lastSyncTime: Flow<Long> = _lastSyncTime.asStateFlow()
+
+    private val _syncError = MutableStateFlow<String?>(null)
+    val syncError: Flow<String?> = _syncError.asStateFlow()
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    init {
+        // Auto-sync from bridge on creation
+        scope.launch {
+            try {
+                syncFromBridge()
+            } catch (e: Exception) {
+                _syncError.value = e.message
+            }
+        }
+    }
+
+    /**
+     * Sync applications from bridge server's /tracker endpoint.
+     * This replaces the in-memory list with the canonical tracker data.
+     */
+    suspend fun syncFromBridge() {
+        try {
+            val response = api.getTracker()
+            val entries = response.applications.mapNotNull { trackerEntry ->
+                try {
+                    val id = trackerEntry.id.ifEmpty { return@mapNotNull null }
+                    val status = parseStatus(trackerEntry.status)
+                    val score = trackerEntry.score.replace("/5", "").replace("N/A", "").replace("—", "").replace("-", "").trim()
+                        .toFloatOrNull()
+
+                    ApplicationEntry(
+                        id = id,
+                        jobId = null,
+                        company = trackerEntry.company,
+                        role = trackerEntry.role,
+                        status = status,
+                        score = score,
+                        reportPath = null,
+                        notes = trackerEntry.notes,
+                        appliedAt = trackerEntry.date.ifEmpty { null },
+                        updatedAt = trackerEntry.date.ifEmpty { timestampProvider.now() }
+                    )
+                } catch (e: Exception) {
+                    null
+                }
+            }
+            _applications.value = entries
+            _lastSyncTime.value = System.currentTimeMillis()
+            _syncError.value = null
+        } catch (e: Exception) {
+            _syncError.value = e.message
+            throw e
+        }
+    }
+
+    /**
+     * Update application status via bridge server.
+     */
+    suspend fun updateStatusViaBridge(applicationId: String, status: ApplicationStatus) {
+        try {
+            api.updateStatus(applicationId, mapOf("status" to status.name))
+            // Re-sync after update
+            syncFromBridge()
+        } catch (e: Exception) {
+            _syncError.value = e.message
+            throw e
+        }
+    }
+
+    /**
+     * Add a new entry via bridge server.
+     */
+    suspend fun addEntryViaBridge(company: String, role: String, location: String = "", notes: String = "") {
+        try {
+            api.addTrackerEntry(
+                com.careerops.app.data.model.TrackerAddRequest(
+                    company = company,
+                    role = role,
+                    location = location,
+                    notes = notes
+                )
+            )
+            syncFromBridge()
+        } catch (e: Exception) {
+            _syncError.value = e.message
+            throw e
+        }
+    }
+
+    /**
+     * Force refresh from bridge server.
+     */
+    suspend fun refresh() {
+        syncFromBridge()
+    }
+
     fun getApplicationsByStatus(status: ApplicationStatus): Flow<List<ApplicationEntry>> {
         return _applications.map { list -> list.filter { it.status == status } }
     }
 
-    fun addApplication(job: JobPosting, score: Float? = null, notes: String = ""): ApplicationEntry {
-        val entry = ApplicationEntry(
-            id = UUID.randomUUID().toString(),
-            jobId = job.id,
-            company = job.company,
-            role = job.title,
-            status = ApplicationStatus.EVALUATED,
-            score = score,
-            notes = notes,
-            updatedAt = timestampProvider.now(),
-        )
-        _applications.value = _applications.value + entry
-        return entry
-    }
-
-    fun updateStatus(applicationId: String, status: ApplicationStatus, notes: String? = null) {
-        _applications.value = _applications.value.map {
-            if (it.id == applicationId) {
-                it.copy(
-                    status = status,
-                    notes = notes ?: it.notes,
-                    updatedAt = timestampProvider.now(),
-                )
-            } else it
+    private fun parseStatus(statusStr: String): ApplicationStatus {
+        return when (statusStr.trim().lowercase()) {
+            "evaluated" -> ApplicationStatus.EVALUATED
+            "applied" -> ApplicationStatus.APPLIED
+            "responded" -> ApplicationStatus.RESPONDED
+            "interview" -> ApplicationStatus.INTERVIEW
+            "offer" -> ApplicationStatus.OFFER
+            "rejected" -> ApplicationStatus.REJECTED
+            "discarded" -> ApplicationStatus.DISCARDED
+            "skip" -> ApplicationStatus.SKIP
+            else -> ApplicationStatus.EVALUATED
         }
-    }
-
-    fun addToPipeline(url: String, source: String = "") {
-        val item = PipelineItem(
-            url = url,
-            source = source,
-            addedAt = timestampProvider.now(),
-        )
-        _pipeline.value = _pipeline.value + item
-    }
-
-    fun removeFromPipeline(url: String) {
-        _pipeline.value = _pipeline.value.filter { it.url != url }
-    }
-
-    suspend fun scanGreenhouse(boardToken: String): PortalScanResult {
-        val response = greenhouseApi.getJobs(boardToken)
-        val postings = response.jobs.map { job ->
-            JobPosting(
-                id = "gh-${boardToken}-${job.id}",
-                company = boardToken.replace("-", " ").replaceFirstChar { it.uppercase() },
-                title = job.title,
-                description = job.description ?: "",
-                url = job.absolute_url,
-                location = job.location?.name ?: "",
-                portal = "greenhouse",
-                postedAt = job.updated_at,
-                createdAt = timestampProvider.now(),
-            )
-        }
-        val result = PortalScanResult(
-            portal = "greenhouse",
-            totalFound = postings.size,
-            newPostings = postings.size,
-            postings = postings,
-            scannedAt = timestampProvider.now(),
-        )
-        _scanHistory.value = _scanHistory.value + result
-        return result
-    }
-
-    suspend fun scanAshby(): PortalScanResult {
-        val response = ashbyApi.getJobs()
-        val postings = response.jobs.map { job ->
-            JobPosting(
-                id = "ashby-${job.id}",
-                company = "Ashby",
-                title = job.title,
-                description = job.descriptionHtml ?: "",
-                url = job.url,
-                location = job.locationName ?: "",
-                portal = "ashby",
-                postedAt = job.updatedAt,
-                createdAt = timestampProvider.now(),
-            )
-        }
-        val result = PortalScanResult(
-            portal = "ashby",
-            totalFound = postings.size,
-            newPostings = postings.size,
-            postings = postings,
-            scannedAt = timestampProvider.now(),
-        )
-        _scanHistory.value = _scanHistory.value + result
-        return result
-    }
-
-    suspend fun scanLever(): PortalScanResult {
-        val postings = leverApi.getPostings()
-        val mapped = postings.map { posting ->
-            JobPosting(
-                id = "lever-${posting.id}",
-                company = posting.categories?.team ?: "Unknown",
-                title = posting.text,
-                description = posting.descriptionPlain ?: "",
-                url = posting.hostedUrl,
-                location = posting.categories?.location ?: "",
-                portal = "lever",
-                createdAt = timestampProvider.now(),
-            )
-        }
-        val result = PortalScanResult(
-            portal = "lever",
-            totalFound = mapped.size,
-            newPostings = mapped.size,
-            postings = mapped,
-            scannedAt = timestampProvider.now(),
-        )
-        _scanHistory.value = _scanHistory.value + result
-        return result
     }
 }
