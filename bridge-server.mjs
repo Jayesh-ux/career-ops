@@ -2608,6 +2608,22 @@ if (!existsSync(PORTALS_YAML) && existsSync(PORTALS_EXAMPLE)) {
   }
 }
 
+// ── GET /download/apk — serve latest APK for install ────────────────
+app.get('/download/apk', (req, res) => {
+  const candidates = [
+    join(__dirname, 'career-ops-app', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk'),
+    join(__dirname, 'career-ops.apk'),
+    '/sdcard/Download/career-ops.apk',
+  ];
+  const apkPath = candidates.find(p => existsSync(p));
+  if (!apkPath) {
+    return res.status(404).json({ error: 'APK not found', searched: candidates });
+  }
+  res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+  res.setHeader('Content-Disposition', 'attachment; filename="career-ops.apk"');
+  res.sendFile(apkPath);
+});
+
 // ── crash protection ───────────────────────────────────────────────
 process.on('uncaughtException', (err) => {
   console.error('[FATAL] uncaughtException:', err.message);
@@ -2997,65 +3013,196 @@ app.post('/chat/stream', async (req, res) => {
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
   });
-  
+
   const send = (event, data) => {
-    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    if (!res.destroyed) {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    }
   };
-  
+
+  let heartbeat = null;
+  let pollTimer = null;
+  let settled = false;
+
+  function cleanup() {
+    if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
+    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  }
+
+  function finish() {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    try { res.end(); } catch {}
+  }
+
+  res.on('close', () => { cleanup(); settled = true; });
+
   try {
     const userId = req.userCtx?.userId;
     const userDir = req.userCtx?.userDir;
     const { message } = req.body;
-    
-    if (!message) { send('error', { error: 'message required' }); return res.end(); }
-    
-    // Auto-detect guard
+
+    if (!message) { send('error', { error: 'message required' }); return finish(); }
+
     const trackerPath = join(userDir, 'data', 'applications.md');
     if (!existsSync(trackerPath)) {
       await doctorCheck(userDir);
     }
-    
+
     const { client, sessionId } = await initOpencode(userId, userDir);
-    
-    // Subscribe to events BEFORE sending prompt
-    const eventResult = await client.event.subscribe();
-    const events = eventResult.stream;
-    
+
+    // Immediate connected event so client knows the SSE pipe is alive
+    send('connected', { sessionId });
+    console.log(`[chat/stream] Session ${sessionId}, sending: "${message.slice(0, 80)}..."`);
+
+    // Heartbeat every 15s to keep connection alive
+    heartbeat = setInterval(() => {
+      if (!res.destroyed) res.write(':keepalive\n\n');
+    }, 15000);
+
     // Fire promptAsync (non-blocking)
     const asyncResult = await client.session.promptAsync({
       path: { id: sessionId },
-      body: { 
+      body: {
         parts: [{ type: "text", text: message }],
         model: { providerID: "opencode", modelID: "big-pickle" }
       }
     });
     if (asyncResult.error) {
       send('error', { error: asyncResult.error });
-      return res.end();
+      return finish();
     }
-    
-    // Stream events until session idle
-    for await (const event of events) {
-      if (event.type === 'message.part.delta') {
-        const delta = event.properties?.delta;
-        if (delta) {
-          send('text_delta', { text: delta });
+
+    // Try event stream with a 15s grace period — if no events arrive, fall back to polling
+    let gotAnyEvent = false;
+    let eventError = null;
+
+    const STREAM_TIMEOUT_MS = 240000; // 4 min hard cap
+    const EVENT_GRACE_MS = 15000;     // fall back to polling after 15s of no events
+
+    try {
+      const eventResult = await client.event.subscribe();
+      const events = eventResult.stream;
+
+      const eventLoop = (async () => {
+        for await (const event of events) {
+          gotAnyEvent = true;
+          if (event.type === 'message.part.delta') {
+            const delta = event.properties?.delta;
+            if (delta) send('text_delta', { text: delta });
+          } else if (event.type === 'session.status') {
+            if (event.properties?.status?.type === 'idle') {
+              send('done', { sessionId });
+              finish();
+              return;
+            }
+          } else if (event.type === 'session.error') {
+            send('error', { error: event.properties?.error });
+            finish();
+            return;
+          }
         }
-      } else if (event.type === 'session.status') {
-        if (event.properties?.status?.type === 'idle') {
-          send('done', { sessionId });
+      })();
+
+      const eventRace = Promise.race([
+        eventLoop.then(() => 'ended'),
+        new Promise(r => setTimeout(() => r('timeout'), EVENT_GRACE_MS))
+      ]);
+
+      const eventOutcome = await eventRace;
+
+      if (eventOutcome === 'timeout' && !gotAnyEvent) {
+        console.log(`[chat/stream] No events in ${EVENT_GRACE_MS}ms — switching to polling fallback`);
+        throw new Error('EVENT_STREAM_EMPTY');
+      }
+    } catch (e) {
+      eventError = e;
+    }
+
+    // FALLBACK: poll session.status + messages (same logic as /chat endpoint)
+    if (!settled) {
+      console.log(`[chat/stream] Using polling fallback`);
+      const POLL_MS = 1000;
+      const deadline = Date.now() + STREAM_TIMEOUT_MS;
+      let pollCount = 0;
+      let sawBusy = false;
+      let idleCount = 0;
+
+      while (Date.now() < deadline && !settled) {
+        await new Promise(r => setTimeout(r, POLL_MS));
+        pollCount++;
+
+        const statusResult = await client.session.status({}).catch(() => ({ data: {} }));
+        const st = statusResult.data?.[sessionId]?.type;
+
+        if (st === 'busy' || st === 'retry') {
+          sawBusy = true;
+          idleCount = 0;
+          if (pollCount % 15 === 0) {
+            console.log(`[chat/stream] Polling... ${pollCount}s (${st})`);
+            send('text_delta', { text: `\n\n_...still working (${pollCount}s)...\n` });
+          }
+          continue;
+        }
+
+        if (sawBusy) {
+          idleCount++;
+          if (idleCount >= 2) {
+            console.log(`[chat/stream] Idle after ${pollCount}s`);
+            break;
+          }
+        }
+      }
+
+      // Fetch messages — scan ALL assistant messages for text content
+      const msgsResult = await client.session.messages({
+        path: { id: sessionId },
+        query: { limit: 30 }
+      });
+      const msgs = Array.isArray(msgsResult.data) ? msgsResult.data : [];
+      const assistants = msgs.filter(m => m.info?.role === 'assistant');
+
+      let content = '';
+      let toolOutputs = [];
+
+      for (let i = assistants.length - 1; i >= 0; i--) {
+        const parts = assistants[i].parts || [];
+        const text = parts.filter(p => p.type === 'text').map(p => p.text).join('\n');
+        if (text && text.trim().length > 0) {
+          content = text;
+          toolOutputs = parts.filter(p => p.type === 'tool').map(tp => ({
+            tool: tp.tool, status: tp.state?.status,
+            output: tp.state?.output || '', input: tp.state?.input || ''
+          }));
           break;
         }
-      } else if (event.type === 'session.error') {
-        send('error', { error: event.properties?.error });
-        break;
+        const tools = parts.filter(p => p.type === 'tool').map(tp => ({
+          tool: tp.tool, status: tp.state?.status,
+          output: tp.state?.output || '', input: tp.state?.input || ''
+        }));
+        if (tools.length > 0 && toolOutputs.length === 0) toolOutputs = tools;
       }
+
+      if (!content && toolOutputs.length > 0) {
+        const completed = toolOutputs.filter(t => t.status === 'completed');
+        if (completed.length > 0) content = formatToolSummary(completed);
+      }
+      if (!content) content = 'Processing complete. Check the tracker for updates.';
+
+      const parsed = parseActionBlocks(content);
+      const toolActions = parseToolOutputs(toolOutputs);
+      parsed.actions.push(...toolActions);
+
+      // Send full accumulated text as a single delta
+      if (parsed.text) send('text_delta', { text: parsed.text });
+      if (parsed.actions.length > 0) send('text_delta', { text: '\n\n' + JSON.stringify(parsed.actions) });
+      send('done', { sessionId });
+      finish();
     }
-    
-    res.end();
   } catch (e) {
     send('error', { error: e.message });
-    res.end();
+    finish();
   }
 });
 
