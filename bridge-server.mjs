@@ -3122,18 +3122,61 @@ app.post('/chat/stream', async (req, res) => {
     const msgs = Array.isArray(msgsResult.data) ? msgsResult.data : [];
     const assistants = msgs.filter(m => m.info?.role === 'assistant');
 
-    let content = '';
-
-    for (let i = assistants.length - 1; i >= 0; i--) {
-      const parts = assistants[i].parts || [];
-      const text = parts.filter(p => p.type === 'text').map(p => p.text).join('\n');
-      if (text && text.trim().length > 0) {
-        content = text;
-        break;
-      }
+    // Debug: log raw message structure so we can fix parsing
+    for (const m of assistants) {
+      console.log(`[chat/stream] assistant msg parts:`, JSON.stringify((m.parts || []).map(p => ({
+        type: p.type,
+        textLen: (p.text || '').length,
+        toolName: p.tool,
+        toolStatus: p.state?.status,
+        outputLen: (p.state?.output || '').length,
+        keys: Object.keys(p)
+      }))));
     }
 
-    if (!content) content = 'Done. Check tracker for updates.';
+    let content = '';
+
+    // Try multiple extraction strategies
+    for (let i = assistants.length - 1; i >= 0; i--) {
+      const parts = assistants[i].parts || [];
+      
+      // Strategy 1: text parts
+      const textParts = parts.filter(p => p.type === 'text');
+      const text = textParts.map(p => p.text || p.content || '').join('\n');
+      if (text && text.trim().length > 0) {
+        content = text.trim();
+        break;
+      }
+      
+      // Strategy 2: tool outputs (scan results, evaluations, etc.)
+      const toolParts = parts.filter(p => p.type === 'tool' && p.state?.status === 'completed' && p.state?.output);
+      if (toolParts.length > 0) {
+        content = toolParts.map(p => p.state.output).join('\n\n');
+        break;
+      }
+      
+      // Strategy 3: any part with text-like content
+      for (const p of parts) {
+        const t = p.text || p.content || p.state?.output || '';
+        if (t && t.trim().length > 0) {
+          content = t.trim();
+          break;
+        }
+      }
+      if (content) break;
+    }
+
+    // Final fallback: dump all messages as text
+    if (!content) {
+      content = msgs.map(m => {
+        const role = m.info?.role || '?';
+        const parts = m.parts || [];
+        return parts.map(p => `[${role}] ${p.type}: ${(p.text || p.content || p.state?.output || '').slice(0, 500)}`).join('\n');
+      }).join('\n\n');
+    }
+    if (!content) content = 'No response from opencode.';
+
+    console.log(`[chat/stream] Response (${content.length} chars): ${content.slice(0, 200)}`);
 
     // Send the response as a single text_delta
     send('text_delta', { text: content });
