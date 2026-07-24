@@ -31,9 +31,8 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         // Ensure bridge token is set on every launch (not just during sign-in)
-        if (userPrefs.bridgeToken.isEmpty()) {
-            userPrefs.bridgeToken = BuildConfig.BRIDGE_TOKEN
-        }
+        // Always force-set from BuildConfig to avoid stale/empty tokens
+        userPrefs.bridgeToken = BuildConfig.BRIDGE_TOKEN
 
         scheduleDailyAutomation()
         scheduleNotificationWorker()

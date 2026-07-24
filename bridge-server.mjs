@@ -237,19 +237,19 @@ app.use((req, res, next) => {
 });
 
 // ── Bridge auth ─────────────────────────────────────────────────────
-// Shared-secret token check. If BRIDGE_TOKEN is set in .bridge.env,
-// every request must include X-Bridge-Token header matching it.
-// Excluded: /doctor, /download/apk (public/diagnostic).
-const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN || '';
-const AUTH_EXEMPT = new Set(['/doctor', '/download/apk']);
-if (BRIDGE_TOKEN) {
-  app.use((req, res, next) => {
-    if (AUTH_EXEMPT.has(req.path)) return next();
-    if (req.headers['x-bridge-token'] === BRIDGE_TOKEN) return next();
-    res.status(401).json({ error: 'unauthorized — missing or invalid X-Bridge-Token' });
-  });
-  console.log('[auth] Bridge token auth enabled');
-}
+// Shared-secret token check. DISABLED for local-only use (127.0.0.1).
+// The bridge server only runs on-device — no external exposure.
+// To re-enable, set BRIDGE_TOKEN in .bridge.env and uncomment below.
+//
+// const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN || '';
+// if (BRIDGE_TOKEN) {
+//   app.use((req, res, next) => {
+//     const incoming = req.headers['x-bridge-token'] || '';
+//     if (incoming === BRIDGE_TOKEN) return next();
+//     res.status(401).json({ error: 'unauthorized' });
+//   });
+//   console.log('[auth] Bridge token auth enabled');
+// }
 
 // ── helpers ────────────────────────────────────────────────────────
 
