@@ -135,73 +135,17 @@ fun ChatScreen(
             }
         }
     ) { paddingValues ->
-            Column(
+            Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(paddingValues)
             ) {
-                // Debug panel (toggle-able)
-                AnimatedVisibility(visible = showDebug) {
-                    Surface(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 100.dp, max = 250.dp),
-                        color = Color(0xFF1A1A2E),
-                        shadowElevation = 4.dp
-                    ) {
-                        Column(modifier = Modifier.padding(8.dp)) {
-                            Text(
-                                "DEBUG PANEL",
-                                color = Color(0xFF00FF41),
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                fontFamily = FontFamily.Monospace
-                            )
-                            if (responseTimes.isNotEmpty()) {
-                                Spacer(modifier = Modifier.height(4.dp))
-                                val avgTime = viewModel.getAverageResponseTime()
-                                val lastTime = viewModel.getLastResponseTime()
-                                val successCount = responseTimes.count { it.success }
-                                val failCount = responseTimes.count { !it.success }
-                                Text(
-                                    text = "Avg: ${avgTime}ms | Last: ${lastTime}ms | Success: $successCount | Failed: $failCount",
-                                    color = Color(0xFF44AAFF),
-                                    fontSize = 10.sp,
-                                    fontFamily = FontFamily.Monospace
-                                )
-                            }
-                            Spacer(modifier = Modifier.height(4.dp))
-                            LazyColumn(
-                                state = debugListState,
-                                modifier = Modifier.fillMaxWidth().wrapContentHeight()
-                            ) {
-                                items(debugLog, key = { "${it.timestamp}-${it.tag}" }) { entry ->
-                                    Text(
-                                        text = entry.formatted(),
-                                        color = when (entry.tag) {
-                                            "error" -> Color(0xFFFF4444)
-                                            "warn" -> Color(0xFFFFAA00)
-                                            "response" -> Color(0xFF44AAFF)
-                                            "action" -> Color(0xFFAA44FF)
-                                            else -> Color(0xFF00FF41)
-                                        },
-                                        fontSize = 10.sp,
-                                        fontFamily = FontFamily.Monospace,
-                                        lineHeight = 14.sp
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Chat messages — SelectionContainer wraps only the chat area
+                // Chat messages (always fills full area)
                 SelectionContainer {
                 LazyColumn(
                     state = listState,
                     modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth()
+                        .fillMaxSize()
                         .padding(horizontal = 12.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                     contentPadding = PaddingValues(vertical = 12.dp)
@@ -230,6 +174,65 @@ fun ChatScreen(
                         }
                     }
                 }
+                }
+
+                // Debug panel (overlays on top of chat)
+                AnimatedVisibility(
+                    visible = showDebug,
+                    modifier = Modifier.align(Alignment.TopCenter)
+                ) {
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                            .heightIn(min = 100.dp, max = 220.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        color = Color(0xFF1A1A2E),
+                        shadowElevation = 8.dp
+                    ) {
+                        Column(modifier = Modifier.padding(8.dp)) {
+                            Text(
+                                "DEBUG",
+                                color = Color(0xFF00FF41),
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                fontFamily = FontFamily.Monospace
+                            )
+                            if (responseTimes.isNotEmpty()) {
+                                val avgTime = viewModel.getAverageResponseTime()
+                                val lastTime = viewModel.getLastResponseTime()
+                                val successCount = responseTimes.count { it.success }
+                                val failCount = responseTimes.count { !it.success }
+                                Text(
+                                    text = "Avg: ${avgTime}ms | Last: ${lastTime}ms | OK: $successCount | Fail: $failCount",
+                                    color = Color(0xFF44AAFF),
+                                    fontSize = 9.sp,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(2.dp))
+                            LazyColumn(
+                                state = debugListState,
+                                modifier = Modifier.fillMaxSize()
+                            ) {
+                                items(debugLog, key = { "${it.timestamp}-${it.tag}" }) { entry ->
+                                    Text(
+                                        text = entry.formatted(),
+                                        color = when (entry.tag) {
+                                            "error" -> Color(0xFFFF4444)
+                                            "warn" -> Color(0xFFFFAA00)
+                                            "response" -> Color(0xFF44AAFF)
+                                            "action" -> Color(0xFFAA44FF)
+                                            else -> Color(0xFF00FF41)
+                                        },
+                                        fontSize = 9.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        lineHeight = 12.sp
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             }
     }

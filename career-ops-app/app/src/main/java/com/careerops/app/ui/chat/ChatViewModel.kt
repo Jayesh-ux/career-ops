@@ -113,14 +113,15 @@ class ChatViewModel @Inject constructor(
 
     init {
         messages.add(ChatMessage.System(
-            "Welcome to career-ops! I'm your AI job search assistant.\n\n" +
-            "Try:\n" +
-            "• \"Find remote frontend jobs\"\n" +
-            "• \"Evaluate https://company.com/jobs/123\"\n" +
-            "• \"Draft application for Adobe\"\n" +
-            "• \"Check my inbox\"\n" +
-            "• \"Show my applications\"\n\n" +
-            "Toggle debug (top-right bug icon) to see connection details."
+            "Hey! I can help you with your job search.\n\n" +
+            "• Paste a job URL to evaluate it\n" +
+            "• \"Scan\" or \"find jobs\" to search 57+ portals\n" +
+            "• \"Check inbox\" to see recruiter replies\n" +
+            "• \"Draft reply\" to respond to emails\n" +
+            "• \"Show applications\" to see your tracker\n" +
+            "• \"Follow up\" for pending applications\n" +
+            "• \"Generate CV\" to create a PDF\n\n" +
+            "What would you like to do?"
         ))
         debugLog.add(DebugEntry("init", "ViewModel created, session: none"))
     }
@@ -303,6 +304,7 @@ class ChatViewModel @Inject constructor(
                     )
                 )
             } finally {
+                removeTyping()
                 isProcessing = false
                 _streamingText.value = ""
                 _progressText.value = ""
