@@ -22,6 +22,7 @@ fun SettingsScreen(
     userPrefs: UserPrefs
 ) {
     var bridgeUrl by remember { mutableStateOf(userPrefs.bridgeServerUrl) }
+    var bridgeToken by remember { mutableStateOf(userPrefs.bridgeToken) }
     var showResetDialog by remember { mutableStateOf(false) }
 
     Scaffold(
@@ -70,7 +71,7 @@ fun SettingsScreen(
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.Link, null, tint = MaterialTheme.colorScheme.primary)
+                        Icon(Icons.Default.Email, null, tint = MaterialTheme.colorScheme.primary)
                         Spacer(modifier = Modifier.width(12.dp))
                         Text("Bridge Server", fontWeight = FontWeight.Bold, fontSize = 16.sp)
                     }
@@ -83,7 +84,18 @@ fun SettingsScreen(
                         singleLine = true
                     )
                     Spacer(modifier = Modifier.height(8.dp))
-                    Button(onClick = { userPrefs.bridgeServerUrl = bridgeUrl }) {
+                    OutlinedTextField(
+                        value = bridgeToken,
+                        onValueChange = { bridgeToken = it },
+                        label = { Text("Bridge Token") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Button(onClick = {
+                        userPrefs.bridgeServerUrl = bridgeUrl
+                        userPrefs.bridgeToken = bridgeToken
+                    }) {
                         Text("Save")
                     }
                 }
@@ -129,7 +141,7 @@ fun SettingsScreen(
                         onClick = { showResetDialog = true },
                         colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
                     ) {
-                        Icon(Icons.Default.DeleteForever, null, modifier = Modifier.size(16.dp))
+                        Icon(Icons.Default.Delete, null, modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(8.dp))
                         Text("Sign Out & Reset")
                     }

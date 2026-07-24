@@ -74,10 +74,16 @@ const PORT = parseInt(process.env.PORT || '8787', 10);
 // /data/users/{userId}/ instead of the project root.
 const USERS_ROOT = join(__dirname, 'data', 'users');
 
+// Per-user directory cache — after first successful resolution, skip 8+ existsSync calls
+const _userDirCache = new Map();
+
 function resolveUserDataDir(userId) {
-  // userId is the user's email (URL-encoded as path segment)
   const safeId = String(userId || '').toLowerCase().replace(/[^a-z0-9@.+-]/g, '_');
   if (!safeId) return null;
+
+  const cached = _userDirCache.get(safeId);
+  if (cached) return cached;
+
   const dir = join(USERS_ROOT, safeId);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
@@ -88,24 +94,20 @@ function resolveUserDataDir(userId) {
     mkdirSync(join(dir, 'batch'), { recursive: true });
     mkdirSync(join(dir, 'batch/tracker-additions'), { recursive: true });
 
-    // Symlink .opencode/ so opencode CLI finds SKILL.md when cwd = userDir
     const opencodeLink = join(dir, '.opencode');
     if (!existsSync(opencodeLink)) {
       try { symlinkSync(join(__dirname, '.opencode'), opencodeLink); } catch { /* non-fatal */ }
     }
 
-    // Symlink cv.md and config/ so opencode reads user's data from cwd root
     const cvLink = join(dir, 'cv.md');
     const userCv = join(dir, 'data', 'cv.md');
     if (!existsSync(cvLink) && existsSync(userCv)) {
       try { symlinkSync(userCv, cvLink); } catch { /* non-fatal */ }
     }
-    const configLink = join(dir, 'config');
     if (!existsSync(join(dir, 'config', 'profile.yml')) && existsSync(join(__dirname, 'config', 'profile.yml'))) {
       try { copyFileSync(join(__dirname, 'config', 'profile.yml'), join(dir, 'config', 'profile.yml')); } catch { /* non-fatal */ }
     }
 
-    // Symlink modes/ so _profile.md and _shared.md are available
     const modesLink = join(dir, 'modes');
     if (!existsSync(modesLink)) {
       try { symlinkSync(join(__dirname, 'modes'), modesLink); } catch { /* non-fatal */ }
@@ -113,6 +115,8 @@ function resolveUserDataDir(userId) {
 
     console.log(`[multi-user] Created user directory: ${dir}`);
   }
+
+  _userDirCache.set(safeId, dir);
   return dir;
 }
 
@@ -120,6 +124,26 @@ function resolvePerUserPath(userId, relativePath) {
   const userDir = resolveUserDataDir(userId);
   if (!userDir) return join(__dirname, relativePath);
   return join(userDir, relativePath);
+}
+
+// Read spend_tier from user's config/profile.yml and map to opencode model
+// Tiers: economy (cheapest), standard (balanced, default), premium (most capable)
+function resolveModelForUser(userId) {
+  const defaultModel = { providerID: 'opencode', modelID: 'big-pickle' };
+  try {
+    const profilePath = join(resolveUserDataDir(userId) || __dirname, 'config', 'profile.yml');
+    if (!existsSync(profilePath)) return defaultModel;
+    const raw = readFileSync(profilePath, 'utf-8');
+    const cfg = yaml.load(raw);
+    const tier = cfg?.spend_tier || 'standard';
+    // For opencode, all tiers currently map to big-pickle (free tier only).
+    // When paid models become available, map: economy → cheapest, standard → balanced, premium → best.
+    if (tier === 'economy') return { providerID: 'opencode', modelID: 'big-pickle' };
+    if (tier === 'premium') return { providerID: 'opencode', modelID: 'big-pickle' };
+    return defaultModel; // standard or unknown
+  } catch {
+    return defaultModel;
+  }
 }
 
 // Per-user OAuth2 credential store
@@ -211,6 +235,21 @@ app.use((req, res, next) => {
   }
   next();
 });
+
+// ── Bridge auth ─────────────────────────────────────────────────────
+// Shared-secret token check. If BRIDGE_TOKEN is set in .bridge.env,
+// every request must include X-Bridge-Token header matching it.
+// Excluded: /doctor, /download/apk (public/diagnostic).
+const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN || '';
+const AUTH_EXEMPT = new Set(['/doctor', '/download/apk']);
+if (BRIDGE_TOKEN) {
+  app.use((req, res, next) => {
+    if (AUTH_EXEMPT.has(req.path)) return next();
+    if (req.headers['x-bridge-token'] === BRIDGE_TOKEN) return next();
+    res.status(401).json({ error: 'unauthorized — missing or invalid X-Bridge-Token' });
+  });
+  console.log('[auth] Bridge token auth enabled');
+}
 
 // ── helpers ────────────────────────────────────────────────────────
 
@@ -464,29 +503,34 @@ app.get('/doctor', (req, res) => {
 // Exchange authorization code for OAuth2 tokens and store per-user.
 // Body: { code, clientId, clientSecret, redirectUri? }
 app.post('/users/:email/oauth/exchange', async (req, res) => {
+  console.log(`[OAuth] Exchange request received for email=${req.params.email}`);
   try {
     const email = decodeURIComponent(req.params.email);
-    const { code, clientId, clientSecret, redirectUri } = req.body;
+    const { code, clientId: clientIdBody, clientSecret: clientSecretBody, redirectUri } = req.body;
+    const clientId = clientIdBody || process.env.GMAIL_CLIENT_ID;
+    const clientSecret = clientSecretBody || process.env.GMAIL_CLIENT_SECRET;
     if (!code || !clientId || !clientSecret) {
-      return res.status(400).json({ error: 'code, clientId, and clientSecret are required' });
+      return res.status(400).json({ error: 'code required; clientId/clientSecret from body or .bridge.env' });
     }
 
     const tokenUrl = 'https://oauth2.googleapis.com/token';
-    const resp = await fetch(tokenUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
+    const params = new URLSearchParams({
         code,
         client_id: clientId,
         client_secret: clientSecret,
-        redirect_uri: redirectUri || 'http://localhost:8787/users/oauth/callback',
         grant_type: 'authorization_code',
-      }),
+    });
+
+    const resp = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params,
     });
 
     if (!resp.ok) {
       const err = await resp.text();
-      return res.status(400).json({ error: `Token exchange failed: ${resp.status} ${err.slice(0, 300)}` });
+      console.error(`[OAuth] Token exchange failed: ${resp.status}`, err.slice(0, 500));
+      return res.status(400).json({ error: `Token exchange failed: ${resp.status}`, details: err.slice(0, 300) });
     }
 
     const data = await resp.json();
@@ -2485,12 +2529,18 @@ app.get('/reports', (req, res) => {
     if (!existsSync(reportsDir)) return res.json({ reports: [] });
     const files = readdirSync(reportsDir).filter(f => f.endsWith('.md')).sort().reverse();
     const reports = files.map(f => {
-      const content = readFileSync(join(reportsDir, f), 'utf-8');
       const num = f.split('-')[0];
       const company = f.split('-').slice(1, -2).join('-').replace(/-/g, ' ');
       const date = f.match(/\d{4}-\d{2}-\d{2}/)?.[0] || '';
-      const score = content.match(/\*\*Score:\*\*\s*(\S+)/)?.[1] || 'N/A';
-      return { id: num, filename: f, company, date, score, preview: content.slice(0, 200) };
+      // Extract score from first 500 chars only (not full file)
+      let score = 'N/A';
+      let preview = '';
+      try {
+        const head = readFileSync(join(reportsDir, f), 'utf-8').slice(0, 500);
+        score = head.match(/\*\*Score:\*\*\s*(\S+)/)?.[1] || 'N/A';
+        preview = head.slice(0, 200);
+      } catch { /* file read failed — use defaults */ }
+      return { id: num, filename: f, company, date, score, preview };
     });
     res.json({ reports });
   } catch (e) {
@@ -2506,6 +2556,8 @@ app.get('/pipeline', (req, res) => {
     const text = readFileSync(pipelinePath, 'utf-8');
     const lines = text.split('\n');
     const entries = [];
+    // Read tracker ONCE before the loop (was O(n) reads per URL)
+    const trackerText = existsSync(TRACKER_PATH) ? readFileSync(TRACKER_PATH, 'utf-8') : '';
     for (const line of lines) {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith('#')) continue;
@@ -2514,8 +2566,6 @@ app.get('/pipeline', (req, res) => {
       if (urlMatch) {
         const url = urlMatch[0].replace(/[)\]]$/, '');
         const label = trimmed.replace(/^[-*]\s*/, '').replace(url, '').trim();
-        // Check if this URL already has a tracker entry (already evaluated)
-        const trackerText = existsSync(TRACKER_PATH) ? readFileSync(TRACKER_PATH, 'utf-8') : '';
         const alreadyEvaluated = trackerText.includes(url);
         entries.push({ url, label, evaluated: alreadyEvaluated });
       }
@@ -2637,12 +2687,27 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`career-ops bridge server v2 running on http://0.0.0.0:${PORT}`);
   console.log(`Tracker: ${TRACKER_PATH}`);
   console.log(`Profile: ${PROFILE_PATH}`);
+  // Start opencode at boot so first chat connects instantly (no 30s cold start)
+  bootOpencode().catch(e => console.error('[boot] opencode startup failed:', e.message));
+
+  // Evict stale opencode sessions every 30 minutes (30min TTL)
+  setInterval(() => {
+    const now = Date.now();
+    const TTL_MS = 30 * 60 * 1000;
+    for (const [key, sess] of opencodeSessions) {
+      if (now - sess.lastAccess > TTL_MS) {
+        opencodeSessions.delete(key);
+        console.log(`[session] Evicted stale session: ${key}`);
+      }
+    }
+  }, 30 * 60 * 1000).unref();
 });
 
 // ── OpenCode SDK integration ───────────────────────────────────────
 const opencodeSessions = new Map();
 const OPENCODE_URL = process.env.OPENCODE_URL || 'http://127.0.0.1:4096';
 const OPENCODE_PORT = 4096;
+let _opencodeReady = false; // true once bootOpencode() completes
 
 function isTermux() {
   return existsSync('/data/data/com.termux') || !!process.env.TERMUX_VERSION;
@@ -2660,17 +2725,92 @@ async function waitForOpencodeServer(url, timeoutMs = 30000) {
   return false;
 }
 
+// Called once at server boot — swaps AGENTS.md, kills stale opencode, spawns fresh proot
+async function bootOpencode() {
+  if (isTermux()) {
+    const prootRootfs = '/data/data/com.termux/files/usr/var/lib/proot-distro/containers/debian/rootfs';
+    const androidAgentsSrc = join(__dirname, 'AGENTS_ANDROID.md');
+    const prootAgentsFull = join(prootRootfs, 'root/career-ops/AGENTS.md');
+    const prootAgentsBackup = join(prootRootfs, 'root/career-ops/AGENTS.md.full');
+
+    // 1) Swap AGENTS.md → lightweight version (backup full once)
+    try {
+      if (existsSync(androidAgentsSrc)) {
+        if (!existsSync(prootAgentsBackup) && existsSync(prootAgentsFull)) {
+          copyFileSync(prootAgentsFull, prootAgentsBackup);
+          console.log('[boot] Backed up AGENTS.md → AGENTS.md.full in proot');
+        }
+        copyFileSync(androidAgentsSrc, prootAgentsFull);
+        console.log('[boot] Installed lightweight AGENTS_ANDROID.md → AGENTS.md in proot');
+      }
+    } catch (e) {
+      console.log(`[boot] AGENTS swap failed: ${e.message}`);
+    }
+
+    // 2) Kill any stale opencode process
+    try {
+      const killResult = spawnSync('pkill', ['-9', '-f', 'opencode serve'], {
+        encoding: 'utf-8', timeout: 5000
+      });
+      if (killResult.status === 0) {
+        console.log('[boot] Killed stale opencode process');
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    } catch { /* no matching process — fine */ }
+
+    // 3) Spawn opencode via proot-distro
+    console.log('[boot] Launching opencode via proot-distro...');
+    const prootBin = '/data/data/com.termux/files/usr/bin/proot-distro';
+    const prootProc = spawn(prootBin, [
+      'login', 'debian', '--',
+      'bash', '-c',
+      `cd /root/career-ops && ./opencode serve --hostname=127.0.0.1 --port=${OPENCODE_PORT} 2>&1`
+    ], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, HOME: '/root' },
+      detached: true,
+    });
+    prootProc.unref();
+    prootProc.on('error', (e) => console.error(`[boot] proot spawn error: ${e.message}`));
+    prootProc.stdout?.on('data', (d) => {
+      const s = d.toString().trim();
+      if (s) console.log(`[proot:out] ${s}`);
+    });
+    prootProc.stderr?.on('data', (d) => {
+      const s = d.toString().trim();
+      if (s) console.log(`[proot:err] ${s}`);
+    });
+    prootProc.on('exit', (code) => console.log(`[proot] exited with code ${code}`));
+
+    // 4) Wait for server ready
+    console.log('[boot] Waiting for opencode server...');
+    const ready = await waitForOpencodeServer(OPENCODE_URL, 30000);
+    if (!ready) {
+      console.error('[boot] opencode server did not start in 30s — will retry on first chat');
+      return;
+    }
+    console.log('[boot] opencode server ready');
+    // Warmup: let model provider initialize
+    await new Promise(r => setTimeout(r, 2000));
+  }
+  _opencodeReady = true;
+}
+
+// Called per user on first /chat — just connects to already-running opencode + creates session
 async function initOpencode(userId, userDir) {
   const key = userId || '__root__';
-  if (opencodeSessions.has(key)) return opencodeSessions.get(key);
+  const cached = opencodeSessions.get(key);
+  if (cached) {
+    cached.lastAccess = Date.now();
+    return cached;
+  }
 
   let client;
 
-  // Strategy 1: Connect to an already-running opencode server
+  // Try connecting to existing opencode server (should be running from bootOpencode)
   try {
     const probe = await fetch(OPENCODE_URL + '/health', { signal: AbortSignal.timeout(2000) });
     if (probe.ok) {
-      console.log(`[chat] Connecting to existing opencode server at ${OPENCODE_URL}`);
       client = createOpencodeClient({
         baseUrl: OPENCODE_URL,
         directory: userDir || __dirname,
@@ -2678,81 +2818,25 @@ async function initOpencode(userId, userDir) {
     }
   } catch {}
 
-  // Strategy 2: Spawn opencode serve
+  // Fallback: opencode not running (boot failed or non-Termux). Spawn now.
   if (!client) {
     if (isTermux()) {
-      // On Android/Termux: spawn via proot-distro (opencode binary needs glibc)
-      console.log(`[chat] Termux detected — launching opencode via proot-distro...`);
-      
-      // Copy lightweight AGENTS_ANDROID.md into proot so opencode uses small context
-      const prootRootfs = '/data/data/com.termux/files/usr/var/lib/proot-distro/containers/debian/rootfs';
-      const androidAgentsSrc = join(__dirname, 'AGENTS_ANDROID.md');
-      const prootAgentsDst = join(prootRootfs, 'root/career-ops/AGENTS_ANDROID.md');
-      const prootAgentsFull = join(prootRootfs, 'root/career-ops/AGENTS.md');
-      const prootAgentsBackup = join(prootRootfs, 'root/career-ops/AGENTS.md.full');
+      // Retry boot — first chat fallback
+      console.log('[chat] opencode not running — retrying boot...');
+      await bootOpencode();
       try {
-        if (existsSync(androidAgentsSrc)) {
-          // Backup full AGENTS.md once
-          if (!existsSync(prootAgentsBackup) && existsSync(prootAgentsFull)) {
-            const { copyFileSync } = await import('fs');
-            copyFileSync(prootAgentsFull, prootAgentsBackup);
-            console.log('[chat] Backed up AGENTS.md → AGENTS.md.full in proot');
-          }
-          // Copy lightweight version into proot
-          const { copyFileSync } = await import('fs');
-          copyFileSync(androidAgentsSrc, prootAgentsDst);
-          // Swap it as AGENTS.md
-          if (existsSync(prootAgentsDst)) {
-            const { renameSync } = await import('fs');
-            renameSync(prootAgentsDst, prootAgentsFull);
-            console.log('[chat] Installed lightweight AGENTS_ANDROID.md → AGENTS.md in proot');
-          }
+        const probe = await fetch(OPENCODE_URL + '/health', { signal: AbortSignal.timeout(2000) });
+        if (probe.ok) {
+          client = createOpencodeClient({
+            baseUrl: OPENCODE_URL,
+            directory: userDir || __dirname,
+          });
         }
-      } catch (e) {
-        console.log(`[chat] AGENTS swap skipped: ${e.message}`);
-      }
-
-      const prootBin = '/data/data/com.termux/files/usr/bin/proot-distro';
-      const prootProc = spawn(prootBin, [
-        'login', 'debian', '--',
-        'bash', '-c',
-        `cd /root/career-ops && ./opencode serve --hostname=127.0.0.1 --port=${OPENCODE_PORT} 2>&1`
-      ], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: { ...process.env, HOME: '/root' },
-        detached: true,
-      });
-      prootProc.unref();
-      prootProc.on('error', (e) => console.error(`[chat] proot spawn error: ${e.message}`));
-      prootProc.stdout?.on('data', (d) => {
-        const s = d.toString().trim();
-        if (s) console.log(`[proot:out] ${s}`);
-      });
-      prootProc.stderr?.on('data', (d) => {
-        const s = d.toString().trim();
-        if (s) console.log(`[proot:err] ${s}`);
-      });
-      prootProc.on('exit', (code) => console.log(`[proot] exited with code ${code}`));
-
-      console.log(`[chat] Waiting for opencode server on ${OPENCODE_URL}...`);
-      const ready = await waitForOpencodeServer(OPENCODE_URL, 30000);
-      if (!ready) {
-        throw new Error(
-          'opencode server did not start in 30s. Check proot output above for errors.'
-        );
-      }
-      console.log(`[chat] opencode server ready`);
-      client = createOpencodeClient({
-        baseUrl: OPENCODE_URL,
-        directory: userDir || __dirname,
-      });
-      // Warmup: wait for model provider to initialize after fresh server start
-      console.log('[chat] Warming up model provider (2s)...');
-      await new Promise(r => setTimeout(r, 2000));
+      } catch {}
     } else {
-      // Desktop Linux/macOS: spawn directly
+      // Desktop: spawn directly
       try {
-        console.log(`[chat] Spawning opencode serve locally...`);
+        console.log('[chat] Spawning opencode serve locally...');
         const server = await createOpencode({
           dir: userDir || __dirname,
           permission: { bash: "allow", write: "allow", edit: "allow" },
@@ -2768,6 +2852,10 @@ async function initOpencode(userId, userDir) {
     }
   }
 
+  if (!client) {
+    throw new Error('opencode server not available');
+  }
+
   const sessionResult = await client.session.create({
     body: { title: userId || 'default' }
   });
@@ -2776,7 +2864,7 @@ async function initOpencode(userId, userDir) {
     throw new Error('Failed to create opencode session: ' + JSON.stringify(sessionResult.error || sessionResult));
   }
 
-  opencodeSessions.set(key, { client, sessionId });
+  opencodeSessions.set(key, { client, sessionId, lastAccess: Date.now() });
   return { client, sessionId };
 }
 
@@ -2814,7 +2902,7 @@ app.post('/chat', async (req, res) => {
       path: { id: sessionId },
       body: { 
         parts: [{ type: "text", text: message }],
-        model: { providerID: "opencode", modelID: "big-pickle" }
+        model: resolveModelForUser(userId)
       }
     });
 
@@ -2869,29 +2957,31 @@ app.post('/chat', async (req, res) => {
       const text = parts.filter(p => p.type === 'text').map(p => p.text).join('\n');
       if (text && text.trim().length > 0) {
         content = text;
-        toolOutputs = parts.filter(p => p.type === 'tool').map(tp => ({
-          tool: tp.tool, status: tp.state?.status,
-          output: tp.state?.output || '', input: tp.state?.input || ''
-        }));
         console.log(`[chat] Found text in msg ${i} (${text.length} chars)`);
-        break;
       }
       
-      // If this message has tool parts, collect them as fallback
+      // Collect tool outputs from ALL messages (not just the one with text)
       const tools = parts.filter(p => p.type === 'tool').map(tp => ({
         tool: tp.tool, status: tp.state?.status,
         output: tp.state?.output || '', input: tp.state?.input || ''
       }));
-      if (tools.length > 0 && toolOutputs.length === 0) {
-        toolOutputs = tools;
+      if (tools.length > 0) {
+        toolOutputs.push(...tools);
       }
+      
+      if (content) break;
     }
     
-    // Fallback: use tool outputs if no text
-    if (!content && toolOutputs.length > 0) {
-      const completed = toolOutputs.filter(t => t.status === 'completed');
+    // Append tool output summaries to content (gives user visibility into what ran)
+    if (toolOutputs.length > 0) {
+      const completed = toolOutputs.filter(t => t.status === 'completed' && t.output);
       if (completed.length > 0) {
-        content = formatToolSummary(completed);
+        const toolSummary = formatToolSummary(completed);
+        if (content) {
+          content = content + '\n\n---\n' + toolSummary;
+        } else {
+          content = toolSummary;
+        }
       }
     }
     
@@ -3004,35 +3094,28 @@ function parseToolOutputs(toolOutputs) {
 
 // ── Format tool summary when no text response available ─────────────
 function formatToolSummary(completedTools) {
-  const summaries = [];
+  const parts = [];
   
   for (const tool of completedTools) {
     if (tool.input?.includes('scan.mjs')) {
       try {
         const data = JSON.parse(tool.output);
         const count = data.results?.length || data.total || 0;
-        summaries.push(`Found ${count} job listings`);
+        parts.push(`Found ${count} job listings.\n\n${tool.output}`);
       } catch {
-        const urlCount = (tool.output.match(/https?:\/\//g) || []).length;
-        if (urlCount > 0) {
-          summaries.push(`Found ${urlCount} job listings`);
-        } else {
-          summaries.push('Scan completed');
-        }
+        parts.push(tool.output || 'Scan completed');
       }
     } else if (tool.input?.includes('evaluate') || tool.input?.includes('oferta')) {
-      const scoreMatch = tool.output.match(/Score:\s*(\d+\.?\d*)/i);
-      if (scoreMatch) {
-        summaries.push(`Evaluation complete — Score: ${scoreMatch[1]}/5`);
-      } else {
-        summaries.push('Evaluation complete');
-      }
+      parts.push(tool.output || 'Evaluation complete');
     } else {
-      summaries.push('Operation completed');
+      // Include actual tool output, not a generic summary
+      if (tool.output && tool.output.trim().length > 0) {
+        parts.push(tool.output);
+      }
     }
   }
   
-  return summaries.join('\n') || 'Processing complete.';
+  return parts.join('\n\n') || 'Processing complete.';
 }
 
 // ── POST /chat/stream — SSE streaming for chat ──────────────────────
@@ -3095,7 +3178,7 @@ app.post('/chat/stream', async (req, res) => {
       path: { id: sessionId },
       body: {
         parts: [{ type: "text", text: message }],
-        model: { providerID: "opencode", modelID: "big-pickle" }
+        model: resolveModelForUser(userId)
       }
     });
     if (asyncResult.error) {
@@ -3151,16 +3234,11 @@ app.post('/chat/stream', async (req, res) => {
     const msgs = Array.isArray(msgsResult.data) ? msgsResult.data : [];
     const assistants = msgs.filter(m => m.info?.role === 'assistant');
 
-    // Debug: log raw message structure so we can fix parsing
+    // Log summary only (full parts are large)
     for (const m of assistants) {
-      console.log(`[chat/stream] assistant msg parts:`, JSON.stringify((m.parts || []).map(p => ({
-        type: p.type,
-        textLen: (p.text || '').length,
-        toolName: p.tool,
-        toolStatus: p.state?.status,
-        outputLen: (p.state?.output || '').length,
-        keys: Object.keys(p)
-      }))));
+      const parts = m.parts || [];
+      const summary = parts.map(p => `${p.type}:${(p.text||'').length || (p.state?.output||'').length}`).join(',');
+      console.log(`[chat/stream] assistant parts: ${parts.length} (${summary})`);
     }
 
     let content = '';
@@ -3233,6 +3311,7 @@ app.post('/chat/reset', (req, res) => {
 app.get('/debug', async (req, res) => {
   const info = {
     opencodeUrl: OPENCODE_URL,
+    opencodeBootCompleted: _opencodeReady,
     hasRunningSessions: opencodeSessions.size,
     sessions: [...opencodeSessions.entries()].map(([k, v]) => ({ key: k, sessionId: v.sessionId })),
     uptime: Math.floor(process.uptime()) + 's',

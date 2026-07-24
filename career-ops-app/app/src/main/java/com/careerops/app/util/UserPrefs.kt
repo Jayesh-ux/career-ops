@@ -49,6 +49,10 @@ class UserPrefs(context: Context) {
         get() = prefs.getString("bridge_url", "http://127.0.0.1:8787") ?: "http://127.0.0.1:8787"
         set(value) = prefs.edit().putString("bridge_url", value).apply()
 
+    var bridgeToken: String
+        get() = prefs.getString("bridge_token", "") ?: ""
+        set(value) = prefs.edit().putString("bridge_token", value).apply()
+
     var isOnboarded: Boolean
         get() = prefs.getBoolean("is_onboarded", false)
         set(value) = prefs.edit().putBoolean("is_onboarded", value).apply()

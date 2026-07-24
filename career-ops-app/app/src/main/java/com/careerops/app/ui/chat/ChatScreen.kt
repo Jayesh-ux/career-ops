@@ -9,6 +9,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.*
@@ -29,6 +30,8 @@ import androidx.hilt.navigation.compose.hiltViewModel
 @Composable
 fun ChatScreen(
     onNavigateToSettings: () -> Unit = {},
+    onNavigateToDashboard: () -> Unit = {},
+    onNavigateToApplications: () -> Unit = {},
     viewModel: ChatViewModel = hiltViewModel()
 ) {
     val messages = viewModel.messages
@@ -36,14 +39,18 @@ fun ChatScreen(
     val showDebug = viewModel.showDebug
     val debugLog = viewModel.debugLog
     val responseTimes = viewModel.responseTimes
+    val streamingText by viewModel.streamingText.collectAsState()
     var inputText by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
     val debugListState = rememberLazyListState()
     val focusManager = LocalFocusManager.current
 
-    LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty()) {
-            listState.animateScrollToItem(messages.size - 1)
+    // Auto-scroll when new messages arrive or streaming text updates
+    LaunchedEffect(messages.size, streamingText.length) {
+        if (messages.isNotEmpty() || streamingText.isNotEmpty()) {
+            listState.animateScrollToItem(
+                if (streamingText.isNotEmpty()) messages.size else messages.size - 1
+            )
         }
     }
 
@@ -58,9 +65,15 @@ fun ChatScreen(
             TopAppBar(
                 title = { Text("career-ops", fontWeight = FontWeight.Bold) },
                 actions = {
+                    IconButton(onClick = onNavigateToDashboard) {
+                        Icon(Icons.Default.Home, contentDescription = "Dashboard")
+                    }
+                    IconButton(onClick = onNavigateToApplications) {
+                        Icon(Icons.Default.List, contentDescription = "Applications")
+                    }
                     IconButton(onClick = { viewModel.toggleDebug() }) {
                         Icon(
-                            Icons.Default.BugReport,
+                            Icons.Default.Warning,
                             contentDescription = "Debug",
                             tint = if (showDebug) MaterialTheme.colorScheme.error
                                    else MaterialTheme.colorScheme.onSurface
@@ -121,91 +134,97 @@ fun ChatScreen(
             }
         }
     ) { paddingValues ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(paddingValues)
-        ) {
-            // Debug panel (toggle-able)
-            AnimatedVisibility(visible = showDebug) {
-                Surface(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 100.dp, max = 250.dp),
-                    color = Color(0xFF1A1A2E),
-                    shadowElevation = 4.dp
-                ) {
-                    Column(modifier = Modifier.padding(8.dp)) {
-                        Text(
-                            "DEBUG PANEL",
-                            color = Color(0xFF00FF41),
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = FontFamily.Monospace
-                        )
-                        
-                        // Response time stats
-                        if (responseTimes.isNotEmpty()) {
-                            Spacer(modifier = Modifier.height(4.dp))
-                            val avgTime = viewModel.getAverageResponseTime()
-                            val lastTime = viewModel.getLastResponseTime()
-                            val successCount = responseTimes.count { it.success }
-                            val failCount = responseTimes.count { !it.success }
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(paddingValues)
+            ) {
+                // Debug panel (toggle-able)
+                AnimatedVisibility(visible = showDebug) {
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 100.dp, max = 250.dp),
+                        color = Color(0xFF1A1A2E),
+                        shadowElevation = 4.dp
+                    ) {
+                        Column(modifier = Modifier.padding(8.dp)) {
                             Text(
-                                text = "Avg: ${avgTime}ms | Last: ${lastTime}ms | Success: $successCount | Failed: $failCount",
-                                color = Color(0xFF44AAFF),
-                                fontSize = 10.sp,
+                                "DEBUG PANEL",
+                                color = Color(0xFF00FF41),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
                                 fontFamily = FontFamily.Monospace
                             )
-                        }
-                        
-                        Spacer(modifier = Modifier.height(4.dp))
-                        LazyColumn(
-                            state = debugListState,
-                            modifier = Modifier.fillMaxSize()
-                        ) {
-                            items(debugLog) { entry ->
+                            if (responseTimes.isNotEmpty()) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                val avgTime = viewModel.getAverageResponseTime()
+                                val lastTime = viewModel.getLastResponseTime()
+                                val successCount = responseTimes.count { it.success }
+                                val failCount = responseTimes.count { !it.success }
                                 Text(
-                                    text = entry.formatted(),
-                                    color = when (entry.tag) {
-                                        "error" -> Color(0xFFFF4444)
-                                        "warn" -> Color(0xFFFFAA00)
-                                        "response" -> Color(0xFF44AAFF)
-                                        "action" -> Color(0xFFAA44FF)
-                                        else -> Color(0xFF00FF41)
-                                    },
+                                    text = "Avg: ${avgTime}ms | Last: ${lastTime}ms | Success: $successCount | Failed: $failCount",
+                                    color = Color(0xFF44AAFF),
                                     fontSize = 10.sp,
-                                    fontFamily = FontFamily.Monospace,
-                                    lineHeight = 14.sp
+                                    fontFamily = FontFamily.Monospace
                                 )
+                            }
+                            Spacer(modifier = Modifier.height(4.dp))
+                            LazyColumn(
+                                state = debugListState,
+                                modifier = Modifier.fillMaxWidth().wrapContentHeight()
+                            ) {
+                                items(debugLog, key = { "${it.timestamp}-${it.tag}" }) { entry ->
+                                    Text(
+                                        text = entry.formatted(),
+                                        color = when (entry.tag) {
+                                            "error" -> Color(0xFFFF4444)
+                                            "warn" -> Color(0xFFFFAA00)
+                                            "response" -> Color(0xFF44AAFF)
+                                            "action" -> Color(0xFFAA44FF)
+                                            else -> Color(0xFF00FF41)
+                                        },
+                                        fontSize = 10.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        lineHeight = 14.sp
+                                    )
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            // Chat messages
-            LazyColumn(
-                state = listState,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(horizontal = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-                contentPadding = PaddingValues(vertical = 12.dp)
-            ) {
-                items(messages) { message ->
-                    when (message) {
-                        is ChatMessage.User -> UserBubble(message)
-                        is ChatMessage.System -> SystemBubble(message)
-                        is ChatMessage.Typing -> TypingBubble(message)
-                        is ChatMessage.ToolStatus -> ToolStatusBubble(message)
-                        is ChatMessage.JobCard -> JobCardBubble(message)
-                        is ChatMessage.EmailDraft -> EmailDraftBubble(message)
-                        is ChatMessage.Evaluation -> EvaluationCard(message)
+                // Chat messages — SelectionContainer wraps only the chat area
+                SelectionContainer {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    contentPadding = PaddingValues(vertical = 12.dp)
+                ) {
+                    items(messages, key = { it.id }) { message ->
+                        when (message) {
+                            is ChatMessage.User -> UserBubble(message)
+                            is ChatMessage.System -> SystemBubble(message)
+                            is ChatMessage.Typing -> TypingBubble(message)
+                            is ChatMessage.ToolStatus -> ToolStatusBubble(message)
+                            is ChatMessage.JobCard -> JobCardBubble(message)
+                            is ChatMessage.EmailDraft -> EmailDraftBubble(message)
+                            is ChatMessage.Evaluation -> EvaluationCard(message)
+                        }
+                    }
+                    // Live-updating streaming bubble
+                    if (streamingText.isNotEmpty()) {
+                        item(key = "streaming") {
+                            StreamingBubble(streamingText)
+                        }
                     }
                 }
+                }
             }
-        }
     }
 }
 
@@ -276,6 +295,43 @@ fun TypingBubble(message: ChatMessage.Typing) {
 }
 
 @Composable
+fun StreamingBubble(text: String) {
+    SelectionContainer {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.Start
+        ) {
+            Surface(
+                shape = RoundedCornerShape(16.dp, 16.dp, 16.dp, 4.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                modifier = Modifier.fillMaxWidth(0.92f)
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    // Streaming indicator
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 1.5.dp)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            "Streaming...",
+                            fontSize = 10.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    // Live text content
+                    Text(
+                        text = text,
+                        fontSize = 14.sp,
+                        lineHeight = 20.sp,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
 fun JobCardBubble(message: ChatMessage.JobCard) {
     Card(
         modifier = Modifier.fillMaxWidth(0.92f),
@@ -284,7 +340,7 @@ fun JobCardBubble(message: ChatMessage.JobCard) {
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Default.Work, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
+                Icon(Icons.Default.Person, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
                 Spacer(modifier = Modifier.width(8.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text(text = message.company, fontWeight = FontWeight.Bold, fontSize = 16.sp)
@@ -420,7 +476,7 @@ fun EvaluationCard(message: ChatMessage.Evaluation) {
         Column(modifier = Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
-                    Icons.Default.Assessment,
+                    Icons.Default.Star,
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.size(20.dp)

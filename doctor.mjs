@@ -407,6 +407,16 @@ function onboardingState(root) {
     .filter(({ path }) => !prereqPresent(root, path))
     .map(({ path }) => path);
   const warnings = playwrightMcpConfigured(root) ? [] : [PLAYWRIGHT_MCP_WARNING];
+  // Check that the lightweight AGENTS_ANDROID.md is installed in proot
+  try {
+    const prootAgentsPath = '/data/data/com.termux/files/usr/var/lib/proot-distro/containers/debian/rootfs/root/career-ops/AGENTS.md';
+    if (existsSync(prootAgentsPath)) {
+      const st = statSync(prootAgentsPath);
+      if (st.size > 10000) {  // full AGENTS.md is ~36KB; lightweight is ~5KB
+        warnings.push(`AGENTS.md in proot is ${Math.round(st.size/1024)}KB (expected ~5KB). Run bridge-server to trigger swap, or copy AGENTS_ANDROID.md over proot AGENTS.md manually.`);
+      }
+    }
+  } catch { /* proot not available — skip check */ }
   let plugins = [];
   try {
     const cfg = readPluginConfigSync(root);

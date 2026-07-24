@@ -19,6 +19,8 @@ android {
         versionName = "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        buildConfigField("String", "BRIDGE_TOKEN", "\"3c1434435017441c2e65f909924ca1aafd53bc3e926f7da9\"")
     }
 
     signingConfigs {
@@ -92,7 +94,6 @@ dependencies {
     implementation(libs.play.services.auth)
     implementation(libs.gson)
     implementation(libs.security.crypto)
-    implementation(libs.coil.compose)
     implementation(libs.datastore.preferences)
     implementation(libs.work.runtime)
 

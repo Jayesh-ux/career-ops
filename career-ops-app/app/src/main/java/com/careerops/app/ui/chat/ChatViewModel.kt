@@ -12,17 +12,23 @@ import com.careerops.app.data.remote.CareerOpsApi
 import com.careerops.app.util.UserPrefs
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.ResponseBody
 import javax.inject.Inject
 
 sealed class ChatMessage {
-    data class User(val text: String) : ChatMessage()
-    data class System(val text: String, val timestamp: String = "") : ChatMessage()
-    data class Typing(val label: String = "Thinking...") : ChatMessage()
-    data class ToolStatus(val label: String, val detail: String = "") : ChatMessage()
+    abstract val id: Long
+
+    data class User(val text: String, override val id: Long = nextId()) : ChatMessage()
+    data class System(val text: String, override val id: Long = nextId(), val timestamp: String = "") : ChatMessage()
+    data class Typing(override val id: Long = -1L, val label: String = "Thinking...") : ChatMessage()
+    data class ToolStatus(override val id: Long = nextId(), val label: String, val detail: String = "") : ChatMessage()
     data class JobCard(
+        override val id: Long = nextId(),
         val company: String,
         val role: String,
         val score: String = "",
@@ -32,6 +38,7 @@ sealed class ChatMessage {
         val onSkip: (() -> Unit)? = null
     ) : ChatMessage()
     data class EmailDraft(
+        override val id: Long = nextId(),
         val to: String,
         val company: String,
         val role: String,
@@ -42,12 +49,18 @@ sealed class ChatMessage {
         val onEdit: (() -> Unit)? = null
     ) : ChatMessage()
     data class Evaluation(
+        override val id: Long = nextId(),
         val company: String = "",
         val role: String = "",
         val score: String = "",
         val summary: String = "",
         val reportPath: String = ""
     ) : ChatMessage()
+
+    companion object {
+        private var counter = 0L
+        fun nextId(): Long = ++counter
+    }
 }
 
 data class ResponseTimeEntry(
@@ -66,6 +79,17 @@ class ChatViewModel @Inject constructor(
 
     companion object {
         private const val TAG = "CareerOps"
+        private const val MAX_DEBUG_LOG = 200
+        private const val MAX_RESPONSE_TIMES = 50
+        private const val MAX_MESSAGES = 200
+        private val ACTION_REGEX = Regex("\\[ACTION:(\\w+)\\]([\\s\\S]*?)\\[/ACTION\\]")
+        private val CLEAN_PATTERNS = listOf(
+            Regex("\\[ACTION:[\\s\\S]*?\\[/ACTION\\]"),
+            Regex("<thinking>[\\s\\S]*?</thinking>"),
+        )
+        private val NOISE_PATTERNS = listOf(
+            Regex("(?i)^\\[.*?\\]\\s*$"),
+        )
     }
 
     val messages = mutableStateListOf<ChatMessage>()
@@ -78,6 +102,9 @@ class ChatViewModel @Inject constructor(
     val debugLog = mutableStateListOf<DebugEntry>()
 
     val responseTimes = mutableStateListOf<ResponseTimeEntry>()
+
+    private val _streamingText = MutableStateFlow("")
+    val streamingText: StateFlow<String> = _streamingText.asStateFlow()
 
     private var currentSessionId: String? = null
 
@@ -135,10 +162,19 @@ class ChatViewModel @Inject constructor(
                     return@launch
                 }
 
-                // Parse SSE stream on IO thread
+                // Parse SSE stream incrementally — emits deltas to streamingText
+                _streamingText.value = ""
                 val streamResult = withContext(Dispatchers.IO) {
-                    parseSSEStream(body, startTime)
+                    parseSSEStreamIncremental(body)
                 }
+
+                // Finalize: get cleaned text and action blocks
+                val finalText = cleanContent(streamResult.fullText)
+                val actions = streamResult.actions
+
+                // Capture streaming text before clearing
+                val streamedContent = _streamingText.value
+                _streamingText.value = ""
 
                 removeTyping()
                 currentSessionId = streamResult.sessionId
@@ -146,35 +182,38 @@ class ChatViewModel @Inject constructor(
                 val elapsed = System.currentTimeMillis() - startTime
 
                 // Track response time
-                responseTimes.add(
+                addResponseTime(
                     ResponseTimeEntry(
                         timestamp = startTime,
                         messagePreview = text.take(30),
                         responseTimeMs = elapsed,
-                        actionsCount = streamResult.actions.size,
+                        actionsCount = actions.size,
                         success = streamResult.error == null
                     )
                 )
 
-                debugLog.add(DebugEntry("response",
+                addDebug(DebugEntry("response",
                     "session=${streamResult.sessionId}, " +
                     "tokens=${streamResult.fullText.length}, " +
-                    "actions=${streamResult.actions.size}, " +
+                    "actions=${actions.size}, " +
                     "error=${streamResult.error}, " +
                     "time=${elapsed}ms"
                 ))
 
-                // Display the accumulated streamed text
-                if (streamResult.fullText.isNotBlank()) {
-                    val cleaned = cleanContent(streamResult.fullText)
-                    if (cleaned.isNotBlank()) {
-                        messages.add(ChatMessage.System(cleaned))
+                // Display the final cleaned text
+                if (finalText.isNotBlank()) {
+                    messages.add(ChatMessage.System(finalText))
+                } else if (streamedContent.isNotBlank()) {
+                    // Fallback: use streamed content if cleanup removed everything
+                    val fallback = cleanContent(streamedContent)
+                    if (fallback.isNotBlank()) {
+                        messages.add(ChatMessage.System(fallback))
                     }
                 }
 
                 // Display action blocks
-                for (action in streamResult.actions) {
-                    debugLog.add(DebugEntry("action", "type=${action.type}, data=${action.data}"))
+                for (action in actions) {
+                    addDebug(DebugEntry("action", "type=${action.type}, data=${action.data}"))
                     when (action.type) {
                         "job_card" -> {
                             messages.add(ChatMessage.JobCard(
@@ -236,19 +275,20 @@ class ChatViewModel @Inject constructor(
                     messages.add(ChatMessage.System("Error: ${streamResult.error}"))
                 }
 
-                if (streamResult.fullText.isBlank() && streamResult.actions.isEmpty() && streamResult.error == null) {
-                    debugLog.add(DebugEntry("warn", "Empty stream — no text, no actions"))
+                if (streamResult.fullText.isBlank() && actions.isEmpty() && streamResult.error == null) {
+                    addDebug(DebugEntry("warn", "Empty stream — no text, no actions"))
                     messages.add(ChatMessage.System("Empty response from server."))
                 }
             } catch (e: Exception) {
                 removeTyping()
+                _streamingText.value = ""
                 val elapsed = System.currentTimeMillis() - startTime
                 val errorMsg = "${e.javaClass.simpleName}: ${e.message}"
-                debugLog.add(DebugEntry("error", "$errorMsg (${elapsed}ms)"))
+                addDebug(DebugEntry("error", "$errorMsg (${elapsed}ms)"))
                 Log.e(TAG, "Chat stream error", e)
                 messages.add(ChatMessage.System("Error: $errorMsg"))
 
-                responseTimes.add(
+                addResponseTime(
                     ResponseTimeEntry(
                         timestamp = startTime,
                         messagePreview = text.take(30),
@@ -259,6 +299,8 @@ class ChatViewModel @Inject constructor(
                 )
             } finally {
                 isProcessing = false
+                _streamingText.value = ""
+                trimMessages()
             }
         }
     }
@@ -271,10 +313,10 @@ class ChatViewModel @Inject constructor(
     )
 
     /**
-     * Parse SSE stream from bridge server.
-     * Events: text_delta ({text}), done ({sessionId}), error ({error})
+     * Parse SSE stream incrementally — emits text deltas to _streamingText
+     * as they arrive, so the UI can render them in real-time.
      */
-    private fun parseSSEStream(body: ResponseBody, startTime: Long): StreamResult {
+    private fun parseSSEStreamIncremental(body: ResponseBody): StreamResult {
         val source = body.source()
         val textBuilder = StringBuilder()
         var sessionId: String? = null
@@ -305,6 +347,8 @@ class ChatViewModel @Inject constructor(
                                     val delta = json.optString("text", "")
                                     if (delta.isNotEmpty()) {
                                         textBuilder.append(delta)
+                                        // Emit incremental update for live UI rendering
+                                        _streamingText.value = textBuilder.toString()
                                     }
                                 }
                                 "done" -> {
@@ -314,9 +358,7 @@ class ChatViewModel @Inject constructor(
                                     error = json.optString("error", "Unknown error")
                                 }
                             }
-                        } catch (e: Exception) {
-                            // Non-JSON data, skip
-                        }
+                        } catch (_: Exception) { }
                         currentEvent = ""
                         dataBuffer.clear()
                     }
@@ -345,9 +387,8 @@ class ChatViewModel @Inject constructor(
      */
     private fun parseActionBlocks(text: String): ParsedOutput {
         val actions = mutableListOf<ActionBlock>()
-        val actionRegex = Regex("\\[ACTION:(\\w+)\\]([\\s\\S]*?)\\[/ACTION\\]")
         
-        val cleanText = actionRegex.replace(text) { match ->
+        val cleanText = ACTION_REGEX.replace(text) { match ->
             val type = match.groupValues[1]
             val content = match.groupValues[2].trim()
             val lines = content.split("\n")
@@ -363,7 +404,7 @@ class ChatViewModel @Inject constructor(
             }
             
             actions.add(ActionBlock(type = type, data = data))
-            "" // Remove the action block from text
+            ""
         }.trim()
 
         return ParsedOutput(text = cleanText, actions = actions)
@@ -381,6 +422,28 @@ class ChatViewModel @Inject constructor(
 
     fun getLastResponseTime(): Long {
         return responseTimes.lastOrNull()?.responseTimeMs ?: 0
+    }
+
+    private fun addDebug(entry: DebugEntry) {
+        debugLog.add(entry)
+        // Cap debug log to prevent unbounded growth
+        while (debugLog.size > MAX_DEBUG_LOG) {
+            debugLog.removeAt(0)
+        }
+    }
+
+    private fun addResponseTime(entry: ResponseTimeEntry) {
+        responseTimes.add(entry)
+        // Cap response times to prevent unbounded growth
+        while (responseTimes.size > MAX_RESPONSE_TIMES) {
+            responseTimes.removeAt(0)
+        }
+    }
+
+    private fun trimMessages() {
+        while (messages.size > MAX_MESSAGES) {
+            messages.removeAt(0)
+        }
     }
 
     private suspend fun draftApplication(company: String, role: String) {
@@ -443,9 +506,10 @@ class ChatViewModel @Inject constructor(
     fun resetSession() {
         viewModelScope.launch {
             try {
-                debugLog.add(DebugEntry("reset", "Clearing session"))
+                addDebug(DebugEntry("reset", "Clearing session"))
                 api.resetChat()
                 currentSessionId = null
+                _streamingText.value = ""
                 messages.clear()
                 responseTimes.clear()
                 messages.add(ChatMessage.System("Session reset. How can I help you?"))
@@ -464,21 +528,13 @@ class ChatViewModel @Inject constructor(
 
     private fun cleanContent(raw: String): String {
         var text = raw
-            .replace(Regex("\\[ACTION:[\\s\\S]*?\\[/ACTION\\]"), "")
-            .replace(Regex("<thinking>[\\s\\S]*?</thinking>"), "")
-            .replace(Regex("```[\\s\\S]*?```"), "")
-            .replace(Regex("`[^`]+`"), "")
-            .trim()
+        for (pattern in CLEAN_PATTERNS) {
+            text = pattern.replace(text, "")
+        }
+        text = text.trim()
         
-        val noisePatterns = listOf(
-            Regex("(?i)^(running|executing|tool|bash)[^\\n]*$"),
-            Regex("(?i)^\\[.*?\\]\\s*$"),
-            Regex("(?i)^Step \\d+:"),
-            Regex("(?i)^\\d+\\.\\s+"),
-            Regex("(?i)^>\\s+"),
-        )
         val lines = text.split("\n").filter { line ->
-            noisePatterns.none { it.matches(line.trim()) }
+            NOISE_PATTERNS.none { it.matches(line.trim()) }
         }
         
         return lines.joinToString("\n").trim()
@@ -491,7 +547,6 @@ data class DebugEntry(
     val timestamp: Long = System.currentTimeMillis()
 ) {
     fun formatted(): String {
-        val secs = (System.currentTimeMillis() - timestamp) / 1000
         return "[${tag.uppercase()}] $message"
     }
 }

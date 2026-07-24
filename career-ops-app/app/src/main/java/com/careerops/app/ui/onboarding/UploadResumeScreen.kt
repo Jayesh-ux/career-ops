@@ -5,9 +5,9 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.CloudUpload
-import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Send
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -70,7 +70,7 @@ fun UploadResumeScreen(
         verticalArrangement = Arrangement.Center
     ) {
         Icon(
-            Icons.Default.CloudUpload,
+            Icons.Default.Send,
             contentDescription = null,
             modifier = Modifier.size(80.dp),
             tint = MaterialTheme.colorScheme.primary
@@ -103,7 +103,7 @@ fun UploadResumeScreen(
                     .fillMaxWidth()
                     .height(56.dp)
             ) {
-                Icon(Icons.Default.Description, null, modifier = Modifier.size(24.dp))
+                Icon(Icons.Default.Info, contentDescription = null, modifier = Modifier.size(24.dp))
                 Spacer(modifier = Modifier.width(12.dp))
                 Text("Choose PDF or DOCX", fontSize = 16.sp)
             }
@@ -116,7 +116,7 @@ fun UploadResumeScreen(
                     modifier = Modifier.padding(16.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(Icons.Default.Description, null, tint = MaterialTheme.colorScheme.primary)
+                    Icon(Icons.Default.Info, null, tint = MaterialTheme.colorScheme.primary)
                     Spacer(modifier = Modifier.width(12.dp))
                     Column(modifier = Modifier.weight(1f)) {
                         Text(fileName ?: "resume.pdf", fontWeight = FontWeight.Medium)

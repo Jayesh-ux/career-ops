@@ -3,8 +3,8 @@ package com.careerops.app.ui.onboarding
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.Error
-import androidx.compose.material.icons.filled.Loop
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -56,7 +56,7 @@ fun ConfirmStartScreen(
     ) {
         if (isChecking) {
             Icon(
-                Icons.Default.Loop,
+                Icons.Default.Refresh,
                 contentDescription = null,
                 modifier = Modifier.size(80.dp),
                 tint = MaterialTheme.colorScheme.primary
@@ -130,7 +130,7 @@ fun ConfirmStartScreen(
                         modifier = Modifier.padding(12.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(Icons.Default.Error, null, tint = MaterialTheme.colorScheme.error)
+                        Icon(Icons.Default.Warning, null, tint = MaterialTheme.colorScheme.error)
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(error!!, color = MaterialTheme.colorScheme.onErrorContainer, fontSize = 13.sp)
                     }
@@ -169,7 +169,7 @@ private fun SetupCheckItem(label: String, isComplete: Boolean, detail: String) {
         verticalAlignment = Alignment.CenterVertically
     ) {
         Icon(
-            if (isComplete) Icons.Default.CheckCircle else Icons.Default.Error,
+            if (isComplete) Icons.Default.CheckCircle else Icons.Default.Warning,
             contentDescription = null,
             tint = if (isComplete) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
             modifier = Modifier.size(20.dp)

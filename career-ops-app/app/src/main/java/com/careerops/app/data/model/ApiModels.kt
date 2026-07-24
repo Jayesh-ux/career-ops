@@ -105,8 +105,8 @@ data class BlacklistResponse(
 
 data class OAuthExchangeRequest(
     val code: String,
-    val clientId: String,
-    val clientSecret: String,
+    val clientId: String = "",
+    val clientSecret: String = "",
     val redirectUri: String? = null
 )
 

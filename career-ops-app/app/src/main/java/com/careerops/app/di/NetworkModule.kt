@@ -38,13 +38,11 @@ object NetworkModule {
             .addInterceptor { chain ->
                 val original = chain.request()
                 val userId = userPrefs.userEmail
-                val request = if (userId.isNotEmpty()) {
-                    original.newBuilder()
-                        .header("X-User-Id", userId)
-                        .build()
-                } else {
-                    original
-                }
+                val token = userPrefs.bridgeToken
+                val request = original.newBuilder().apply {
+                    if (userId.isNotEmpty()) header("X-User-Id", userId)
+                    if (token.isNotEmpty()) header("X-Bridge-Token", token)
+                }.build()
                 chain.proceed(request)
             }
             .addInterceptor(

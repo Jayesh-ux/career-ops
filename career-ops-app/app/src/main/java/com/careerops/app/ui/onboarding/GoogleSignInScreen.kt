@@ -6,7 +6,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Email
-import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.Person
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -19,12 +19,12 @@ import androidx.compose.ui.unit.sp
 import com.google.android.gms.auth.api.signin.GoogleSignIn
 import com.google.android.gms.auth.api.signin.GoogleSignInOptions
 import com.google.android.gms.common.api.ApiException
-import com.google.android.gms.common.api.Scope
 import android.util.Log
 
 @Composable
 fun GoogleSignInScreen(
-    onSignInSuccess: (email: String, idToken: String) -> Unit,
+    oauthError: String? = null,
+    onSignInSuccess: (email: String, serverAuthCode: String) -> Unit,
     onSignInError: (String) -> Unit
 ) {
     val context = LocalContext.current
@@ -33,9 +33,8 @@ fun GoogleSignInScreen(
 
     val gso = remember {
         GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
-            .requestIdToken("221656652451-am341k5t73gi9jntrnjm1k5satn1o1hq.apps.googleusercontent.com")
+            .requestServerAuthCode("221656652451-5cb11e7qhkkngdjbs6emaiqidt4a93dr.apps.googleusercontent.com")
             .requestEmail()
-            .requestScopes(Scope("https://mail.google.com/"))
             .build()
     }
 
@@ -50,9 +49,9 @@ fun GoogleSignInScreen(
             try {
                 val account = task.getResult(ApiException::class.java)
                 val email = account?.email ?: ""
-                val idToken = account?.idToken ?: ""
-                if (email.isNotEmpty() && idToken.isNotEmpty()) {
-                    onSignInSuccess(email, idToken)
+                val serverAuthCode = account?.serverAuthCode ?: ""
+                if (email.isNotEmpty() && serverAuthCode.isNotEmpty()) {
+                    onSignInSuccess(email, serverAuthCode)
                 } else {
                     errorMessage = "Could not retrieve email from Google account."
                 }
@@ -62,7 +61,10 @@ fun GoogleSignInScreen(
                 onSignInError(errorMessage!!)
             }
         } else {
-            errorMessage = "Sign-in was cancelled."
+            val errorCode = result.data?.getIntExtra("googleSignInError", -1) ?: -1
+            Log.e("GoogleSignIn", "Sign-in cancelled, resultCode=${result.resultCode}, errorCode=$errorCode, data=${result.data}")
+            errorMessage = "Sign-in cancelled (code: ${result.resultCode}, error: $errorCode). Please try again."
+            onSignInError(errorMessage!!)
         }
     }
 
@@ -74,7 +76,7 @@ fun GoogleSignInScreen(
         verticalArrangement = Arrangement.Center
     ) {
         Icon(
-            Icons.Default.Security,
+            Icons.Default.Person,
             contentDescription = null,
             modifier = Modifier.size(80.dp),
             tint = MaterialTheme.colorScheme.primary
@@ -130,13 +132,14 @@ fun GoogleSignInScreen(
 
         Spacer(modifier = Modifier.height(32.dp))
 
-        if (errorMessage != null) {
+        val displayError = errorMessage ?: oauthError
+        if (displayError != null) {
             Card(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
                 modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)
             ) {
                 Text(
-                    text = errorMessage!!,
+                    text = displayError!!,
                     modifier = Modifier.padding(12.dp),
                     color = MaterialTheme.colorScheme.onErrorContainer,
                     fontSize = 13.sp
