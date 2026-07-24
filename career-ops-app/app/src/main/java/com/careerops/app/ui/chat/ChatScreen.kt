@@ -3,6 +3,9 @@ package com.careerops.app.ui.chat
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.systemBars
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -62,9 +65,11 @@ fun ChatScreen(
     }
 
     Scaffold(
+        contentWindowInsets = WindowInsets.systemBars,
         topBar = {
             TopAppBar(
                 title = { Text("career-ops", fontWeight = FontWeight.Bold) },
+                windowInsets = TopAppBarDefaults.windowInsets,
                 actions = {
                     IconButton(onClick = onNavigateToDashboard) {
                         Icon(Icons.Default.Home, contentDescription = "Dashboard")
