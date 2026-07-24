@@ -40,16 +40,17 @@ fun ChatScreen(
     val debugLog = viewModel.debugLog
     val responseTimes = viewModel.responseTimes
     val streamingText by viewModel.streamingText.collectAsState()
+    val progressText by viewModel.progressText.collectAsState()
     var inputText by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
     val debugListState = rememberLazyListState()
     val focusManager = LocalFocusManager.current
 
     // Auto-scroll when new messages arrive or streaming text updates
-    LaunchedEffect(messages.size, streamingText.length) {
-        if (messages.isNotEmpty() || streamingText.isNotEmpty()) {
+    LaunchedEffect(messages.size, streamingText.length, progressText.length) {
+        if (messages.isNotEmpty() || streamingText.isNotEmpty() || progressText.isNotEmpty()) {
             listState.animateScrollToItem(
-                if (streamingText.isNotEmpty()) messages.size else messages.size - 1
+                if (streamingText.isNotEmpty() || progressText.isNotEmpty()) messages.size else messages.size - 1
             )
         }
     }
@@ -222,6 +223,12 @@ fun ChatScreen(
                             StreamingBubble(streamingText)
                         }
                     }
+                    // Progress indicator
+                    if (progressText.isNotEmpty() && streamingText.isEmpty()) {
+                        item(key = "progress") {
+                            ProgressBubble(progressText)
+                        }
+                    }
                 }
                 }
             }
@@ -326,6 +333,33 @@ fun StreamingBubble(text: String) {
                         color = MaterialTheme.colorScheme.onSurface
                     )
                 }
+            }
+        }
+    }
+}
+
+@Composable
+fun ProgressBubble(text: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Start
+    ) {
+        Surface(
+            shape = RoundedCornerShape(16.dp, 16.dp, 16.dp, 4.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+            modifier = Modifier.fillMaxWidth(0.5f)
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 1.5.dp)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = text,
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
     }

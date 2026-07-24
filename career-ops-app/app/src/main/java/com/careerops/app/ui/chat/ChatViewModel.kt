@@ -106,6 +106,9 @@ class ChatViewModel @Inject constructor(
     private val _streamingText = MutableStateFlow("")
     val streamingText: StateFlow<String> = _streamingText.asStateFlow()
 
+    private val _progressText = MutableStateFlow("")
+    val progressText: StateFlow<String> = _progressText.asStateFlow()
+
     private var currentSessionId: String? = null
 
     init {
@@ -175,6 +178,7 @@ class ChatViewModel @Inject constructor(
                 // Capture streaming text before clearing
                 val streamedContent = _streamingText.value
                 _streamingText.value = ""
+                _progressText.value = ""
 
                 removeTyping()
                 currentSessionId = streamResult.sessionId
@@ -282,6 +286,7 @@ class ChatViewModel @Inject constructor(
             } catch (e: Exception) {
                 removeTyping()
                 _streamingText.value = ""
+                _progressText.value = ""
                 val elapsed = System.currentTimeMillis() - startTime
                 val errorMsg = "${e.javaClass.simpleName}: ${e.message}"
                 addDebug(DebugEntry("error", "$errorMsg (${elapsed}ms)"))
@@ -300,6 +305,7 @@ class ChatViewModel @Inject constructor(
             } finally {
                 isProcessing = false
                 _streamingText.value = ""
+                _progressText.value = ""
                 trimMessages()
             }
         }
@@ -347,14 +353,21 @@ class ChatViewModel @Inject constructor(
                                     val delta = json.optString("text", "")
                                     if (delta.isNotEmpty()) {
                                         textBuilder.append(delta)
-                                        // Emit incremental update for live UI rendering
                                         _streamingText.value = textBuilder.toString()
                                     }
                                 }
+                                "progress" -> {
+                                    _progressText.value = json.optString("text", "")
+                                }
+                                "connected" -> {
+                                    _progressText.value = "Connected..."
+                                }
                                 "done" -> {
+                                    _progressText.value = ""
                                     sessionId = json.optString("sessionId", sessionId)
                                 }
                                 "error" -> {
+                                    _progressText.value = ""
                                     error = json.optString("error", "Unknown error")
                                 }
                             }

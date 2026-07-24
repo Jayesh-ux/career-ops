@@ -3206,7 +3206,7 @@ app.post('/chat/stream', async (req, res) => {
         idleCount = 0;
         if (pollCount % 4 === 0) {
           console.log(`[chat/stream] Working... ${Math.round(pollCount * POLL_MS / 1000)}s (${st})`);
-          send('text_delta', { text: `\n...working (${Math.round(pollCount * POLL_MS / 1000)}s)...\n` });
+          send('progress', { text: `Working... ${Math.round(pollCount * POLL_MS / 1000)}s` });
         }
         continue;
       }
