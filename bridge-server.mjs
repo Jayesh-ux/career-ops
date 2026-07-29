@@ -2225,6 +2225,7 @@ app.get('/scan/stream', async (req, res) => {
       send('start', { totalPortals: playwrightFailed.length, phase: 'playwright' });
       
       let chromium;
+      let playwrightAvailable = true;
       try {
         const pw = await import('playwright');
         chromium = pw.chromium;
@@ -2233,8 +2234,48 @@ app.get('/scan/stream', async (req, res) => {
           const pw = await import('playwright-core');
           chromium = pw.chromium;
         } catch {
-          send('progress', { completed: playwrightFailed.length, total: playwrightFailed.length, current: 'Playwright not available', found: results.length, error: 'playwright not installed' });
+          playwrightAvailable = false;
         }
+      }
+      
+      // If Playwright isn't available locally, try remote proxy
+      const remotePwUrl = process.env.REMOTE_PLAYWRIGHT_URL;
+      if (!playwrightAvailable && remotePwUrl) {
+        for (const entry of playwrightFailed.slice(0, 10)) {
+          try {
+            const resp = await fetch(`${remotePwUrl}/playwright/scrape`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ url: entry.careers_url }),
+              signal: AbortSignal.timeout(30000),
+            });
+            if (resp.ok) {
+              const data = await resp.json();
+              if (data.success && Array.isArray(data.links)) {
+                for (const link of data.links) {
+                  const title = (link.title || '').toLowerCase();
+                  const href = link.url;
+                  if (!href || keywordMatched.some(r => r.url === href)) continue;
+                  const matchesKeyword = kw.length === 0 || kw.some(k => title.includes(k));
+                  if (!matchesKeyword) continue;
+                  const entry2 = { company: entry.name || '', role: link.title, location: entry.location || '', url: href, matched: true, source: 'remote-playwright', notes: entry.notes || '' };
+                  keywordMatched.push(entry2);
+                  const companyLoc = (entry.location || '').toLowerCase();
+                  const matchesLoc = locs.length === 0 || locs.some(l => companyLoc.includes(l));
+                  if (matchesLoc && !results.some(r => r.url === href)) {
+                    results.push(entry2);
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            // Portal failed — continue
+          }
+          completed++;
+          send('progress', { completed, total: totalPortals, current: `${entry.name} (remote)`, found: results.length, phase: 'playwright' });
+        }
+      } else if (!playwrightAvailable) {
+        send('progress', { completed: playwrightFailed.length, total: playwrightFailed.length, current: 'Playwright not available', found: results.length, error: 'playwright not installed, set REMOTE_PLAYWRIGHT_URL in .bridge.env to use a remote server' });
       }
       
       if (chromium) {
