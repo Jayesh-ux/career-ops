@@ -31,8 +31,15 @@ import { randomUUID } from 'node:crypto';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PDF_PAGE_MARGIN = '0.6in';
 
+// --user-dir overrides base directory for multi-user isolation
+let _baseDir = __dirname;
+const _userDirIdx = process.argv.indexOf('--user-dir');
+if (_userDirIdx !== -1 && process.argv[_userDirIdx + 1]) {
+  _baseDir = process.argv[_userDirIdx + 1];
+}
+
 // Ensure output directory exists (fresh setup)
-mkdirSync(resolve(__dirname, 'output'), { recursive: true });
+mkdirSync(resolve(_baseDir, 'output'), { recursive: true });
 
 /**
  * Normalize text for ATS compatibility by converting problematic Unicode.
@@ -213,7 +220,7 @@ export function validateCvSectionOrder(html, cvMarkdown, { allowReorder = false 
  */
 export function repoRelativeManifestPath(pathValue) {
   if (!pathValue) return '';
-  const rel = relative(__dirname, resolve(pathValue));
+  const rel = relative(_baseDir, resolve(pathValue));
   if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) return '';
   return rel.split(sep).join('/');
 }
@@ -245,8 +252,8 @@ export function injectPrintPageCss(html, format = 'a4') {
  * gitignored output/ artifacts and is meaningless on another machine.
  */
 function updatePDFManifest(reportNum, pdfPath, htmlPath, format) {
-  const manifestPath = resolve(__dirname, 'data', 'pdf-index.tsv');
-  const toRel = (p) => relative(__dirname, p).split(sep).join('/');
+  const manifestPath = resolve(_baseDir, 'data', 'pdf-index.tsv');
+  const toRel = (p) => relative(_baseDir, p).split(sep).join('/');
   const relPDF = toRel(pdfPath);
   const relHTML = repoRelativeManifestPath(htmlPath);
   const date = new Date().toISOString().slice(0, 10);
@@ -323,10 +330,10 @@ async function generatePDF() {
 
   // Path-traversal guard: keep the PDF write inside the project directory so a
   // crafted output argument (e.g. "../../etc/cron.d/x") can't escape the repo.
-  // Anchored to the repo root (__dirname), not process.cwd(): running the script
+  // Anchored to the repo root (_baseDir), not process.cwd(): running the script
   // from outside the repo used to falsely refuse in-repo outputs — and, worse,
   // would have allowed writes anywhere under an arbitrary cwd.
-  const relOut = relative(__dirname, outputPath);
+  const relOut = relative(_baseDir, outputPath);
   if (relOut === '' || relOut.startsWith('..') || isAbsolute(relOut)) {
     console.error(`Refusing to write the PDF outside the project directory: ${outputPath}`);
     process.exit(1);
@@ -346,7 +353,7 @@ async function generatePDF() {
   let html = await readFile(inputPath, 'utf-8');
   let cvMarkdown = '';
   try {
-    cvMarkdown = await readFile(resolve(__dirname, 'cv.md'), 'utf-8');
+    cvMarkdown = await readFile(resolve(_baseDir, 'cv.md'), 'utf-8');
   } catch (err) {
     if (err?.code !== 'ENOENT') throw err;
   }
@@ -380,7 +387,7 @@ async function generatePDF() {
 export async function inlineLocalFonts(html) {
   const FONT_REF = /url\(\s*(['"]?)\.\/fonts\/([^'")\s]+)\1\s*\)/g;
   const MIME = { woff2: 'font/woff2', woff: 'font/woff', otf: 'font/otf', ttf: 'font/ttf' };
-  const fontsDir = resolve(__dirname, 'fonts');
+  const fontsDir = resolve(_baseDir, 'fonts');
   const names = [...new Set([...html.matchAll(FONT_REF)].map((m) => m[2]))];
   const dataUrls = new Map();
   for (const name of names) {

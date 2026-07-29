@@ -823,6 +823,35 @@ search_queries:
 # company_aliases:
 #   Fin: [Intercom]
 
+  # ── India job portals (Naukri, Indeed IN, TimesJobs, LinkedIn IN) ──────────
+  - name: Naukri — Full Stack Developer Mumbai
+    query: 'site:naukri.com "Full Stack Developer" OR "Software Engineer" OR "Frontend Developer" Mumbai OR Kalyan OR Thane OR "Navi Mumbai"'
+    enabled: true
+
+  - name: Naukri — Full Stack Developer Bengaluru
+    query: 'site:naukri.com "Full Stack Developer" OR "Software Engineer" Bengaluru OR Bangalore OR Hyderabad OR Pune'
+    enabled: true
+
+  - name: Indeed India — Full Stack Developer
+    query: 'site:indeed.co.in "Full Stack Developer" OR "Software Engineer" OR "Frontend Developer" Mumbai OR Bengaluru OR Pune OR Hyderabad'
+    enabled: true
+
+  - name: TimesJobs — Full Stack Developer
+    query: 'site:timesjobs.com "Full Stack Developer" OR "Software Engineer" OR "Frontend Developer" Mumbai OR Kalyan OR Thane OR Pune'
+    enabled: true
+
+  - name: LinkedIn India — Full Stack Developer
+    query: 'site:linkedin.com/jobs "Full Stack Developer" OR "Software Engineer" India Mumbai OR Kalyan OR Thane OR "Navi Mumbai"'
+    enabled: true
+
+  - name: Foundit India (formerly Monster) — Full Stack
+    query: 'site:foundit.in OR site:monsterindia.com "Full Stack Developer" OR "Software Engineer" Mumbai OR Kalyan OR Thane'
+    enabled: true
+
+  - name: Cutshort — Full Stack Developer India
+    query: 'site:cutshort.com "Full Stack Developer" OR "Software Engineer" OR "Frontend Developer" Mumbai OR Bengaluru OR Pune'
+    enabled: true
+
 tracked_companies:
 
   # -- AI Labs & LLM providers --
@@ -1746,7 +1775,373 @@ job_boards:
   #   68 = Higher Education, 64 = Educational Administration, 22 = Career Development
   # Full list: https://www.higheredjobs.com/rss/
 
-  # - name: HigherEdJobs — Higher Education
-  #   provider: higheredjobs
-  #   cat_id: 68
-  #   enabled: true
+  # ── Indian companies with detectable ATS providers ────────────────────
+  # These use Greenhouse/Lever/Ashby APIs — zero-token, auto-detected.
+
+  - name: Zomato
+    careers_url: https://careers.smartrecruiters.com/Zomato1
+    notes: "Indian food delivery (SmartRecruiters ATS) — engineering roles in Gurgaon/Bangalore"
+
+  - name: Groww
+    careers_url: https://job-boards.greenhouse.io/groww
+    notes: "Indian fintech (Greenhouse ATS) — full stack, backend, frontend in Bengaluru"
+
+  - name: Razorpay
+    careers_url: https://job-boards.greenhouse.io/razorpaysoftwareprivatelimited
+    notes: "Indian payments (Greenhouse ATS) — engineering roles in Bengaluru"
+
+  - name: Meesho
+    careers_url: https://jobs.lever.co/meesho
+    notes: "Indian e-commerce (Lever ATS) — Bengaluru"
+
+  - name: ShareChat (Mohalla Tech)
+    careers_url: https://jobs.lever.co/sharechat
+    notes: "Indian social media (Lever ATS) — Bengaluru"
+
+  - name: Postman
+    careers_url: https://job-boards.greenhouse.io/postman
+    notes: "API platform (Greenhouse ATS) — engineering roles in Bengaluru, SF, Pune, Austin"
+
+  - name: Freshworks
+    careers_url: https://jobs.lever.co/freshworks
+    notes: "Indian SaaS (Lever ATS) — Chennai, Bengaluru"
+
+  - name: Chargebee
+    careers_url: https://jobs.lever.co/chargebee
+    notes: "Indian SaaS subscription billing (Lever ATS) — Chennai, Bengaluru, remote"
+
+  - name: BrowserStack
+    careers_url: https://www.browserstack.com/careers
+    scan_method: websearch
+    notes: "DevTools — engineering roles in Mumbai, Dublin"
+
+  - name: Wingify (VWO)
+    careers_url: https://wingify.com/careers
+    scan_method: websearch
+    notes: "A/B testing SaaS — engineering in New Delhi, remote"
+
+  - name: Dukaan
+    careers_url: https://mydukaan.io/careers
+    scan_method: websearch
+    notes: "Indian e-commerce D2C — full stack in Bengaluru"
+
+  - name: Hasura
+    careers_url: https://hasura.io/careers
+    scan_method: websearch
+    notes: "GraphQL engine — engineering in Bengaluru, SF, remote"
+
+  - name: Appsmith
+    careers_url: https://www.appsmith.com/careers
+    scan_method: websearch
+    notes: "Low-code platform — engineering in Bengaluru, remote"
+
+  - name: SignEasy (acquired)
+    careers_url: https://signeasy.com/careers
+    scan_method: websearch
+    notes: "E-signature SaaS — engineering in Bengaluru"
+
+  - name: Cashfree
+    careers_url: https://www.cashfree.com/careers
+    scan_method: websearch
+    notes: "Indian payments — engineering in Bengaluru"
+
+  - name: Jupiter (jupiter.money)
+    careers_url: https://jupiter.money/careers
+    scan_method: websearch
+    notes: "Indian neobank — engineering in Bengaluru"
+
+  - name: slice
+    careers_url: https://www.sliceit.com/careers
+    scan_method: websearch
+    notes: "Indian fintech (credit card) — engineering in Bengaluru"
+
+  - name: Uni Cards
+    careers_url: https://www.uni.cards/careers
+    scan_method: websearch
+    notes: "Indian fintech — engineering in Bengaluru"
+
+  - name: NiYO Solutions
+    careers_url: https://niyo.com/careers
+    scan_method: websearch
+    notes: "Indian fintech (payroll/expense) — engineering in Bengaluru"
+
+  - name: Jar (jar.app)
+    careers_url: https://www.myjar.app/careers
+    scan_method: websearch
+    notes: "Indian fintech (savings/investments) — engineering in Bengaluru"
+
+  - name: CredAvenue
+    careers_url: https://www.credavenue.com/careers
+    scan_method: websearch
+    notes: "Indian debt marketplace — engineering in Chennai, Bengaluru"
+
+  - name: Upstox
+    careers_url: https://jobs.lever.co/upstox
+    notes: "Indian discount broking (Lever ATS) — engineering in Mumbai, Bengaluru"
+
+  - name: Angel One (Angel Broking)
+    careers_url: https://www.angelone.in/careers
+    scan_method: websearch
+    notes: "Indian discount broking — engineering in Bengaluru, Mumbai"
+
+  - name: Zerodha
+    careers_url: https://zerodha.com/careers
+    scan_method: websearch
+    notes: "Indian discount broking — engineering in Bengaluru"
+
+  - name: Nykaa
+    careers_url: https://www.nykaa.com/careers
+    scan_method: websearch
+    notes: "Indian e-commerce beauty — engineering in Mumbai, Bengaluru"
+
+  - name: Urban Company
+    careers_url: https://careers.urbancompany.com
+    scan_method: websearch
+    notes: "Indian home services — engineering in Gurgaon, Bengaluru"
+
+  - name: Swiggy
+    careers_url: https://www.swiggy.com/careers
+    scan_method: websearch
+    notes: "Indian food delivery — engineering in Bengaluru"
+
+  - name: Ola
+    careers_url: https://ola.com/careers
+    scan_method: websearch
+    notes: "Indian mobility — engineering in Bengaluru"
+
+  - name: Ola Electric
+    careers_url: https://olaelectric.com/careers
+    scan_method: websearch
+    notes: "Indian EV — engineering in Bengaluru, Tamil Nadu"
+
+  - name: Flipkart
+    careers_url: https://www.flipkartcareers.com
+    scan_method: websearch
+    notes: "Indian e-commerce — engineering in Bengaluru"
+
+  - name: Myntra
+    careers_url: https://www.myntra.com/careers
+    scan_method: websearch
+    notes: "Indian fashion e-commerce — engineering in Bengaluru"
+
+  - name: PharmEasy
+    careers_url: https://pharmeasy.in/careers
+    scan_method: websearch
+    notes: "Indian healthtech — engineering in Mumbai, Bengaluru"
+
+  - name: Tata 1mg
+    careers_url: https://www.1mg.com/careers
+    scan_method: websearch
+    notes: "Indian healthtech — engineering in Gurgaon"
+
+  - name: Practo
+    careers_url: https://www.practo.com/careers
+    scan_method: websearch
+    notes: "Indian healthtech — engineering in Bengaluru"
+
+  - name: BookMyShow
+    careers_url: https://careers.bookmyshow.com
+    scan_method: websearch
+    notes: "Indian entertainment ticketing — engineering in Mumbai, Bengaluru"
+
+  - name: Dream11
+    careers_url: https://jobs.lever.co/dreamsports
+    notes: "Indian fantasy sports (Lever ATS) — engineering in Mumbai, Bengaluru"
+
+  - name: Paytm
+    careers_url: https://jobs.lever.co/paytm
+    notes: "Indian fintech (Lever ATS) — engineering in Noida, Bengaluru"
+
+  - name: Unacademy
+    careers_url: https://unacademy.com/careers
+    scan_method: websearch
+    notes: "Indian edtech — engineering in Bengaluru"
+
+  - name: upGrad
+    careers_url: https://www.upgrad.com/careers
+    scan_method: websearch
+    notes: "Indian edtech — engineering in Mumbai, Bengaluru"
+
+  - name: Byju's
+    careers_url: https://byjus.com/careers
+    scan_method: websearch
+    notes: "Indian edtech — engineering in Bengaluru"
+
+  - name: Physics Wallah
+    careers_url: https://www.pw.live/careers
+    scan_method: websearch
+    notes: "Indian edtech — engineering in Noida, Bengaluru"
+
+  - name: Delhivery
+    careers_url: https://www.delhivery.com/careers
+    scan_method: websearch
+    notes: "Indian logistics — engineering in Gurgaon, Bengaluru"
+
+  - name: Shadowfax
+    careers_url: https://shadowfax.in/careers
+    scan_method: websearch
+    notes: "Indian logistics — engineering in Bengaluru"
+
+  - name: Porter
+    careers_url: https://porter.in/careers
+    scan_method: websearch
+    notes: "Indian logistics (intra-city) — engineering in Bengaluru"
+
+  - name: Rivigo
+    careers_url: https://rivigo.com/careers
+    scan_method: websearch
+    notes: "Indian logistics (trucking) — engineering in Gurgaon"
+
+  - name: BlackBuck
+    careers_url: https://www.blackbuck.com/careers
+    scan_method: websearch
+    notes: "Indian logistics (trucking platform) — engineering in Bengaluru"
+
+  - name: XpressBees
+    careers_url: https://www.xpressbees.com/careers
+    scan_method: websearch
+    notes: "Indian logistics — engineering in Pune, Bengaluru"
+
+  - name: Ecom Express
+    careers_url: https://www.ecomexpress.in/careers
+    scan_method: websearch
+    notes: "Indian logistics — engineering in Gurgaon"
+
+  # ── Indian companies with Greenhouse ATS (Mumbai/Pune region) ──────
+  - name: Prodigal
+    careers_url: https://job-boards.greenhouse.io/prodigal
+    api: https://boards-api.greenhouse.io/v1/boards/prodigal/jobs
+    enabled: true
+    notes: "Mumbai (Powai) — AI-powered debt collection platform"
+  - name: Blenheim Chalcot India
+    careers_url: https://job-boards.greenhouse.io/blenheimchalcotindia
+    api: https://boards-api.greenhouse.io/v1/boards/blenheimchalcotindia/jobs
+    enabled: true
+    notes: "Mumbai (Andheri East), Navi Mumbai — digital venture builder"
+  - name: AppDirect India
+    careers_url: https://job-boards.greenhouse.io/appdirect
+    api: https://boards-api.greenhouse.io/v1/boards/appdirect/jobs
+    enabled: true
+    notes: "Pune — cloud commerce platform"
+  - name: DoorDash India
+    careers_url: https://job-boards.greenhouse.io/doordashindia
+    api: https://boards-api.greenhouse.io/v1/boards/doordashindia/jobs
+    enabled: true
+    notes: "Pune — delivery logistics engineering hub"
+  - name: Addepar India
+    careers_url: https://job-boards.greenhouse.io/addepar1
+    api: https://boards-api.greenhouse.io/v1/boards/addepar1/jobs
+    enabled: true
+    notes: "Pune — wealth management platform"
+  - name: KRAFTON INDIA
+    careers_url: https://job-boards.greenhouse.io/kraftonindia
+    api: https://boards-api.greenhouse.io/v1/boards/kraftonindia/jobs
+    enabled: true
+    notes: "Pune — gaming (BGMI) + fintech UPI"
+  - name: Liberis
+    careers_url: https://job-boards.greenhouse.io/liberis
+    api: https://boards-api.greenhouse.io/v1/boards/liberis/jobs
+    enabled: true
+    notes: "Mumbai (Andheri East) — embedded business finance"
+  - name: Eltropy
+    careers_url: https://job-boards.greenhouse.io/eltropyinc
+    api: https://boards-api.greenhouse.io/v1/boards/eltropyinc/jobs
+    enabled: true
+    notes: "Pune / Bengaluru — AI-powered credit union platform"
+  - name: Capco India
+    careers_url: https://job-boards.greenhouse.io/capco
+    api: https://boards-api.greenhouse.io/v1/boards/capco/jobs
+    enabled: true
+    notes: "Pune / Mumbai — financial services consulting"
+  - name: PhonePe India
+    careers_url: https://job-boards.greenhouse.io/phonepe
+    api: https://boards-api.greenhouse.io/v1/boards/phonepe/jobs
+    enabled: true
+    notes: "Bengaluru HQ, Pune office — payments fintech"
+  - name: Ridecell India
+    careers_url: https://job-boards.greenhouse.io/ridecell
+    api: https://boards-api.greenhouse.io/v1/boards/ridecell/jobs
+    enabled: true
+    notes: "Pune — mobility/fleet automation"
+  - name: Guidepoint India
+    careers_url: https://job-boards.greenhouse.io/guidepoint
+    api: https://boards-api.greenhouse.io/v1/boards/guidepoint/jobs
+    enabled: true
+    notes: "Pune — expert network services"
+  - name: Nerdy India
+    careers_url: https://job-boards.greenhouse.io/nerdy
+    api: https://boards-api.greenhouse.io/v1/boards/nerdy/jobs
+    enabled: true
+    notes: "Pune — edtech (Varsity Tutors)"
+  - name: 66degrees India
+    careers_url: https://job-boards.greenhouse.io/66degrees
+    api: https://boards-api.greenhouse.io/v1/boards/66degrees/jobs
+    enabled: true
+    notes: "Pune / Bengaluru — Google Cloud consulting"
+
+  # ── Indian companies with Lever ATS (Mumbai/Pune region) ──────────
+  - name: Dream Sports
+    careers_url: https://jobs.lever.co/dreamsports
+    api: https://api.lever.co/v0/postings/dreamsports
+    enabled: true
+    notes: "Mumbai — parent company of Dream11, FanCode"
+  - name: Paytm
+    careers_url: https://jobs.lever.co/paytm
+    api: https://api.lever.co/v0/postings/paytm
+    enabled: true
+    notes: "Mumbai / Pune — payments fintech"
+  - name: Mindtickle
+    careers_url: https://jobs.lever.co/mindtickle
+    api: https://api.lever.co/v0/postings/mindtickle
+    enabled: true
+    notes: "Pune — sales enablement platform"
+  - name: Mactores
+    careers_url: https://jobs.lever.co/mactores
+    api: https://api.lever.co/v0/postings/mactores
+    enabled: true
+    notes: "Mumbai — data engineering & AI consultancy"
+  - name: ION Group India
+    careers_url: https://jobs.lever.co/ion
+    api: https://api.lever.co/v0/postings/ion
+    enabled: true
+    notes: "Mumbai / Pune — financial trading software"
+  - name: Nium
+    careers_url: https://jobs.lever.co/nium
+    api: https://api.lever.co/v0/postings/nium
+    enabled: true
+    notes: "Mumbai — cross-border payments infra"
+  - name: Pattern India
+    careers_url: https://jobs.lever.co/pattern
+    api: https://api.lever.co/v0/postings/pattern
+    enabled: true
+    notes: "Pune — e-commerce marketplace SaaS"
+  - name: FloQast India
+    careers_url: https://jobs.lever.co/floqast
+    api: https://api.lever.co/v0/postings/floqast
+    enabled: true
+    notes: "Pune — accounting/finance automation"
+  - name: Aleph India
+    careers_url: https://jobs.lever.co/aleph
+    api: https://api.lever.co/v0/postings/aleph
+    enabled: true
+    notes: "Mumbai — adtech platform (crypto.com, spotify ads)"
+  - name: Dun & Bradstreet India
+    careers_url: https://jobs.lever.co/dnb
+    api: https://api.lever.co/v0/postings/dnb
+    enabled: true
+    notes: "Navi Mumbai (Turbhe) — business data analytics"
+  - name: Brillio India
+    careers_url: https://jobs.lever.co/brillio-2
+    api: https://api.lever.co/v0/postings/brillio-2
+    enabled: true
+    notes: "Pune — digital transformation services"
+  - name: Smart Working Solutions
+    careers_url: https://jobs.lever.co/smart-working-solutions
+    api: https://api.lever.co/v0/postings/smart-working-solutions
+    enabled: true
+    notes: "India / Pune / Mumbai — AI training & full-stack dev"
+  - name: Glance (InMobi)
+    careers_url: https://job-boards.greenhouse.io/glance
+    api: https://boards-api.greenhouse.io/v1/boards/glance/jobs
+    enabled: true
+    notes: "Bengaluru — lock screen content platform (InMobi)"

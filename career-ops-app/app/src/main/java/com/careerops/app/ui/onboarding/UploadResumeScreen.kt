@@ -35,8 +35,7 @@ fun UploadResumeScreen(
     email: String,
     api: CareerOpsApi,
     userPrefs: UserPrefs,
-    onUploadSuccess: (name: String, skills: List<String>) -> Unit,
-    onSkip: () -> Unit
+    onUploadSuccess: (name: String, skills: List<String>) -> Unit
 ) {
     val context = LocalContext.current
     var selectedUri by remember { mutableStateOf<Uri?>(null) }
@@ -226,12 +225,6 @@ fun UploadResumeScreen(
                     Text("Upload & Extract", fontSize = 16.sp)
                 }
             }
-        }
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        TextButton(onClick = onSkip) {
-            Text("Skip for now", color = MaterialTheme.colorScheme.outline)
         }
     }
 }

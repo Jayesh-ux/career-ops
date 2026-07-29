@@ -23,7 +23,12 @@ import { roleFuzzyMatch } from './role-matcher.mjs';
 import { LEGACY_COLMAP, detectColumns, resolveScoreStatus, normalizeVia } from './tracker-parse.mjs';
 import { resolveTrackerPath, trackerLockDirFor, acquireTrackerLock, writeFileAtomic, normalizeCompany, cell } from './tracker-utils.mjs';
 
-const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
+let CAREER_OPS = dirname(fileURLToPath(import.meta.url));
+// --user-dir overrides CAREER_OPS for multi-user isolation
+const _userDirIdx = process.argv.indexOf('--user-dir');
+if (_userDirIdx !== -1 && process.argv[_userDirIdx + 1]) {
+  CAREER_OPS = process.argv[_userDirIdx + 1];
+}
 // Support both layouts: data/applications.md (boilerplate) and applications.md
 // (original). CAREER_OPS_TRACKER overrides the path (used by tests and
 // non-standard layouts). Resolution lives in tracker-utils.mjs so every tracker

@@ -49,6 +49,10 @@ interface CareerOpsApi {
         @Part("email") email: RequestBody
     ): ResumeUploadResponse
 
+    // ── Scan ───────────────────────────────────────────────────
+    @POST("scan")
+    suspend fun scan(@Body request: ScanRequest? = null): ScanResponse
+
     // ── AI: Evaluation & Pipeline ──────────────────────────────
     @POST("auto-pipeline")
     suspend fun autoPipeline(@Body request: AutoPipelineRequest): AutoPipelineResponse
@@ -72,36 +76,7 @@ interface CareerOpsApi {
     @POST("email/classify")
     suspend fun classifyEmail(@Body request: ClassifyRequest): ClassifyResponse
 
-    @POST("email/reply")
-    suspend fun sendReply(@Body request: EmailReplyRequest): Map<String, Any>
-
-    @POST("email/triage")
-    suspend fun triageEmails(@Body body: Map<String, String>): TriageResponse
-
-    @POST("email/credentials")
-    suspend fun saveCredentials(@Body creds: CredentialsRequest): Map<String, Any>
-
-    // ── AI: Outreach & Research ────────────────────────────────
-    @POST("outreach")
-    suspend fun generateOutreach(@Body request: OutreachRequest): OutreachResponse
-
-    @POST("deep")
-    suspend fun deepResearch(@Body request: DeepResearchRequest): DeepResearchResponse
-
-    @POST("interview-prep")
-    suspend fun interviewPrep(@Body request: InterviewPrepRequest): InterviewPrepResponse
-
-    // ── AI: Follow-ups & Replies ───────────────────────────────
-    @POST("followup/draft")
-    suspend fun draftFollowup(@Body request: FollowupDraftRequest): FollowupDraftResponse
-
-    @GET("followups")
-    suspend fun getFollowups(): FollowUpsResponse
-
-    @POST("paste-reply")
-    suspend fun pasteReply(@Body request: PasteReplyRequest): PasteReplyResponse
-
-    // ── Inbox ──────────────────────────────────────────────────
+    // ── Email Inbox ────────────────────────────────────────────
     @GET("email/inbox")
     suspend fun getInbox(
         @Query("email") email: String,
@@ -110,53 +85,40 @@ interface CareerOpsApi {
         @Query("includeSpam") includeSpam: Boolean = false
     ): InboxResponse
 
-    // ── Scanning ───────────────────────────────────────────────
-    @POST("scan")
-    suspend fun scan(@Body request: ScanRequest?): ScanResponse
+    @POST("email/reply")
+    suspend fun draftReply(@Body request: EmailReplyRequest): ReplyDraftResponse
 
-    @GET("scan/stream")
-    suspend fun scanStream(): retrofit2.Response<okhttp3.ResponseBody>
+    @POST("email/reply/send")
+    suspend fun sendReplyDraft(@Body body: Map<String, String>): Map<String, Any>
 
-    @GET("scan-history")
-    suspend fun getScanHistory(): ScanHistoryResponse
+    // ── Spam ───────────────────────────────────────────────────
+    @POST("email/spam/delete")
+    suspend fun deleteSpam(@Body body: Map<String, Any>): Map<String, Any>
 
-    @GET("portals")
-    suspend fun getPortals(): PortalsResponse
-
-    // ── Reports ────────────────────────────────────────────────
-    @GET("reports")
-    suspend fun getReports(): ReportsListResponse
-
-    @GET("reports/{id}")
-    suspend fun getReport(@Path("id") id: String): ReportDetailResponse
-
-    // ── Liveness ───────────────────────────────────────────────
-    @POST("liveness")
-    suspend fun checkLiveness(@Body request: LivenessRequest): LivenessResponse
-
-    // ── PDF & Salary ───────────────────────────────────────────
-    @POST("pdf")
-    suspend fun generatePdf(): PdfResponse
-
-    @GET("salary-gap")
-    suspend fun getSalaryGap(): SalaryGapResponse
-
-    // ── Blacklist ──────────────────────────────────────────────
-    @GET("blacklist")
-    suspend fun getBlacklist(): BlacklistResponse
-
-    @POST("blacklist")
-    suspend fun updateBlacklist(@Body body: Map<String, String>): Map<String, Any>
-
-    // ── Email Sending ──────────────────────────────────────────
+    // ── Email Send ─────────────────────────────────────────────
     @POST("email/send")
     suspend fun sendEmail(@Body request: EmailSendRequest): Map<String, Any>
+
+    // ── Followups ──────────────────────────────────────────────
+    @GET("followups")
+    suspend fun getFollowups(): FollowupResponse
+
+    // ── Liveness ───────────────────────────────────────────────
+    @POST("liveness/check")
+    suspend fun checkLiveness(@Body request: LivenessRequest): LivenessResponse
+
+    // ── Email Triage ───────────────────────────────────────────
+    @POST("email/triage")
+    suspend fun triageEmails(@Body body: Map<String, String>): TriageResponse
 
     // ── Export ─────────────────────────────────────────────────
     @GET("export/{file}")
     suspend fun exportFile(@Path("file") file: String): ExportResponse
 
     // ── Multi-user OAuth ───────────────────────────────────────
+    @POST("auth/google-id-token")
+    suspend fun verifyGoogleIdToken(@Body request: GoogleIdTokenRequest): GoogleIdTokenResponse
+
     @POST("users/{email}/oauth/exchange")
     suspend fun exchangeOAuth(
         @Path("email") email: String,

@@ -61,10 +61,28 @@ class UserPrefs(context: Context) {
         get() = prefs.getBoolean("automation_running", false)
         set(value) = prefs.edit().putBoolean("automation_running", value).apply()
 
+    var pendingEvents: String
+        get() = prefs.getString("pending_events", "") ?: ""
+        set(value) = prefs.edit().putString("pending_events", value).apply()
+
     val isLoggedIn: Boolean
-        get() = userEmail.isNotEmpty() && refreshToken.isNotEmpty()
+        get() = userEmail.isNotEmpty()
 
     fun clear() {
         prefs.edit().clear().apply()
+    }
+
+    fun saveChatHistory(json: String, context: Context) {
+        try {
+            context.openFileOutput("chat_history.json", Context.MODE_PRIVATE).use { out ->
+                out.write(json.toByteArray())
+            }
+        } catch (_: Exception) {}
+    }
+
+    fun loadChatHistory(context: Context): String {
+        return try {
+            context.openFileInput("chat_history.json").bufferedReader().use { it.readText() }
+        } catch (_: Exception) { "" }
     }
 }

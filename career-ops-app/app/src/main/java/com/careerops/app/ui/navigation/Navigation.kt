@@ -13,6 +13,7 @@ import androidx.compose.ui.Modifier
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import com.careerops.app.data.model.GoogleIdTokenRequest
 import com.careerops.app.data.model.OAuthExchangeRequest
 import com.careerops.app.data.remote.CareerOpsApi
 import com.careerops.app.ui.chat.ChatScreen
@@ -58,36 +59,66 @@ fun CareerOpsNavHost(
 
             GoogleSignInScreen(
                 oauthError = oauthError,
-                onSignInSuccess = { email, authCode ->
-                    userPrefs.userEmail = email
-                    // Static bridge token — must match BRIDGE_TOKEN in .bridge.env on server
+                onSignInSuccess = { email, authToken ->
                     if (userPrefs.bridgeToken.isEmpty()) {
                         userPrefs.bridgeToken = BuildConfig.BRIDGE_TOKEN
                     }
                     oauthError = null
                     scope.launch(Dispatchers.IO) {
                         try {
-                            Log.d(TAG, "Exchanging OAuth code for $email")
-                            val resp = api.exchangeOAuth(
-                                email,
-                                OAuthExchangeRequest(
-                                    code = authCode,
-                                    clientId = "221656652451-5cb11e7qhkkngdjbs6emaiqidt4a93dr.apps.googleusercontent.com"
+                            if (authToken.length > 200) {
+                                // This is an ID token from Credential Manager
+                                Log.d(TAG, "Verifying Google ID token")
+                                val resp = api.verifyGoogleIdToken(
+                                    GoogleIdTokenRequest(idToken = authToken)
                                 )
-                            )
-                            Log.d(TAG, "OAuth exchange response: success=${resp.success}, hasRefreshToken=${resp.hasRefreshToken}")
-                            if (resp.success) {
-                                scope.launch(Dispatchers.Main) {
-                                    navController.navigate(Routes.ONBOARDING_RESUME) {
-                                        popUpTo(Routes.ONBOARDING_GOOGLE) { inclusive = true }
+                                Log.d(TAG, "ID token verify: success=${resp.success}, email=${resp.email}, hasGmailAuth=${resp.hasGmailAuth}")
+                                if (resp.success) {
+                                    userPrefs.userEmail = resp.email
+                                    if (resp.hasGmailAuth) {
+                                        // Already has Gmail access — done
+                                        scope.launch(Dispatchers.Main) {
+                                            val next = if (userPrefs.isOnboarded) Routes.CHAT else Routes.ONBOARDING_RESUME
+                                            navController.navigate(next) {
+                                                popUpTo(Routes.ONBOARDING_GOOGLE) { inclusive = true }
+                                            }
+                                        }
+                                    } else {
+                                        // Needs Gmail OAuth — pass email to WebView flow
+                                        oauthError = "NEEDS_GMAIL_AUTH:${resp.email}"
                                     }
+                                } else {
+                                    oauthError = "Failed to verify Google account."
                                 }
                             } else {
-                                oauthError = "Token exchange failed. Please try again."
+                                // This is an auth code from WebView OAuth
+                                Log.d(TAG, "Exchanging OAuth code")
+                                val resp = api.exchangeOAuth(
+                                    email.ifEmpty { "pending" },
+                                    OAuthExchangeRequest(
+                                        code = authToken,
+                                        clientId = "221656652451-5cb11e7qhkkngdjbs6emaiqidt4a93dr.apps.googleusercontent.com"
+                                    )
+                                )
+                                Log.d(TAG, "OAuth exchange: success=${resp.success}, email=${resp.email}")
+                                if (resp.success) {
+                                    val resolvedEmail = resp.email
+                                    if (!resolvedEmail.isNullOrEmpty()) {
+                                        userPrefs.userEmail = resolvedEmail
+                                    }
+                                    scope.launch(Dispatchers.Main) {
+                                        val next = if (userPrefs.isOnboarded) Routes.CHAT else Routes.ONBOARDING_RESUME
+                                        navController.navigate(next) {
+                                            popUpTo(Routes.ONBOARDING_GOOGLE) { inclusive = true }
+                                        }
+                                    }
+                                } else {
+                                    oauthError = "Token exchange failed. Please try again."
+                                }
                             }
                         } catch (e: Exception) {
-                            Log.e(TAG, "OAuth exchange failed", e)
-                            oauthError = "OAuth exchange failed: ${e.message}"
+                            Log.e(TAG, "Auth flow failed", e)
+                            oauthError = "Auth failed: ${e.message}"
                         }
                     }
                 },
@@ -101,11 +132,6 @@ fun CareerOpsNavHost(
                 api = api,
                 userPrefs = userPrefs,
                 onUploadSuccess = { _, _ ->
-                    navController.navigate(Routes.ONBOARDING_PROFILE) {
-                        popUpTo(Routes.ONBOARDING_RESUME) { inclusive = true }
-                    }
-                },
-                onSkip = {
                     navController.navigate(Routes.ONBOARDING_PROFILE) {
                         popUpTo(Routes.ONBOARDING_RESUME) { inclusive = true }
                     }
@@ -165,6 +191,11 @@ fun CareerOpsNavHost(
         composable(Routes.SETTINGS) {
             SettingsScreen(
                 onBack = { navController.popBackStack() },
+                onReconnectGmail = {
+                    navController.navigate(Routes.ONBOARDING_GOOGLE) {
+                        launchSingleTop = true
+                    }
+                },
                 userPrefs = userPrefs
             )
         }

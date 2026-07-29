@@ -1,0 +1,14 @@
+{
+  "_date": "2026-07-29",
+  "scanDone": false,
+  "triageDone": false,
+  "evaluateDone": false,
+  "followupDone": false,
+  "adaptDone": false,
+  "dailyApps": {
+    "2026-07-28": 0,
+    "2026-07-29": 0
+  },
+  "repliesDrafted": 0,
+  "lastAdapt": "2026-07-28T20:40:55.000Z"
+}

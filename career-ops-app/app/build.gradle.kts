@@ -29,6 +29,8 @@ android {
             storePassword = "android"
             keyAlias = "androiddebugkey"
             keyPassword = "android"
+            isV1SigningEnabled = true
+            isV2SigningEnabled = true
         }
     }
 
@@ -45,6 +47,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            lint {
+                disable += "RemoveWorkManagerInitializer"
+            }
         }
     }
 
@@ -92,6 +97,9 @@ dependencies {
     implementation(libs.kotlinx.serialization)
 
     implementation(libs.play.services.auth)
+    implementation(libs.credentials)
+    implementation(libs.credentials.play.services)
+    implementation(libs.google.id)
     implementation(libs.gson)
     implementation(libs.security.crypto)
     implementation(libs.datastore.preferences)

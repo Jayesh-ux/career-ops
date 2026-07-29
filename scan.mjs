@@ -56,12 +56,31 @@ const parseYaml = yaml.load;
 
 // ── Config ──────────────────────────────────────────────────────────
 
-const PORTALS_PATH = process.env.CAREER_OPS_PORTALS || 'portals.yml';
-const PROFILE_PATH = process.env.CAREER_OPS_PROFILE || 'config/profile.yml';
-const SCAN_HISTORY_PATH = 'data/scan-history.tsv';
-const PIPELINE_PATH = 'data/pipeline.md';
-const APPLICATIONS_PATH = 'data/applications.md';
+// --user-dir overrides paths for multi-user isolation
+let _userDir = null;
+const _userDirIdx = process.argv.indexOf('--user-dir');
+if (_userDirIdx !== -1 && process.argv[_userDirIdx + 1]) {
+  _userDir = process.argv[_userDirIdx + 1];
+}
+
+const PORTALS_PATH = _userDir && require('fs').existsSync(path.join(_userDir, 'portals.yml'))
+  ? path.join(_userDir, 'portals.yml')
+  : (process.env.CAREER_OPS_PORTALS || 'portals.yml');
+const PROFILE_PATH = _userDir ? path.join(_userDir, 'config/profile.yml') : (process.env.CAREER_OPS_PROFILE || 'config/profile.yml');
+const SCAN_HISTORY_PATH = _userDir ? path.join(_userDir, 'data/scan-history.tsv') : 'data/scan-history.tsv';
+const PIPELINE_PATH = _userDir ? path.join(_userDir, 'data/pipeline.md') : 'data/pipeline.md';
+const APPLICATIONS_PATH = _userDir ? path.join(_userDir, 'data/applications.md') : 'data/applications.md';
+const BLACKLIST_PATH = _userDir ? path.join(_userDir, 'data/blacklist.md') : 'data/blacklist.md';
+const SCAN_RUNS_PATH = _userDir ? path.join(_userDir, 'data/scan-runs.tsv') : 'data/scan-runs.tsv';
+const SCAN_PROGRESS_PATH = _userDir ? path.join(_userDir, 'data/scan-progress.json') : 'data/scan-progress.json';
 const PROVIDERS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'providers');
+
+function writeProgress(current, total, portal, found, phase) {
+  try {
+    const data = { current, total, portal, found, phase, ts: Date.now() };
+    writeFileSync(SCAN_PROGRESS_PATH, JSON.stringify(data), 'utf-8');
+  } catch {}
+}
 
 // Ensure required directories exist (fresh setup)
 mkdirSync('data', { recursive: true });
@@ -1066,8 +1085,6 @@ export function appendToScanHistory(offers, date, status = 'added') {
 
 // ── Company blacklist (#1742) ───────────────────────────────────────
 
-const BLACKLIST_PATH = 'data/blacklist.md';
-
 /**
  * Parse the user's do-not-apply list (data/blacklist.md, user layer, opt-in).
  *
@@ -1114,8 +1131,6 @@ export function loadBlacklist(filePath = BLACKLIST_PATH) {
 }
 
 // ── Scan-run persistence (#1604) ────────────────────────────────────
-
-const SCAN_RUNS_PATH = 'data/scan-runs.tsv';
 
 // One row of run counters per non-dry scan — today these numbers are printed
 // once in the summary and lost when the terminal scrolls. Full ISO timestamp
@@ -1436,10 +1451,15 @@ async function main() {
   const errors = [...resolveErrors];
   const emptyTargets = [];
 
+  const totalTargets = targets.length;
+  let completedTargets = 0;
+
   const tasks = targets.map(company => async () => {
     let provider = company._provider;
     const ctx = makeHttpCtx();
     let sourceName = provider.id === 'local-parser' ? 'local-parser' : `${provider.id}-api`;
+    const portalName = company.name || 'unknown';
+    writeProgress(completedTargets, totalTargets, portalName, totalFound, 'providers');
     try {
       let jobs;
       try {
@@ -1553,6 +1573,9 @@ async function main() {
         error: err.message,
         kind: classifyFetchError(err),
       });
+    } finally {
+      completedTargets++;
+      writeProgress(completedTargets, totalTargets, portalName, totalFound, 'providers');
     }
   });
 
@@ -1566,6 +1589,7 @@ async function main() {
   let migratedOffers = [];
   if (verify && newOffers.length > 0) {
     console.log(`\nVerifying liveness of ${newOffers.length} new offer(s) with Playwright (sequential)...`);
+    writeProgress(0, newOffers.length, 'Playwright verification', totalFound, 'verify');
     const result = await verifyOffers(newOffers, { headedFallback, throttleBaseMs, rediscover });
     verifiedOffers = result.verified;
     expiredOffers = result.expired;

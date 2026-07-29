@@ -137,9 +137,11 @@ fun ProfileFormScreen(
 
         Button(
             onClick = {
-                if (name.isBlank()) {
-                    error = "Name is required"
-                    return@Button
+                when {
+                    name.isBlank() -> { error = "Name is required"; return@Button }
+                    targetRoles.isBlank() -> { error = "Target roles are required"; return@Button }
+                    location.isBlank() -> { error = "Location is required"; return@Button }
+                    compensation.isBlank() -> { error = "Salary range is required"; return@Button }
                 }
                 isSaving = true
                 error = null
@@ -177,7 +179,7 @@ fun ProfileFormScreen(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(56.dp),
-            enabled = !isSaving && name.isNotBlank()
+            enabled = !isSaving && name.isNotBlank() && targetRoles.isNotBlank() && location.isNotBlank() && compensation.isNotBlank()
         ) {
             if (isSaving) {
                 CircularProgressIndicator(

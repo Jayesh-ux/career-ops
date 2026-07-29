@@ -11,6 +11,8 @@ import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 @HiltWorker
@@ -167,6 +169,14 @@ class DailyAutomationWorker @AssistedInject constructor(
     }
 
     private fun sendDataNotification(type: String, message: String) {
+        // Also store as pending event for chat display
+        try {
+            val existing = userPrefs.pendingEvents.ifEmpty { "[]" }
+            val arr = JSONArray(existing)
+            arr.put(JSONObject().put("type", type).put("message", message).put("timestamp", System.currentTimeMillis()))
+            userPrefs.pendingEvents = arr.toString()
+        } catch (_: Exception) {}
+
         val data = Data.Builder()
             .putString(KEY_EVENT_TYPE, type)
             .putString(KEY_EVENT_MESSAGE, message)
@@ -182,6 +192,14 @@ class DailyAutomationWorker @AssistedInject constructor(
     }
 
     private fun sendDraftNotification(title: String, body: String) {
+        // Also store as pending event for chat display
+        try {
+            val existing = userPrefs.pendingEvents.ifEmpty { "[]" }
+            val arr = JSONArray(existing)
+            arr.put(JSONObject().put("type", "draft").put("message", "$title\n$body").put("timestamp", System.currentTimeMillis()))
+            userPrefs.pendingEvents = arr.toString()
+        } catch (_: Exception) {}
+
         val data = Data.Builder()
             .putString(KEY_EVENT_TYPE, "draft")
             .putString(KEY_EVENT_MESSAGE, "$title\n$body")

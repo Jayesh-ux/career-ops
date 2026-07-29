@@ -33,8 +33,8 @@ object NetworkModule {
     fun provideOkHttpClient(userPrefs: UserPrefs): OkHttpClient {
         return OkHttpClient.Builder()
             .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(300, TimeUnit.SECONDS)
-            .writeTimeout(60, TimeUnit.SECONDS)
+            .readTimeout(600, TimeUnit.SECONDS)
+            .writeTimeout(120, TimeUnit.SECONDS)
             .addInterceptor { chain ->
                 val original = chain.request()
                 val userId = userPrefs.userEmail

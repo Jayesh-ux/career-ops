@@ -29,10 +29,22 @@ fun ConfirmStartScreen(
     var doctorResult by remember { mutableStateOf<Map<String, Any>?>(null) }
     var setupComplete by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    var hasResume by remember { mutableStateOf(false) }
+    var hasProfile by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         scope.launch {
             try {
+                // Verify resume exists
+                val files = api.getUserFiles(email)
+                hasResume = files.files.any { it.path.contains("cv.md", ignoreCase = true) }
+
+                // Verify profile is complete
+                val profile = api.getProfile()
+                hasProfile = profile.name.isNotEmpty() &&
+                            profile.targetRoles.isNotEmpty() &&
+                            profile.location.isNotEmpty()
+
                 val doctor = api.doctor()
                 doctorResult = mapOf(
                     "onboardingNeeded" to doctor.onboardingNeeded,
@@ -114,8 +126,8 @@ fun ConfirmStartScreen(
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     SetupCheckItem("Google Account", userPrefs.userEmail.isNotEmpty(), userPrefs.userEmail)
-                    SetupCheckItem("Resume", userPrefs.isOnboarded, "Uploaded")
-                    SetupCheckItem("Profile", userPrefs.userName.isNotEmpty(), userPrefs.userName)
+                    SetupCheckItem("Resume", hasResume, if (hasResume) "Uploaded" else "Not uploaded — go back and upload")
+                    SetupCheckItem("Profile", hasProfile, if (hasProfile) userPrefs.userName else "Incomplete — go back and fill all fields")
                     SetupCheckItem("OAuth2 Token", userPrefs.refreshToken.isNotEmpty(), "Configured")
                 }
             }
@@ -141,6 +153,14 @@ fun ConfirmStartScreen(
 
             Button(
                 onClick = {
+                    if (!hasResume) {
+                        error = "Please go back and upload your resume first."
+                        return@Button
+                    }
+                    if (!hasProfile) {
+                        error = "Please go back and complete your profile (name, roles, location, salary)."
+                        return@Button
+                    }
                     scope.launch {
                         try {
                             userPrefs.isOnboarded = true
@@ -152,7 +172,8 @@ fun ConfirmStartScreen(
                 },
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(56.dp)
+                    .height(56.dp),
+                enabled = hasResume && hasProfile
             ) {
                 Text("Confirm & Start", fontSize = 16.sp)
             }

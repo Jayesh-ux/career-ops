@@ -49,6 +49,8 @@
       "batch/send-*": "deny",
       "curl": "deny",
       "curl *": "deny",
+      "curl http://127.0.0.1:8787*": "allow",
+      "curl http://localhost:8787*": "allow",
       "wget": "deny",
       "wget *": "deny",
       "ssh": "deny",

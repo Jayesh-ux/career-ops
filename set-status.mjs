@@ -50,7 +50,12 @@ import {
   writeFileAtomic, loadCanonicalStates, resolveCanonicalState, normalizeCompany, cell,
 } from './tracker-utils.mjs';
 
-const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
+let CAREER_OPS = dirname(fileURLToPath(import.meta.url));
+// --user-dir overrides CAREER_OPS for multi-user isolation
+const _userDirIdx = process.argv.indexOf('--user-dir');
+if (_userDirIdx !== -1 && process.argv[_userDirIdx + 1]) {
+  CAREER_OPS = process.argv[_userDirIdx + 1];
+}
 const STATES_FILE = join(CAREER_OPS, 'templates/states.yml');
 
 const EXIT_OK = 0;

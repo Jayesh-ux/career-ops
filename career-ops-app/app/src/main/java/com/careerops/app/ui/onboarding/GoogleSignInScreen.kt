@@ -1,6 +1,7 @@
 package com.careerops.app.ui.onboarding
 
 import android.app.Activity
+import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
@@ -16,29 +17,59 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.careerops.app.GoogleOAuthActivity
 import com.google.android.gms.auth.api.signin.GoogleSignIn
 import com.google.android.gms.auth.api.signin.GoogleSignInOptions
 import com.google.android.gms.common.api.ApiException
-import android.util.Log
+import com.google.android.gms.common.api.Scope
+import android.util.Log as AndroidLog
+
+private const val TAG = "GoogleSignIn"
+private const val WEB_CLIENT_ID = "221656652451-5cb11e7qhkkngdjbs6emaiqidt4a93dr.apps.googleusercontent.com"
 
 @Composable
 fun GoogleSignInScreen(
     oauthError: String? = null,
-    onSignInSuccess: (email: String, serverAuthCode: String) -> Unit,
+    onSignInSuccess: (email: String, authToken: String) -> Unit,
     onSignInError: (String) -> Unit
 ) {
     val context = LocalContext.current
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    var pendingGmailEmail by remember { mutableStateOf<String?>(null) }
 
     val gso = remember {
         GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
-            .requestServerAuthCode("221656652451-5cb11e7qhkkngdjbs6emaiqidt4a93dr.apps.googleusercontent.com")
+            .requestServerAuthCode(WEB_CLIENT_ID)
             .requestEmail()
+            .requestScopes(
+                Scope("https://www.googleapis.com/auth/gmail.send"),
+                Scope("https://www.googleapis.com/auth/gmail.readonly")
+            )
             .build()
     }
 
     val googleSignInClient = remember { GoogleSignIn.getClient(context, gso) }
+
+    val gmailOAuthLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        isLoading = false
+        if (result.resultCode == Activity.RESULT_OK) {
+            val code = result.data?.getStringExtra("auth_code")
+            if (!code.isNullOrEmpty()) {
+                pendingGmailEmail?.let { email ->
+                    onSignInSuccess(email, code)
+                }
+                pendingGmailEmail = null
+            } else {
+                onSignInError("Authorization failed.")
+            }
+        } else {
+            pendingGmailEmail = null
+            onSignInError("Gmail authorization was cancelled.")
+        }
+    }
 
     val signInLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
@@ -50,23 +81,46 @@ fun GoogleSignInScreen(
                 val account = task.getResult(ApiException::class.java)
                 val email = account?.email ?: ""
                 val serverAuthCode = account?.serverAuthCode ?: ""
+                AndroidLog.d(TAG, "GoogleSignIn OK: email=$email, hasCode=${serverAuthCode.isNotEmpty()}")
                 if (email.isNotEmpty() && serverAuthCode.isNotEmpty()) {
                     onSignInSuccess(email, serverAuthCode)
+                } else if (email.isNotEmpty()) {
+                    onSignInError("NEEDS_GMAIL_AUTH:$email")
                 } else {
-                    errorMessage = "Could not retrieve email from Google account."
+                    onSignInError("Could not retrieve email from Google account.")
                 }
             } catch (e: ApiException) {
-                Log.e("GoogleSignIn", "Sign-in failed: ${e.statusCode}", e)
-                errorMessage = "Google sign-in failed (code: ${e.statusCode}). Please try again."
-                onSignInError(errorMessage!!)
+                AndroidLog.e(TAG, "GoogleSignIn failed: statusCode=${e.statusCode}", e)
+                when (e.statusCode) {
+                    12501, 12500, 16 -> onSignInError("Sign-in was cancelled.")
+                    12502 -> onSignInError("Sign-in timed out. Please try again.")
+                    7 -> onSignInError("Network error. Check your connection.")
+                    8 -> onSignInError("Internal Google error. Please try again later.")
+                    else -> onSignInError("Google sign-in failed (code: ${e.statusCode}). Try again.")
+                }
             }
         } else {
-            val errorCode = result.data?.getIntExtra("googleSignInError", -1) ?: -1
-            Log.e("GoogleSignIn", "Sign-in cancelled, resultCode=${result.resultCode}, errorCode=$errorCode, data=${result.data}")
-            errorMessage = "Sign-in cancelled (code: ${result.resultCode}, error: $errorCode). Please try again."
-            onSignInError(errorMessage!!)
+            onSignInError("Sign-in was cancelled.")
         }
     }
+
+    fun launchGmailOAuth(email: String) {
+        pendingGmailEmail = email
+        isLoading = true
+        val authUri = "https://accounts.google.com/o/oauth2/v2/auth?" +
+            "client_id=$WEB_CLIENT_ID&" +
+            "redirect_uri=https://career-ops.app&" +
+            "response_type=code&" +
+            "scope=openid email https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly&" +
+            "access_type=offline&" +
+            "login_hint=$email&" +
+            "prompt=none"
+        val intent = GoogleOAuthActivity.createIntent(context, authUri)
+        gmailOAuthLauncher.launch(intent)
+    }
+
+    val isNeedsGmailAuth = oauthError?.startsWith("NEEDS_GMAIL_AUTH:") == true
+    val gmailAuthEmail = oauthError?.removePrefix("NEEDS_GMAIL_AUTH:")
 
     Column(
         modifier = Modifier
@@ -132,14 +186,14 @@ fun GoogleSignInScreen(
 
         Spacer(modifier = Modifier.height(32.dp))
 
-        val displayError = errorMessage ?: oauthError
+        val displayError = if (isNeedsGmailAuth) null else (errorMessage ?: oauthError)
         if (displayError != null) {
             Card(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
                 modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)
             ) {
                 Text(
-                    text = displayError!!,
+                    text = displayError,
                     modifier = Modifier.padding(12.dp),
                     color = MaterialTheme.colorScheme.onErrorContainer,
                     fontSize = 13.sp
@@ -147,27 +201,85 @@ fun GoogleSignInScreen(
             }
         }
 
-        Button(
-            onClick = {
-                isLoading = true
-                errorMessage = null
-                googleSignInClient.signOut().addOnCompleteListener {
-                    signInLauncher.launch(googleSignInClient.signInIntent)
+        if (isNeedsGmailAuth) {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer),
+                modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text("Account connected!", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        "Now connect Gmail so we can read and draft emails for you.",
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer
+                    )
                 }
-            },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(56.dp),
-            enabled = !isLoading
-        ) {
-            if (isLoading) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(24.dp),
-                    color = MaterialTheme.colorScheme.onPrimary,
-                    strokeWidth = 2.dp
-                )
-            } else {
-                Text("Sign in with Google", fontSize = 16.sp)
+            }
+            Button(
+                onClick = { gmailAuthEmail?.let { launchGmailOAuth(it) } },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp),
+                enabled = !isLoading
+            ) {
+                if (isLoading) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(24.dp),
+                        color = MaterialTheme.colorScheme.onPrimary,
+                        strokeWidth = 2.dp
+                    )
+                } else {
+                    Text("Connect Gmail", fontSize = 16.sp)
+                }
+            }
+        } else {
+            Button(
+                onClick = {
+                    isLoading = true
+                    errorMessage = null
+                    googleSignInClient.signOut().addOnCompleteListener {
+                        signInLauncher.launch(googleSignInClient.signInIntent)
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp),
+                enabled = !isLoading
+            ) {
+                if (isLoading) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(24.dp),
+                        color = MaterialTheme.colorScheme.onPrimary,
+                        strokeWidth = 2.dp
+                    )
+                } else {
+                    Text("Sign in with Google", fontSize = 16.sp)
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            OutlinedButton(
+                onClick = {
+                    isLoading = true
+                    errorMessage = null
+                    val authUri = "https://accounts.google.com/o/oauth2/v2/auth?" +
+                        "client_id=$WEB_CLIENT_ID&" +
+                        "redirect_uri=https://career-ops.app&" +
+                        "response_type=code&" +
+                        "scope=openid email https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly&" +
+                        "access_type=offline&" +
+                        "prompt=select_account"
+                    val intent = GoogleOAuthActivity.createIntent(context, authUri)
+                    gmailOAuthLauncher.launch(intent)
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp),
+                enabled = !isLoading
+            ) {
+                Text("Use browser sign-in", fontSize = 14.sp)
             }
         }
     }

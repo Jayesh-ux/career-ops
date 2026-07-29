@@ -15,8 +15,9 @@ import { resolveExtractorMode } from './browser-extract.mjs';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const argv = process.argv.slice(2);
 const targetIdx = argv.indexOf('--target');
+const userIdx = argv.indexOf('--user-dir');
 const projectRoot =
-  targetIdx !== -1 && argv[targetIdx + 1] ? argv[targetIdx + 1] : __dirname;
+  (userIdx !== -1 && argv[userIdx + 1]) || (targetIdx !== -1 && argv[targetIdx + 1]) || __dirname;
 const JSON_OUT = argv.includes('--json');
 // --strict adds a live ATS-slug probe of portals.yml (network). Opt-in so the
 // default `npm run doctor` stays fast and fully offline.

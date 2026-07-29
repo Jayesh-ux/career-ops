@@ -465,3 +465,60 @@ Sent 2 applications:
 - User is setting up OAuth2 — once done, all 8 emails can be sent
 
 **Tracker:** Now at 78 entries (3 new pending: #79 Innovista, #80 webkit24, #81 RSVR)
+
+## Daily Search — 2026-07-28
+**Time:** 2026-07-28T17:27:11.873Z
+**Mode:** DRY RUN
+
+### Company Pages Checked
+- Ingram Micro India: ❌ Inactive/Expired
+- TCS Freshers: ❌ Inactive/Expired
+- Infosys Freshers: ❌ Inactive/Expired
+- Wipro Freshers: ✅ Active
+- Accenture India Freshers: ❌ Inactive/Expired
+- Cognizant Freshers: ❌ Inactive/Expired
+- LTIMindtree: ❌ Inactive/Expired
+- Tech Mahindra: ✅ Active
+- HCL Freshers: ❌ Inactive/Expired
+- Capgemini Freshers: ❌ Inactive/Expired
+
+### New Applications Generated (0)
+
+### Already Applied (skipped from re-apply)
+
+---
+
+## Daily Search — 2026-07-28
+**Time:** 2026-07-28T17:59:54.318Z
+**Mode:** FULL
+
+### Company Pages Checked
+- Ingram Micro India: ❌ Inactive/Expired
+- TCS Freshers: ❌ Inactive/Expired
+- Infosys Freshers: ❌ Inactive/Expired
+- Wipro Freshers: ✅ Active
+- Accenture India Freshers: ❌ Inactive/Expired
+- Cognizant Freshers: ❌ Inactive/Expired
+- LTIMindtree: ❌ Inactive/Expired (redirected)
+- Tech Mahindra: ✅ Active
+- HCL Freshers: ❌ Inactive/Expired
+- Capgemini Freshers: ❌ Inactive/Expired
+
+### New Applications Generated (13)
+- ✅ the-red-arc-2026-07-28.eml
+- ✅ scalix-enterprise-solution-llp-2026-07-28.eml
+- ✅ verdantis-technologies-2026-07-28.eml
+- ✅ neosoft-technologies-2026-07-28.eml
+- ✅ lofaz-2026-07-28.eml
+- ✅ olv-technologies-2026-07-28.eml
+- ✅ pillow-tax-2026-07-28.eml
+- ✅ cere-labs-2026-07-28.eml
+- ✅ systenics-solutions-2026-07-28.eml
+- ✅ advin-softwares-2026-07-28.eml
+- ✅ lvlup-labz-2026-07-28.eml
+- ✅ sequelstring-ai-2026-07-28.eml
+- ✅ green-pista-2026-07-28.eml
+
+### Already Applied (skipped from re-apply)
+
+---

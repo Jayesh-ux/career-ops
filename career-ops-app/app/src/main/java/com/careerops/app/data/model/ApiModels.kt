@@ -103,6 +103,18 @@ data class BlacklistResponse(
     val companies: List<String> = emptyList()
 )
 
+data class GoogleIdTokenRequest(
+    val idToken: String
+)
+
+data class GoogleIdTokenResponse(
+    val success: Boolean = false,
+    val email: String = "",
+    val hasGmailAuth: Boolean = false,
+    val name: String = "",
+    val picture: String = ""
+)
+
 data class OAuthExchangeRequest(
     val code: String,
     val clientId: String = "",
@@ -266,6 +278,17 @@ data class BatchResponse(
     val results: List<AutoPipelineResponse> = emptyList()
 )
 
+data class FollowupResponse(
+    val entries: List<FollowupEntry> = emptyList()
+)
+
+data class FollowupEntry(
+    val company: String = "",
+    val role: String = "",
+    val daysSince: Int = 0,
+    val lastContact: String = ""
+)
+
 data class FollowupDraftRequest(
     val company: String,
     val role: String? = null,
@@ -422,10 +445,11 @@ data class PortalsResponse(
 )
 
 data class EmailReplyRequest(
-    val to: String,
-    val subject: String,
-    val body: String,
-    val inReplyTo: String? = null
+    val to: String = "",
+    val subject: String = "",
+    val body: String = "",
+    val inReplyTo: String? = null,
+    val replyType: String? = null
 )
 
 // ── Chat (opencode integration) ─────────────────────────
@@ -482,4 +506,10 @@ data class EmailSendRequest(
     val body: String,
     val company: String? = null,
     val role: String? = null
+)
+
+// ── Reply draft response ─────────────────────────────────────────────
+data class ReplyDraftResponse(
+    val replyBody: String = "",
+    val subject: String = ""
 )
