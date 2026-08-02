@@ -43,6 +43,8 @@ class NotificationWorker @AssistedInject constructor(
             "draft" -> "\uD83D\uDCC3 New Job Match"
             "followups" -> "\u23F0 Follow-up Reminder"
             "interview_active" -> "\uD83C\uDF1F Interview Active"
+            "interview" -> "\uD83C\uDF1F Interview Scheduled"
+            "interview_reminder" -> "\u23F0 Interview Reminder"
             else -> "career-ops Update"
         }
 

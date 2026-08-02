@@ -38,6 +38,7 @@ data class ProfileResponse(
     val phone: String = "",
     val headline: String = "",
     val targetRoles: List<String> = emptyList(),
+    val archetypes: List<String> = emptyList(),
     val location: String = "",
     val compensation: String = ""
 )
@@ -76,6 +77,9 @@ data class InboxResponse(
 )
 
 data class InboxEmail(
+    val id: String = "",
+    val uid: String = "",
+    val gmailId: String = "",
     val from: String = "",
     val subject: String = "",
     val date: String = "",
@@ -168,7 +172,9 @@ data class ScanResult(
     val url: String = "",
     val source: String = "",
     val location: String = "",
-    val salary: String = ""
+    val salary: String = "",
+    val score: String = "",
+    val fit: String = ""
 )
 
 data class AutoPipelineRequest(
@@ -327,10 +333,23 @@ data class ScanRequest(
     val locations: List<String> = emptyList()
 )
 
+data class PortalResult(
+    val company: String = "",
+    val status: String = "",
+    val keywordMatches: Int = 0,
+    val exactMatches: Int = 0,
+    val error: String = ""
+)
+
 data class ScanResponse(
     val results: List<ScanResult> = emptyList(),
     val total: Int = 0,
-    val newFound: Int = 0
+    val newFound: Int = 0,
+    val portalsScanned: Int = 0,
+    val locationExactMatch: Boolean? = null,
+    val portalResults: List<PortalResult> = emptyList(),
+    val wideningSteps: List<String> = emptyList(),
+    val otherLocations: List<ScanResult> = emptyList()
 )
 
 data class LivenessRequest(
@@ -484,19 +503,18 @@ data class ActionBlock(
 data class EmailDraftRequest(
     val company: String,
     val role: String? = null,
-    val type: String = "application"
+    val type: String = "application",
+    val jd: String? = null
 )
 
 data class EmailDraftResponse(
     val success: Boolean = false,
-    val draft: EmailDraftData = EmailDraftData()
-)
-
-data class EmailDraftData(
     val to: String = "",
     val subject: String = "",
     val body: String = "",
-    val contactBlock: String = ""
+    val contactBlock: String = "",
+    val phone: String = "",
+    val error: String? = null
 )
 
 // ── Email send request (HITL enforced) ───────────────────────────────
@@ -512,4 +530,160 @@ data class EmailSendRequest(
 data class ReplyDraftResponse(
     val replyBody: String = "",
     val subject: String = ""
+)
+
+// ── Playwright Apply endpoints (bridge-server /apply/*) ──────────────
+data class ApplyOpenRequest(
+    val url: String,
+    val stealth: Boolean = false
+)
+
+data class ApplyOpenResponse(
+    val success: Boolean = false,
+    val mode: String = "",
+    val url: String = "",
+    val title: String = "",
+    val company: String = "",
+    val atsType: String? = null,
+    val fields: List<ApplyField> = emptyList(),
+    val answers: Map<String, String> = emptyMap(),
+    val pending_questions: List<ApplyPendingQuestion> = emptyList(),
+    val manual_apply_guide: ManualApplyGuide? = null,
+    val message: String = "",
+    val manualUrl: String = "",
+    val error: String? = null
+)
+
+data class ApplyField(
+    val id: String = "",
+    val type: String = "",
+    val label: String = "",
+    val required: Boolean = false,
+    val options: List<String>? = null
+)
+
+// A form field the app could not auto-fill and must ask the candidate about
+// (salary, years of experience, office commute, work authorization, etc).
+data class ApplyPendingQuestion(
+    val field_id: String = "",
+    val category: String = "",
+    val label: String = "",
+    val required: Boolean = false,
+    val type: String = "text",
+    val options: List<String> = emptyList(),
+    val hint: String = "",
+    val source: String = ""
+)
+
+data class ApplyFillRequest(
+    val url: String,
+    val answers: Map<String, String> = emptyMap(),
+    val company: String? = null,
+    val stealth: Boolean = false
+)
+
+data class ApplyFillResponse(
+    val success: Boolean = false,
+    val mode: String = "",
+    val url: String = "",
+    val company: String = "",
+    val title: String = "",
+    val atsType: String? = null,
+    val filled: List<String> = emptyList(),
+    val skipped: List<String> = emptyList(),
+    val cvAttached: Boolean = false,
+    val cvNote: String = "",
+    val loginWall: Boolean = false,
+    val loginVia: String? = null,
+    val message: String = "",
+    val error: String? = null
+)
+
+data class ManualApplyGuide(
+    val ats_type: String = "",
+    val ats_platform: String = "",
+    val confidence: String = "",
+    val url: String = "",
+    val manual_apply_url: String = "",
+    val fields: List<ApplyGuideField> = emptyList(),
+    val estimated_fill_minutes: Int = 5,
+    val notes: String = ""
+)
+
+data class ApplyGuideField(
+    val field: String = "",
+    val value: String = "",
+    val source: String = "",
+    val required: Boolean? = null
+)
+
+data class InterviewRecord(
+    val key: String = "",
+    val id: String = "",
+    val from: String = "",
+    val subject: String = "",
+    val bodyPreview: String = "",
+    val detectedAt: String = "",
+    val scheduledAt: String? = null,
+    val scheduledHuman: String? = null,
+    val date: String? = null,
+    val time: String? = null,
+    val confidence: Int? = null,
+    val reminderSentAt: String? = null,
+    val status: String = "scheduled",
+    val reminder: InterviewReminder? = null
+)
+
+data class InterviewReminder(
+    val due: Boolean = false,
+    val label: String = ""
+)
+
+data class InterviewDetectResponse(
+    val interviews: List<InterviewRecord> = emptyList(),
+    val newCount: Int = 0,
+    val total: Int = 0
+)
+
+data class InterviewsResponse(
+    val interviews: List<InterviewRecord> = emptyList(),
+    val count: Int = 0
+)
+
+// ── Portal logins (bridge-server /portals/* and /portal-creds/*) ─────
+// Google OAuth is the preferred login method for auto-fill on login-gated
+// job portals. Portal email/password is the fallback for portals without
+// Google sign-in. Credentials are stored encrypted per-user.
+data class PortalRequirement(
+    val portal: String = "",
+    val loginRequired: Any? = null,
+    val needsProfile: Boolean = false,
+    val googleOAuth: Boolean = false
+)
+
+data class PortalRequirementsResponse(
+    val googleOAuth: Boolean = false,
+    val loginMethod: String = "",
+    val loginNote: String = "",
+    val portals: List<PortalRequirement> = emptyList()
+)
+
+data class PortalCredsEntry(
+    val portal: String = "",
+    val email: String = "",
+    val hasPassword: Boolean = false,
+    val hasProfile: Boolean = false
+)
+
+data class PortalCredsResponse(
+    val success: Boolean = false,
+    val creds: List<PortalCredsEntry> = emptyList()
+)
+
+data class PortalCredsRequest(
+    val portal: String,
+    val email: String,
+    val password: String = "",
+    val fullName: String = "",
+    val phone: String = ""
 )

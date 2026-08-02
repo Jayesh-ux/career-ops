@@ -22,7 +22,10 @@ fun ProfileFormScreen(
     email: String,
     api: CareerOpsApi,
     userPrefs: UserPrefs,
-    onComplete: () -> Unit
+    onComplete: () -> Unit,
+    title: String = "Your Profile",
+    subtitle: String = "Help us find the right roles for you.",
+    saveLabel: String = "Save & Start"
 ) {
     val scope = rememberCoroutineScope()
     var name by remember { mutableStateOf(userPrefs.userName) }
@@ -30,7 +33,36 @@ fun ProfileFormScreen(
     var location by remember { mutableStateOf("") }
     var compensation by remember { mutableStateOf("") }
     var isSaving by remember { mutableStateOf(false) }
+    var isLoading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
+
+    // Pre-fill existing profile data (edit mode)
+    LaunchedEffect(Unit) {
+        try {
+            val profile = api.getProfile()
+            if (profile.name.isNotEmpty()) {
+                if (name.isEmpty()) name = profile.name
+                if (targetRoles.isEmpty()) targetRoles = profile.targetRoles.joinToString(", ")
+                if (location.isEmpty()) location = profile.location
+                if (compensation.isEmpty()) compensation = profile.compensation
+            }
+        } catch (e: Exception) {
+            // Profile may not exist yet during onboarding — ignore
+        }
+        isLoading = false
+    }
+
+    if (isLoading) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(32.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            CircularProgressIndicator()
+        }
+        return
+    }
 
     Column(
         modifier = Modifier
@@ -49,7 +81,7 @@ fun ProfileFormScreen(
         Spacer(modifier = Modifier.height(24.dp))
 
         Text(
-            text = "Your Profile",
+            text = title,
             style = MaterialTheme.typography.headlineMedium,
             fontWeight = FontWeight.Bold,
             textAlign = TextAlign.Center
@@ -58,7 +90,7 @@ fun ProfileFormScreen(
         Spacer(modifier = Modifier.height(8.dp))
 
         Text(
-            text = "Help us find the right roles for you.",
+            text = subtitle,
             style = MaterialTheme.typography.bodyLarge,
             textAlign = TextAlign.Center,
             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -188,7 +220,7 @@ fun ProfileFormScreen(
                     strokeWidth = 2.dp
                 )
             } else {
-                Text("Save & Start", fontSize = 16.sp)
+                Text(saveLabel, fontSize = 16.sp)
             }
         }
     }

@@ -83,10 +83,18 @@ class DailyAutomationWorker @AssistedInject constructor(
                     maxEmails = 20
                 )
                 val recruiterReplies = inbox.emails.filter { email ->
-                    !email.isSpam && (
-                        email.subject.contains(Regex("(?i)(interview|schedule|offer|selected|shortlist|next steps)")) ||
-                        email.body.contains(Regex("(?i)(interview|schedule|offer|next round|phone screen)")
-                    ))
+                    val from = (email.from ?: "").lowercase()
+                    val isDigest = listOf(
+                        "quora.com", "indeed.com", "hirist", "linkedin.com", "naukri",
+                        "monster.com", "glassdoor", "buzzfeed", "medium.com", "substack",
+                        "newsletter", "digest", "no-reply", "noreply", "updates@"
+                    ).any { from.contains(it) }
+                    !isDigest && !email.isSpam && (
+                        email.subject.contains(Regex("(?i)(interview|phone screen|next round|screening)")) ||
+                        email.subject.contains(Regex("(?i)(offer letter|selected for|joining date|start date)")) ||
+                        email.subject.contains(Regex("(^|\\s)re\\s*:\\s*", RegexOption.IGNORE_CASE)) &&
+                            email.body.contains(Regex("(?i)(your application|your resume|your cv|recruiter|hiring manager)"))
+                    )
                 }
 
                 if (recruiterReplies.isNotEmpty()) {

@@ -246,6 +246,75 @@ function setUserOAuth(userId, creds) {
   writeFileSync(oauthPath, encrypted, 'utf-8');
 }
 
+// ── Portal login requirements + per-user credential vault ───────────
+// Indian job portals gate the application form behind an account; company
+// ATS pages (Greenhouse, Lever, Ashby, ...) are public. The vault stores
+// the user's portal credentials encrypted at rest (same AES-256-GCM key as
+// .oauth2.json) so auto-fill can log in and apply seamlessly.
+
+const PORTAL_LOGIN_REQUIREMENTS = [
+  // googleOAuth: portal offers "Continue with Google" — the preferred login
+  // path (uses the user's Gmail OAuth session in their persistent profile).
+  // Fallback: stored portal email/password from /portal-creds.
+  { portal: 'Internshala', hostPattern: 'internshala.com', loginRequired: true, needsProfile: true, googleOAuth: true },
+  { portal: 'Naukri', hostPattern: 'naukri.com', loginRequired: true, needsProfile: true, googleOAuth: true },
+  { portal: 'Shine', hostPattern: 'shine.com', loginRequired: true, needsProfile: true, googleOAuth: true },
+  { portal: 'TimesJobs', hostPattern: 'timesjobs.com', loginRequired: true, needsProfile: true, googleOAuth: true },
+  { portal: 'Hirist', hostPattern: 'hirist', loginRequired: true, needsProfile: true, googleOAuth: false },
+  { portal: 'iimjobs', hostPattern: 'iimjobs.com', loginRequired: true, needsProfile: true, googleOAuth: true },
+  { portal: 'Foundit', hostPattern: 'foundit', loginRequired: true, needsProfile: true, googleOAuth: true },
+  { portal: 'Instahyre', hostPattern: 'instahyre.com', loginRequired: true, needsProfile: true, googleOAuth: true },
+  { portal: 'Cutshort', hostPattern: 'cutshort.io', loginRequired: true, needsProfile: true, googleOAuth: true },
+  { portal: 'Freshersworld', hostPattern: 'freshersworld.com', loginRequired: true, needsProfile: true, googleOAuth: false },
+  { portal: 'LinkedIn', hostPattern: 'linkedin.com', loginRequired: true, needsProfile: false, googleOAuth: false },
+  { portal: 'Glassdoor', hostPattern: 'glassdoor', loginRequired: 'partial', needsProfile: false, googleOAuth: true },
+  { portal: 'Indeed', hostPattern: 'indeed.com', loginRequired: 'partial', needsProfile: false, googleOAuth: true },
+  { portal: 'Monster', hostPattern: 'monsterindia.com', loginRequired: true, needsProfile: true, googleOAuth: true },
+];
+
+function detectPortalFromUrl(urlStr) {
+  const host = ((urlStr || '').toLowerCase().match(/^https?:\/\/([^/]+)/i) || [])[1] || '';
+  for (const p of PORTAL_LOGIN_REQUIREMENTS) {
+    if (host.endsWith(p.hostPattern) || host.includes(p.hostPattern)) return p;
+  }
+  return null;
+}
+
+function getPortalCredsPath(userId) {
+  const userDir = resolveUserDataDir(userId);
+  if (!userDir) return null;
+  return join(userDir, '.portal-creds.json');
+}
+
+function getPortalCreds(userId) {
+  const p = getPortalCredsPath(userId);
+  if (!p || !existsSync(p)) return {};
+  try {
+    const raw = readFileSync(p, 'utf-8').trim();
+    if (isEncryptedData(raw)) return decryptJson(raw) || {};
+    const data = JSON.parse(raw);
+    setPortalCreds(userId, data); // migrate to encrypted
+    return data;
+  } catch { return {}; }
+}
+
+function setPortalCreds(userId, creds) {
+  const p = getPortalCredsPath(userId);
+  if (!p) throw new Error('Invalid userId');
+  writeFileSync(p, encryptJson(creds || {}), 'utf-8');
+}
+
+function deletePortalCreds(userId, portal) {
+  const creds = getPortalCreds(userId);
+  const norm = (portal || '').toLowerCase();
+  let removed = false;
+  for (const key of Object.keys(creds)) {
+    if (key.toLowerCase() === norm) { delete creds[key]; removed = true; }
+  }
+  if (removed) setPortalCreds(userId, creds);
+  return removed;
+}
+
 async function refreshOAuthToken(creds) {
   if (!creds.refreshToken || !creds.clientId || !creds.clientSecret) return null;
   const params = new URLSearchParams({
@@ -353,6 +422,11 @@ app.use((req, res, next) => {
 //   });
 //   console.log('[auth] Bridge token auth enabled');
 // }
+
+// ── Health check ─────────────────────────────────────────────────────
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', uptime: process.uptime() });
+});
 
 // ── APK download ────────────────────────────────────────────────────
 // Serves the latest APK so Android file manager can install it.
@@ -608,25 +682,70 @@ function runCli(script, args = []) {
 }
 
 async function runOpencode(prompt, timeoutMs = 120000, cwd) {
-  return new Promise((resolve, reject) => {
-    const bin = spawnSync('which', ['opencode'], { encoding: 'utf-8' });
-    const opencodeBin = bin.stdout.trim() || 'opencode';
-    const proc = spawn(opencodeBin, ['run', prompt], {
-      cwd: cwd || __dirname,
-      env: { ...process.env },
-      timeout: timeoutMs,
-    });
-    proc.stdin.end(); // close stdin so opencode doesn't hang waiting for input
-    let stdout = '';
-    let stderr = '';
-    proc.stdout.on('data', d => { stdout += d.toString(); });
-    proc.stderr.on('data', d => { stderr += d.toString(); });
-    proc.on('close', code => {
-      if (code === 0) resolve(stdout);
-      else reject(new Error(`opencode exited ${code}: ${stderr.slice(0, 300)}`));
-    });
-    proc.on('error', reject);
+  // Use SDK client (HTTP to opencode server) instead of spawning binary directly.
+  // Spawning fails on Termux because the binary requires proot's dynamic linker.
+  const userId = cwd ? basename(cwd) : undefined;
+  // Stateless agent-helper calls (eval/draft/reply/classify/...) must NOT reuse
+  // the shared /chat session — shared history made evals echo the previous job's
+  // (hallucinated) details when a JD fetch failed. Always use a fresh session.
+  const { client, sessionId } = await initOpencode(userId, cwd, true);
+
+  await client.session.promptAsync({
+    path: { id: sessionId },
+    body: {
+      parts: [{ type: "text", text: prompt }],
+      model: resolveModelForUser(userId)
+    }
   });
+
+  const deadline = Date.now() + timeoutMs;
+  let sawBusy = false;
+  let idleCount = 0;
+
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 1000));
+    const statusResult = await client.session.status({}).catch(() => ({ data: {} }));
+    const st = statusResult.data?.[sessionId]?.type;
+
+    if (st === 'busy' || st === 'retry') {
+      sawBusy = true;
+      idleCount = 0;
+      continue;
+    }
+
+    if (sawBusy) {
+      idleCount++;
+      if (idleCount >= 2) break;
+    }
+
+    if (!sawBusy && Date.now() > (deadline - timeoutMs + 3000)) break;
+  }
+
+  const msgsResult = await client.session.messages({
+    path: { id: sessionId },
+    query: { limit: 50 }
+  }).catch(() => ({ data: [] }));
+  const msgs = Array.isArray(msgsResult.data) ? msgsResult.data : [];
+  const assistants = msgs.filter(m => m.info?.role === 'assistant');
+
+  const textParts = [];
+  for (const m of assistants) {
+    for (const p of (m.parts || [])) {
+      if (p.type === 'text') {
+        const t = (p.text || p.content || '').trim();
+        // Keep JSON blocks too — draft/classify/reply/eval prompts return JSON,
+        // and filtering them out made those endpoints return empty. Only strip
+        // the skill-wrapper artifacts injected by the agent runtime.
+        if (t && !t.startsWith('<skill_content')) {
+          textParts.push(t);
+        }
+      }
+    }
+  }
+
+  const output = textParts.join('\n\n');
+  if (!output) throw new Error('opencode produced no text output');
+  return output;
 }
 
 function parseJsonFromOutput(text) {
@@ -654,19 +773,23 @@ app.get('/doctor', (req, res) => {
     const script = join(__dirname, 'doctor.mjs');
     const args = [script, '--json'];
     const cwd = userCwd(req);
-    const r = spawnSync('node', args, {
+    const nodeBin = process.execPath || 'node';
+    const r = spawnSync(nodeBin, args, {
       cwd,
       encoding: 'utf-8',
       timeout: 30000
     });
+    if (r.error) {
+      return res.status(500).json({ error: `Failed to run doctor: ${r.error.message}` });
+    }
     if (r.status !== 0) {
-      return res.status(500).json({ error: r.stderr || 'doctor.mjs failed' });
+      return res.status(500).json({ error: r.stderr?.slice(0, 500) || 'doctor.mjs failed' });
     }
     const output = (r.stdout || '').trim();
     try {
       res.json(JSON.parse(output));
     } catch {
-      res.status(500).json({ error: 'doctor.mjs produced invalid JSON', raw: output });
+      res.status(500).json({ error: 'doctor.mjs produced invalid JSON', raw: output.slice(0, 500) });
     }
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -694,6 +817,7 @@ app.post('/users/:email/oauth/exchange', async (req, res) => {
         client_secret: clientSecret,
         grant_type: 'authorization_code',
         access_type: 'offline',
+        prompt: 'consent',
         redirect_uri: redirectUri || 'https://career-ops.app',
     });
 
@@ -860,6 +984,7 @@ app.get('/users/:email/oauth/callback', async (req, res) => {
       client_secret: clientSecret,
       grant_type: 'authorization_code',
       access_type: 'offline',
+      prompt: 'consent',
       redirect_uri: `http://127.0.0.1:8787/users/${encodeURIComponent(email)}/oauth/callback`,
     });
     const resp = await fetch(tokenUrl, {
@@ -900,8 +1025,9 @@ app.get('/users/:email/oauth/callback', async (req, res) => {
 // POST /email/connect — Save app password for a user (user-friendly fallback)
 app.post('/email/connect', (req, res) => {
   try {
-    const { email, appPassword } = req.body;
-    if (!email || !appPassword) return res.status(400).json({ error: 'email and appPassword required' });
+    const { email, appPassword: rawPw } = req.body;
+    if (!email || !rawPw) return res.status(400).json({ error: 'email and appPassword required' });
+    const appPassword = rawPw.replace(/\s+/g, '');
 
     // Store as per-user credentials (app password mode)
     const userId = req.userCtx?.userId || email;
@@ -1085,11 +1211,14 @@ app.get('/users/:email/files', (req, res) => {
       if (!existsSync(dir)) return results;
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
         const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
-        if (entry.isDirectory()) {
-          results.push(...walkDir(join(dir, entry.name), relPath));
-        } else if (entry.name !== '.oauth2.json') {
-          const stat = statSync(join(dir, entry.name));
-          results.push({ path: relPath, size: stat.size, modified: stat.mtime.toISOString() });
+        if (entry.isDirectory() && !entry.isSymbolicLink()) {
+          const sub = join(dir, entry.name);
+          if (existsSync(sub)) results.push(...walkDir(sub, relPath));
+        } else if (entry.isFile() && entry.name !== '.oauth2.json') {
+          try {
+            const stat = statSync(join(dir, entry.name));
+            results.push({ path: relPath, size: stat.size, modified: stat.mtime.toISOString() });
+          } catch { /* skip unreadable files */ }
         }
       }
       return results;
@@ -1358,83 +1487,130 @@ app.post('/tracker/add', (req, res) => {
 });
 
 // POST /email/send — supports both app password and OAuth2 (per-user and legacy)
+// Build a raw RFC2822 message (optionally with a PDF attachment) for Gmail REST send.
+function buildRfc2822Message({ from, to, subject, body, pdfPath }) {
+  const hasAttachment = pdfPath && existsSync(pdfPath);
+  const boundary = `----=_Part_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+  const lines = [
+    `From: ${from}`,
+    `To: ${to}`,
+    `Subject: ${subject || ''}`,
+    'MIME-Version: 1.0',
+  ];
+  if (hasAttachment) {
+    lines.push(`Content-Type: multipart/mixed; boundary="${boundary}"`);
+    lines.push('');
+    lines.push(`--${boundary}`);
+    lines.push('Content-Type: text/plain; charset=UTF-8');
+    lines.push('Content-Transfer-Encoding: 7bit');
+    lines.push('');
+    lines.push(body);
+    lines.push('');
+    lines.push(`--${boundary}`);
+    const pdfBuf = readFileSync(pdfPath);
+    const fileName = basename(pdfPath) || 'resume.pdf';
+    lines.push(`Content-Type: application/pdf; name="${fileName}"`);
+    lines.push('Content-Transfer-Encoding: base64');
+    lines.push(`Content-Disposition: attachment; filename="${fileName}"`);
+    lines.push('');
+    lines.push(pdfBuf.toString('base64'));
+    lines.push('');
+    lines.push(`--${boundary}--`);
+  } else {
+    lines.push('Content-Type: text/plain; charset=UTF-8');
+    lines.push('Content-Transfer-Encoding: 7bit');
+    lines.push('');
+    lines.push(body);
+  }
+  return Buffer.from(lines.join('\r\n')).toString('base64url');
+}
+
 app.post('/email/send', async (req, res) => {
   try {
     const { email, appPassword, company, role, body, to, pdfPath } = req.body;
     if (!email || !body) {
       return res.status(400).json({ error: 'email and body are required' });
     }
+    if (!to || !String(to).trim()) {
+      return res.status(400).json({ error: 'to (recipient) is required — refusing to send without a recipient' });
+    }
 
     // Determine auth method: per-user OAuth2 > legacy OAuth2 > app password
     const userOAuth = req.userCtx.userId ? getUserOAuth(req.userCtx.userId) : null;
     const hasUserOAuth2 = hasUsableOAuth(userOAuth);
     const hasLegacyOAuth2 = process.env.GMAIL_CLIENT_ID && process.env.GMAIL_CLIENT_SECRET && process.env.GMAIL_REFRESH_TOKEN;
-    let authConfig;
-    let authMethod = 'unknown';
+    const envAppPassword = (process.env.GMAIL_APP_PASSWORD || '').replace(/\s+/g, '');
+    const subject = `Application for ${role || 'Unknown Role'} at ${company || 'Unknown Company'}`;
 
-    if (hasUserOAuth2) {
-      // Per-user OAuth2: use their stored tokens
-      let accessToken = userOAuth.accessToken;
-      if (!accessToken || (userOAuth.expiresAt && Date.now() > userOAuth.expiresAt - 300000)) {
-        // Refresh the token
-        const tokenResp = await fetch(GMAIL_TOKEN_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({
-            client_id: userOAuth.clientId,
-            client_secret: userOAuth.clientSecret,
-            refresh_token: userOAuth.refreshToken,
-            grant_type: 'refresh_token',
-          }),
-        });
-        if (!tokenResp.ok) throw new Error(`Per-user token refresh failed: ${tokenResp.status}`);
-        const tokenData = await tokenResp.json();
-        accessToken = tokenData.access_token;
-        // Update stored credentials with new access token
-        userOAuth.accessToken = accessToken;
-        userOAuth.expiresAt = tokenData.expires_in ? Date.now() + tokenData.expires_in * 1000 : 0;
-        setUserOAuth(req.userCtx.userId, userOAuth);
+    // ── OAuth2: Gmail REST send (token carries gmail.send, not the mail.google.com SMTP scope) ──
+    if (hasUserOAuth2 || hasLegacyOAuth2) {
+      let accessToken = null;
+      try {
+        accessToken = await resolveGmailAccessToken(req.userCtx?.userId, email);
+      } catch (tokenErr) {
+        console.warn(`[email/send] token resolution failed: ${tokenErr.message}`);
       }
-      authConfig = {
-        type: 'OAuth2',
-        user: email,
-        clientId: userOAuth.clientId,
-        clientSecret: userOAuth.clientSecret,
-        accessToken,
-      };
-      authMethod = 'per_user_oauth2';
-    } else if (hasLegacyOAuth2) {
-      const accessToken = await getGmailAccessToken();
-      authConfig = {
-        type: 'OAuth2',
-        user: email,
-        clientId: process.env.GMAIL_CLIENT_ID,
-        clientSecret: process.env.GMAIL_CLIENT_SECRET,
-        accessToken,
-      };
-      authMethod = 'legacy_oauth2';
-    } else if (appPassword) {
-      authConfig = { user: email, pass: appPassword };
-      authMethod = 'app_password';
-    } else {
-      return res.status(400).json({ error: 'Either appPassword or OAuth2 credentials (per-user or legacy) required' });
+      if (accessToken) {
+        try {
+          const raw = buildRfc2822Message({ from: email, to, subject, body, pdfPath });
+          const sendResp = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ raw }),
+          });
+          if (sendResp.ok) {
+            const sent = await sendResp.json();
+            console.log(`[email/send] gmail_rest success (id=${sent.id})`);
+            return res.json({ success: true, applicationId: 0, method: hasUserOAuth2 ? 'per_user_oauth2_rest' : 'legacy_oauth2_rest', messageId: sent.id });
+          }
+          const errText = await sendResp.text();
+          console.warn(`[email/send] gmail_rest failed: ${sendResp.status} ${errText.slice(0, 200)}`);
+        } catch (e) {
+          console.warn(`[email/send] gmail_rest error: ${e.message}`);
+        }
+      }
     }
 
-    const transporter = nodemailer.createTransport({
-      host: 'smtp.gmail.com', port: 587, secure: false,
-      auth: authConfig,
-    });
+    // ── SMTP fallback (app password only) — SMTP XOAUTH2 needs the mail.google.com scope ──
+    const attempts = [];
+    if (appPassword) {
+      attempts.push({ label: 'app_password', auth: { user: email, pass: appPassword } });
+    }
+    if (!hasUserOAuth2 && !hasLegacyOAuth2 && !appPassword && envAppPassword) {
+      attempts.push({ label: 'env_app_password', auth: { user: email, pass: envAppPassword } });
+    }
+
+    if (attempts.length === 0) {
+      return res.status(400).json({ error: 'Gmail REST send unavailable and no appPassword configured for SMTP fallback' });
+    }
 
     const mailOpts = {
       from: email,
-      to: to || email,
-      subject: `Application for ${role || 'Unknown Role'} at ${company || 'Unknown Company'}`,
+      to,
+      subject,
       text: body,
     };
     if (pdfPath && existsSync(pdfPath)) mailOpts.attachments = [{ path: pdfPath }];
 
-    const info = await transporter.sendMail(mailOpts);
-    res.json({ success: true, applicationId: 0, method: authMethod });
+    let lastErr = null;
+    for (const attempt of attempts) {
+      try {
+        const transporter = nodemailer.createTransport({
+          host: 'smtp.gmail.com', port: 587, secure: false,
+          auth: attempt.auth,
+        });
+        await transporter.sendMail(mailOpts);
+        console.log(`[email/send] ${attempt.label} success`);
+        return res.json({ success: true, applicationId: 0, method: attempt.label });
+      } catch (e) {
+        console.warn(`[email/send] ${attempt.label} failed: ${e.message}`);
+        lastErr = e;
+      }
+    }
+    return res.status(500).json({ success: false, error: lastErr ? lastErr.message : 'Email send failed' });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
@@ -1442,6 +1618,34 @@ app.post('/email/send', async (req, res) => {
 
 // Shared IMAP fetch — single implementation used by /email/inbox and /email/triage
 // Supports both app password and OAuth2 (XOAUTH2), per-user and legacy
+
+// Rate-limit IMAP connection error logging — the scheduler polls every few
+// minutes, so an auth/config failure would otherwise spam the logs. Log once
+// per email per hour (or immediately when the error text changes).
+const _imapErrorLog = new Map();
+function logImapError(email, err) {
+  const msg = err?.message || String(err);
+  const key = String(email || '').toLowerCase();
+  const now = Date.now();
+  const prev = _imapErrorLog.get(key);
+  if (prev && msg === prev.msg && now - prev.ts < 3600000) return; // same error within 1h — silent
+  _imapErrorLog.set(key, { msg, ts: now });
+  console.error(`[IMAP] Connection error for ${email}: ${msg}`);
+}
+
+// Same treatment for REST failures (e.g. Gmail API disabled) so the
+// scheduler doesn't spam an identical 403 every poll.
+const _restErrorLog = new Map();
+function logRestError(tag, email, err) {
+  const msg = (err?.message || String(err)).slice(0, 160);
+  const key = `${tag}|${String(email || '').toLowerCase()}`;
+  const now = Date.now();
+  const prev = _restErrorLog.get(key);
+  if (prev && msg === prev.msg && now - prev.ts < 3600000) return;
+  _restErrorLog.set(key, { msg, ts: now });
+  console.error(`[${tag}] ${err?.message || err}`);
+}
+
 async function fetchEmails(email, password, { daysBack = 30, maxEmails = 50, timeout = 30000, userOAuth = null } = {}) {
   // Determine auth method: per-user OAuth2 > legacy OAuth2 > app password
   const hasUserOAuth2 = hasUsableOAuth(userOAuth);
@@ -1482,6 +1686,7 @@ async function fetchEmails(email, password, { daysBack = 30, maxEmails = 50, tim
       user: email,
       xoauth2: buildXoauth2String(email, accessToken),
       host: 'imap.gmail.com', port: 993, tls: true,
+      connTimeout: 30000, authTimeout: 30000,
       tlsOptions: { rejectUnauthorized: false },
     };
   } else if (hasLegacyOAuth2) {
@@ -1490,12 +1695,14 @@ async function fetchEmails(email, password, { daysBack = 30, maxEmails = 50, tim
       user: email,
       xoauth2: buildXoauth2String(email, accessToken),
       host: 'imap.gmail.com', port: 993, tls: true,
+      connTimeout: 30000, authTimeout: 30000,
       tlsOptions: { rejectUnauthorized: false },
     };
   } else {
     imapConfig = {
       user: email, password,
       host: 'imap.gmail.com', port: 993, tls: true,
+      connTimeout: 30000, authTimeout: 30000,
       tlsOptions: { rejectUnauthorized: false },
     };
   }
@@ -1518,15 +1725,14 @@ async function fetchEmails(email, password, { daysBack = 30, maxEmails = 50, tim
       imap.openBox('INBOX', false, (err) => {
         if (err) { imap.end(); finish(); return; }
         const since = new Date(Date.now() - daysBack * 86400000).toISOString().split('T')[0];
-        imap.search(['ALL', ['SINCE', since]], (err, results) => {
-          if (err || !results || results.length === 0) { imap.end(); finish(); return; }
-          const latest = results.slice(-maxEmails);
+
+        function processResults(latest) {
           let pending = latest.length;
           let timedOut = false;
 
           if (pending === 0) { imap.end(); finish(); return; }
 
-          const f = imap.fetch(latest, { bodies: '' });
+          const f = imap.fetch(latest, { bodies: '', uids: true });
           f.on('message', (msg) => {
             let buf = '';
             msg.on('body', (stream) => {
@@ -1535,6 +1741,7 @@ async function fetchEmails(email, password, { daysBack = 30, maxEmails = 50, tim
                 simpleParser(buf, (parseErr, parsed) => {
                   if (!parseErr && parsed) {
                     emails.push({
+                      uid: msg.uid,
                       from: parsed.from?.text || '',
                       fromEmail: (parsed.from?.value?.[0]?.address) || '',
                       subject: parsed.subject || '',
@@ -1556,16 +1763,122 @@ async function fetchEmails(email, password, { daysBack = 30, maxEmails = 50, tim
           f.once('end', () => {
             setTimeout(() => { if (!timedOut) { timedOut = true; imap.end(); finish(); } }, 5000);
           });
-        });
+        }
+
+        // Defensive search: V8 throws "Too many arguments" with large result sets on imap.search()
+        try {
+          imap.search(['ALL', ['SINCE', since]], (err, results) => {
+            if (err || !results || results.length === 0) { imap.end(); finish(); return; }
+            processResults(results.slice(-maxEmails));
+          });
+        } catch (searchErr) {
+          console.warn(`[IMAP] search() threw (${searchErr.message}), falling back to seq.search with capped results`);
+          try {
+            imap.seq.search(['ALL', ['SINCE', since]], (err2, results2) => {
+              if (err2 || !results2 || results2.length === 0) { imap.end(); finish(); return; }
+              processResults(results2.slice(-Math.min(maxEmails, 50)));
+            });
+          } catch (seqErr) {
+            console.error(`[IMAP] seq.search also failed: ${seqErr.message}`);
+            imap.end();
+            finish();
+          }
+        }
       });
     });
     imap.once('error', (err) => {
-      console.error(`[IMAP] Connection error for ${email}: ${err?.message || err}`);
+      logImapError(email, err);
       finish();
     });
     imap.connect();
     setTimeout(() => { finish(); }, timeout);
   });
+}
+
+// ── Gmail REST inbox (reliable alternative to IMAP) ────────────────
+// The `imap` npm package throws "Too many arguments" against Gmail on
+// large/older accounts. OAuth users get the Gmail REST API instead —
+// same tokens, no flaky parser. App-password users keep the IMAP path.
+
+async function resolveGmailAccessToken(userId, email) {
+  const userOAuth = userId ? getUserOAuth(userId) : null;
+  if (userOAuth && hasUsableOAuth(userOAuth)) {
+    if (!userOAuth.accessToken || (userOAuth.expiresAt && Date.now() > userOAuth.expiresAt - 300000)) {
+      if (userOAuth.refreshToken) {
+        const refreshed = await refreshOAuthToken(userOAuth);
+        if (refreshed) {
+          Object.assign(userOAuth, refreshed);
+          try { setUserOAuth(userId, userOAuth); } catch {}
+        }
+      }
+    }
+    if (userOAuth.accessToken) return userOAuth.accessToken;
+  }
+  if (process.env.GMAIL_CLIENT_ID && process.env.GMAIL_CLIENT_SECRET && process.env.GMAIL_REFRESH_TOKEN) {
+    return getGmailAccessToken();
+  }
+  throw new Error('No Gmail auth available for REST inbox');
+}
+
+function parseFromEmail(fromStr) {
+  const m = String(fromStr || '').match(/<([^>]+)>/);
+  return m ? m[1] : String(fromStr || '').trim().split(/\s+/)[0];
+}
+
+function extractGmailBody(msg) {
+  const parts = [];
+  const walk = (node) => {
+    if (!node) return;
+    if (node.body && node.body.data) {
+      try {
+        const b64 = node.body.data.replace(/-/g, '+').replace(/_/g, '/');
+        parts.push(Buffer.from(b64, 'base64').toString('utf-8'));
+      } catch { /* skip undecodable part */ }
+    }
+    if (Array.isArray(node.parts)) for (const p of node.parts) walk(p);
+  };
+  walk(msg.payload);
+  return parts.join('\n\n');
+}
+
+async function fetchGmailInboxREST(email, userId, { daysBack = 30, maxEmails = 50, query } = {}) {
+  const accessToken = await resolveGmailAccessToken(userId, email);
+  const headers = { Authorization: `Bearer ${accessToken}` };
+  const q = query || `in:inbox newer_than:${Math.max(daysBack, 1)}d`;
+  const listUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=${Math.min(Math.max(maxEmails, 1), 50)}&q=${encodeURIComponent(q)}`;
+  const listResp = await fetch(listUrl, { headers });
+  if (!listResp.ok) {
+    const errText = await listResp.text().catch(() => '');
+    throw new Error(`Gmail API list failed: ${listResp.status} ${errText.slice(0, 200)}`);
+  }
+  const listData = await listResp.json();
+  const ids = (listData.messages || []).slice(0, maxEmails).map(m => m.id);
+
+  const emails = [];
+  await Promise.all(ids.map(async (id) => {
+    try {
+      const msgResp = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`, { headers });
+      if (!msgResp.ok) return;
+      const msg = await msgResp.json();
+      const headersMap = {};
+      for (const h of (msg.payload?.headers || [])) headersMap[h.name.toLowerCase()] = h.value;
+      const bodyText = extractGmailBody(msg);
+      const parsedDate = new Date(headersMap.date || parseInt(msg.internalDate || 0, 10));
+      emails.push({
+        gmailId: msg.id,
+        from: headersMap.from || '',
+        fromEmail: parseFromEmail(headersMap.from || ''),
+        subject: headersMap.subject || '',
+        date: isNaN(parsedDate.getTime()) ? new Date(0).toISOString() : parsedDate.toISOString(),
+        preview: (msg.snippet || '').substring(0, 200),
+        body: bodyText.substring(0, 5000),
+      });
+    } catch { /* skip individual message failures */ }
+  }));
+
+  emails.sort((a, b) => new Date(b.date) - new Date(a.date));
+  emails.forEach((e, i) => { e.id = i + 1; });
+  return emails;
 }
 
 // ── Spam filter for inbox emails ──────────────────────────────────
@@ -1634,7 +1947,7 @@ function classifyEmailSpam(email) {
 // GET /email/inbox — supports both app password and OAuth2, with spam filtering
 app.get('/email/inbox', async (req, res) => {
   const email = req.query.email || process.env.GMAIL_USER;
-  const rawAppPassword = req.query.appPassword || process.env.GMAIL_APP_PASSWORD;
+  const rawAppPassword = (req.query.appPassword || process.env.GMAIL_APP_PASSWORD || '').replace(/\s+/g, '');
   // Treat placeholder/revoked app passwords as no password
   const appPassword = rawAppPassword && !rawAppPassword.includes('REVOKED') && !rawAppPassword.includes('REPLACE') ? rawAppPassword : null;
   const userOAuth = req.userCtx.userId ? getUserOAuth(req.userCtx.userId) : null;
@@ -1650,7 +1963,26 @@ app.get('/email/inbox', async (req, res) => {
   }
 
   try {
-    const allEmails = await fetchEmails(email, appPassword, { userOAuth });
+    const daysBack = parseInt(req.query.daysBack, 10) || 30;
+    const maxEmails = parseInt(req.query.maxEmails, 10) || 50;
+
+    // OAuth users get Gmail REST (reliable; IMAP crashes on large mailboxes).
+    // App-password users keep IMAP. On REST failure, fall back to IMAP.
+    let allEmails;
+    let method;
+    if (hasUserOAuth2 || hasLegacyOAuth2) {
+      try {
+        allEmails = await fetchGmailInboxREST(email, req.userCtx.userId, { daysBack, maxEmails });
+        method = hasUserOAuth2 ? 'per_user_oauth2_rest' : 'legacy_oauth2_rest';
+      } catch (restErr) {
+        logRestError('email/inbox', email, restErr);
+        allEmails = await fetchEmails(email, appPassword, { userOAuth, daysBack, maxEmails });
+        method = hasUserOAuth2 ? 'per_user_oauth2_imap' : 'legacy_oauth2_imap';
+      }
+    } else {
+      allEmails = await fetchEmails(email, appPassword, { userOAuth, daysBack, maxEmails });
+      method = 'app_password';
+    }
 
     // Classify spam for each email
     const classified = allEmails.map(e => ({
@@ -1667,8 +1999,35 @@ app.get('/email/inbox', async (req, res) => {
       total: allEmails.length,
       legitimateCount: legitimate.length,
       spamCount: spam.length,
-      method: hasUserOAuth2 ? 'per_user_oauth2' : (hasLegacyOAuth2 ? 'legacy_oauth2' : 'app_password'),
+      method,
     });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /email/sent — list emails sent from the account (audit trail).
+// Read-only; used to show the user exactly what the system sent.
+app.get('/email/sent', async (req, res) => {
+  const email = req.query.email || process.env.GMAIL_USER;
+  const userOAuth = req.userCtx.userId ? getUserOAuth(req.userCtx.userId) : null;
+  const hasUserOAuth2 = hasUsableOAuth(userOAuth);
+  const hasLegacyOAuth2 = process.env.GMAIL_CLIENT_ID && process.env.GMAIL_CLIENT_SECRET && process.env.GMAIL_REFRESH_TOKEN;
+
+  if (!email) return res.status(400).json({ error: 'email required' });
+  if (!hasUserOAuth2 && !hasLegacyOAuth2) {
+    return res.status(400).json({ error: 'Sent-folder audit requires OAuth2 (app-password IMAP not supported for sent)' });
+  }
+
+  try {
+    const daysBack = parseInt(req.query.daysBack, 10) || 3;
+    const maxEmails = parseInt(req.query.maxEmails, 10) || 50;
+    const sent = await fetchGmailInboxREST(email, req.userCtx.userId, {
+      daysBack,
+      maxEmails,
+      query: `in:sent newer_than:${Math.max(daysBack, 1)}d`,
+    });
+    res.json({ emails: sent, total: sent.length, method: 'gmail_rest_sent' });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1704,20 +2063,7 @@ app.post('/scan', async (req, res) => {
     const userLocFlex = ((userProfile.candidate?.location_flexibility) || '').toLowerCase().trim();
 
     // Dynamically extract nearby location terms from flexibility + full location
-    const nearbyTerms = new Set([userCity, userCountry].filter(Boolean));
-    if (userLocFlex) {
-      for (const part of userLocFlex.split(/[/,&\n]+/)) {
-        const cleaned = part.replace(/on.?site|in|area|remote|hybrid|office|work|from|or|and|the|near|within/gi, '').trim();
-        if (cleaned.length >= 3) nearbyTerms.add(cleaned);
-      }
-    }
-    if (/\bremote\b/i.test(userLocFlex)) nearbyTerms.add('remote');
-    // Extract state/region from full location (last part before country)
-    if (userLocFull && userCountry) {
-      const parts = userLocFull.split(',').map(s => s.trim());
-      const statePart = parts.length >= 2 ? parts[parts.length - 2] : '';
-      if (statePart && !statePart.includes(userCountry)) nearbyTerms.add(statePart.toLowerCase());
-    }
+    const nearbyTerms = buildNearbyTerms(userProfile);
 
     const rawKw = (keywords || []).map(k => k.toLowerCase().trim()).filter(Boolean);
     const STOP_WORDS = new Set(['full', 'stack']);
@@ -1743,7 +2089,9 @@ app.post('/scan', async (req, res) => {
     for (const term of nearbyTerms) {
       if (!LOCATION_EXPANSIONS[term]) LOCATION_EXPANSIONS[term] = [...nearbyTerms];
     }
-    const rawLocs = (locations || []).map(l => l.toLowerCase().trim()).filter(Boolean);
+    // Locations can arrive as a single comma/newline-separated blob (the
+    // profile city block) — split into individual terms so each city matches.
+    const rawLocs = (locations || []).flatMap(l => String(l).toLowerCase().split(/[,\n;&]+/).map(s => s.trim())).filter(Boolean);
     // For each raw location term, derive variants: prefix "navi ", "greater " and suffix " area", " region"
     for (const loc of [...nearbyTerms, ...rawLocs]) {
       const variants = [loc, loc.replace(/\s+area$/,''), loc.replace(/\s+region$/, '')];
@@ -1759,9 +2107,32 @@ app.post('/scan', async (req, res) => {
     const portalsPath = join(__dirname, 'portals.yml');
     if (!existsSync(portalsPath)) return res.json({ results: [], summary: { portalsScanned: 0, totalFound: 0, filteredByKeywords: 0, duplicatesSkipped: 0, netNew: 0, tooBroad: false, narrowingHints: [] } });
     const py = yaml.load(readFileSync(portalsPath, 'utf-8'));
-    const companies = py?.tracked_companies || [];
+    let companies = py?.tracked_companies || [];
     const boards = py?.search_queries || [];
     const jobBoards = py?.job_boards || [];
+
+    // Also load companies from tracker — every company user applied to becomes a scan target
+    const trackerPath = req.userCtx.trackerPath || TRACKER_PATH;
+    if (existsSync(trackerPath)) {
+      const trackerLines = readFileSync(trackerPath, 'utf-8').split('\n');
+      const existingNames = new Set(companies.map(c => (c.name || '').toLowerCase()));
+      for (const line of trackerLines) {
+        const m = line.match(/^\|\s*\d+\s*\|[^|]*\|([^|]+)/);
+        if (m) {
+          const companyName = m[1].trim();
+          const lower = companyName.toLowerCase();
+          if (lower && !existingNames.has(lower)) {
+            existingNames.add(lower);
+            const slug = companyName.toLowerCase().replace(/[^a-z0-9]+/g, '').replace(/^(the|a|an)/, '');
+            companies.push({
+              name: companyName,
+              careers_url: `https://${slug}.com/careers`,
+              notes: 'auto-discovered from tracker',
+            });
+          }
+        }
+      }
+    }
 
     // Load blacklist — same format as career-ops CLI (per-user or root)
     const blacklistPath = req.userCtx.blacklistPath || join(__dirname, 'data/blacklist.md');
@@ -1789,6 +2160,7 @@ app.post('/scan', async (req, res) => {
     const results = [];
     const keywordMatched = []; // jobs that pass keyword filter (used for location fallback)
     const errored = [];
+    const portalResults = []; // per-portal breakdown
     let totalBeforeFilter = 0;
 
     // Phase 1: Provider-based scanning
@@ -1808,6 +2180,7 @@ app.post('/scan', async (req, res) => {
       if (entry.enabled === false) continue;
       const resolved = resolveProvider(entry, providers);
       if (resolved && !resolved.error) providerTargets.push({ entry, provider: resolved.provider, isBoard: true });
+      else if (entry.scan_query || entry.careers_url) webSearchTargets.push(entry);
     }
     for (const entry of jobBoards) {
       if (entry.enabled === false) continue;
@@ -1826,20 +2199,28 @@ app.post('/scan', async (req, res) => {
         const ctx = makeHttpCtx();
         const jobs = await t.provider.fetch(t.entry, ctx);
         totalBeforeFilter += jobs.length;
+        let kwCount = 0;
+        let exactCount = 0;
         for (const job of jobs) {
           const title = (job.title || '').toLowerCase();
           const loc = (job.location || '').toLowerCase();
           const matchesKw = kw.length === 0 || kw.some(k => title.includes(k));
           if (matchesKw) {
+            kwCount++;
             const SENIOR_TITLE_RE = /\b(senior|staff|principal|head of|vice president|vp[\s.]|director|sr\.?\s)/i;
             if (SENIOR_TITLE_RE.test(title)) continue;
             const entry = { company: job.company || t.entry.name || '', role: job.title || '', location: job.location || '', url: job.url || '', matched: true, source: t.provider.id, notes: t.entry.notes || '' };
             keywordMatched.push(entry);
             const matchesLoc = locs.length === 0 || locs.some(l => loc.includes(l));
-            if (matchesLoc) results.push(entry);
+            if (matchesLoc) {
+              exactCount++;
+              results.push(entry);
+            }
           }
         }
+        portalResults.push({ company: t.entry.name || 'unknown', status: 'scanned', keywordMatches: kwCount, exactMatches: exactCount });
       } catch (e) {
+        portalResults.push({ company: t.entry.name || 'unknown', status: 'errored', keywordMatches: 0, exactMatches: 0, error: e.message?.slice(0, 200) || 'unknown error' });
         errored.push({ company: t.entry.name, error: e.message });
       }
     }));
@@ -1850,14 +2231,14 @@ app.post('/scan', async (req, res) => {
 
     await Promise.all(webSearchTargets.slice(0, 15).map(async (entry) => {
       try {
-        if (!entry.careers_url) return;
+        if (!entry.careers_url) { portalResults.push({ company: entry.name || 'unknown', status: 'skipped', keywordMatches: 0, exactMatches: 0 }); return; }
         const resp = await fetch(entry.careers_url, {
           signal: controller.signal,
           headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36' },
         });
-        if (!resp.ok) return;
+        if (!resp.ok) { portalResults.push({ company: entry.name || 'unknown', status: 'unreachable', keywordMatches: 0, exactMatches: 0 }); return; }
         const html = await resp.text().catch(() => '');
-        if (html.length < 100) return;
+        if (html.length < 100) { portalResults.push({ company: entry.name || 'unknown', status: 'empty', keywordMatches: 0, exactMatches: 0 }); return; }
         // Build job title detection terms dynamically from profile + portals config
         const titleDetectTerms = new Set();
         for (const k of rawKw) for (const w of k.split(/\s+/)) if (w.length >= 3) titleDetectTerms.add(w.replace(/[^a-z0-9]/g, ''));
@@ -1873,6 +2254,8 @@ app.post('/scan', async (req, res) => {
 
         const seenUrls = new Set();
         const matches = [];
+        let kwCount = 0;
+        let exactCount = 0;
 
         let m;
         while ((m = linkPattern.exec(html)) !== null) {
@@ -1888,20 +2271,26 @@ app.post('/scan', async (req, res) => {
 
         for (const match of matches) {
           const href = match.href && (match.href.startsWith('http') ? match.href : new URL(match.href, entry.careers_url).href);
+          if (href && !isJobDetailUrl(href)) continue;
           if (href && seenUrls.has(href)) continue;
           if (href) seenUrls.add(href);
           const lower = match.title.toLowerCase();
           totalBeforeFilter++;
           if (kw.length === 0 || kw.some(k => lower.includes(k))) {
+            kwCount++;
             const companyLoc = (entry.location || '').toLowerCase();
             const matchesLoc = locs.length === 0 || locs.some(l => companyLoc.includes(l));
             const entry2 = { company: entry.name || '', role: match.title, location: entry.location || '', url: href || '', matched: true, source: 'websearch', notes: entry.notes || '' };
             keywordMatched.push(entry2);
-            if (matchesLoc) results.push(entry2);
+            if (matchesLoc) {
+              exactCount++;
+              results.push(entry2);
+            }
           }
         }
-      } catch {
-        // timeout or fetch error — skip
+        portalResults.push({ company: entry.name || 'unknown', status: 'scanned', keywordMatches: kwCount, exactMatches: exactCount });
+      } catch (e) {
+        portalResults.push({ company: entry.name || 'unknown', status: 'errored', keywordMatches: 0, exactMatches: 0, error: e.message?.slice(0, 200) || 'unknown error' });
       }
     }));
     clearTimeout(timeout);
@@ -1962,6 +2351,21 @@ app.post('/scan', async (req, res) => {
       }
     }
 
+    // Generate widening steps: honest explanation of what was done
+    const wideningSteps = [];
+    if (netNew > 0 && locationExactMatch) {
+      wideningSteps.push(`Found ${deduped.length} matches in your target area.`);
+    } else if (netNew > 0 && !locationExactMatch) {
+      wideningSteps.push(`No exact location matches in "${userCity || locs.join(', ')}".`);
+      wideningSteps.push(`Found ${otherLocations.length} keyword-matched roles in other areas — included as nearby matches.`);
+      if (userCountry) wideningSteps.push(`Try expanding location filter to "${userCountry}" for more results.`);
+    } else if (netNew === 0) {
+      wideningSteps.push(`Scanned ${portalsScanned} portals for "${rawKw.join(', ')}" positions.`);
+      wideningSteps.push('Zero matching jobs found anywhere with current filters.');
+      if (userCity) wideningSteps.push(`No openings for your profile in "${userCity}" or wider India at this time.`);
+      wideningSteps.push('This is an honest count — will re-check on next scheduled scan.');
+    }
+
     // Generate narrowing hints — progressive: suggest expanding location if no/few results
     const narrowingHints = [];
     if (kw.length === 0) narrowingHints.push('No keyword filter — all roles matched');
@@ -1974,12 +2378,20 @@ app.post('/scan', async (req, res) => {
     }
     if (netNew > 100) narrowingHints.push(`${netNew} results is a lot — consider narrowing keywords or adding a location`);
 
+    // If no exact location matches but keyword matches exist in other locations,
+    // include them in results so the app shows something useful
+    const exactResults = deduped.slice(0, 100);
+    const otherResults = otherLocations.slice(0, 100);
+    const mergedResults = exactResults.length > 0 ? exactResults : otherResults;
+
     res.json({
       total: totalBeforeFilter,
       newFound: netNew,
-      results: deduped.slice(0, 100),
-      otherLocations: otherLocations.slice(0, 100),
+      results: mergedResults,
+      otherLocations: otherResults,
       locationExactMatch,
+      portalResults,
+      wideningSteps,
       errors: errored,
       webFallback: webSearchTargets.length,
       summary: {
@@ -1999,6 +2411,252 @@ app.post('/scan', async (req, res) => {
   }
 });
 
+// ── Timeout helper ─────────────────────────────────────────────────
+// Race any promise against a wall-clock deadline. Used around browser
+// operations (launch, per-portal scrape, close) so one stuck portal or a
+// hung Chromium launch on a phone can never stall the whole scan.
+function withTimeout(promise, ms, label) {
+  let timer;
+  return Promise.race([
+    Promise.resolve(promise),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label || 'operation'} timed out after ${ms}ms`)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+// ── Shared location-term builder ─────────────────────────────────────
+// Profiles store cities in several shapes — a single city, or a comma /
+// newline-separated list ("Mumbai, Thane, Navi Mumbai…"), plus a commuting
+// preference that may live under compensation or candidate. Tokenizing all
+// of them means a Mumbai-area role matches whether the profile listed it as
+// one city or many, for every user.
+const LOC_STOP_WORDS = new Set(['onsite','site','on','in','at','area','near','around','hybrid','remote','work','or','and','the','from','office','for','within']);
+function buildNearbyTerms(profile) {
+  const p = profile || {};
+  const city = String(p.location?.city || '').toLowerCase();
+  const country = String(p.location?.country || '').toLowerCase();
+  const fullLoc = String(p.candidate?.location || '').toLowerCase();
+  const flex = String((p.candidate?.location_flexibility) || (p.compensation?.location_flexibility) || '').toLowerCase();
+  const terms = new Set();
+  const add = (t) => {
+    const c = t.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').trim();
+    if (c.length >= 2 && !/^\d+$/.test(c)) terms.add(c);
+  };
+  for (const tok of city.split(/[,\n;&/]+/)) add(tok);
+  if (country) terms.add(country);
+  for (const tok of flex.split(/[\s,;&/]+/)) {
+    const c = tok.toLowerCase().replace(/[^a-z]/g, '');
+    if (c.length >= 3 && !LOC_STOP_WORDS.has(c)) terms.add(c);
+  }
+  if (fullLoc && country) {
+    const parts = fullLoc.split(',').map(s => s.trim());
+    const statePart = parts.length >= 2 ? parts[parts.length - 2] : '';
+    if (statePart && !statePart.includes(country)) add(statePart);
+  }
+  return terms;
+}
+
+// ── Career-ops heuristic scoring for scan results ───────────────────
+// Zero-token fit score for every scanned opportunity so the user can see
+// a rating on every card. Mirrors the full evaluation rubric (role match,
+// seniority, location, domain, compensation). Not a substitute for the
+// deep opencode evaluation — it decides which roles deserve one.
+function scoreScanResult(result, userProfile, kwList) {
+  const title = (result.role || '').toLowerCase();
+  const loc = (result.location || '').toLowerCase();
+  const company = (result.company || '');
+  const notesAndCompany = ((result.notes || '') + ' ' + company + ' ' + title).toLowerCase();
+  const profile = userProfile || {};
+  let score = 0;
+  const details = [];
+
+  // 1. Role match (0-3)
+  const targetRoles = (profile.target_roles?.primary || []).map(r => String(r).toLowerCase());
+  const archetypes = (profile.target_roles?.archetypes || []).map(a => String(a.name || '').toLowerCase()).filter(Boolean);
+  const allRoles = [...new Set([...targetRoles, ...archetypes, ...(kwList || []).map(k => String(k).toLowerCase())])];
+  const fullMatch = allRoles.find(r => r && (title === r || title.includes(r)));
+  const tokenMatch = allRoles.filter(r => r && r.split(/\s+/).some(t => t.length >= 4 && title.includes(t)));
+  if (fullMatch) { score += 3; details.push(`exact role match "${fullMatch}"`); }
+  else if (tokenMatch.length > 0) { score += 2; details.push(`keyword overlap: ${[...new Set(tokenMatch)].slice(0, 3).join(', ')}`); }
+  else { score += 0.5; details.push('generic engineering role'); }
+
+  // 2. Seniority alignment (0-1)
+  const senior = /\b(senior|staff|principal|head of|vp[\s.]|director|lead|architect)\b/i.test(title);
+  const junior = /\b(junior|fresher|entry)\b/i.test(title);
+  if (junior) { score += 1; details.push('junior/fresher level'); }
+  else if (!senior) { score += 0.5; details.push('mid level'); }
+  else { details.push('senior role (no bonus)'); }
+
+  // 3. Location proximity (0-2)
+  const userCity = ((profile.location?.city) || '').toLowerCase().trim();
+  const userCountry = ((profile.location?.country) || '').toLowerCase().trim();
+  // location_flexibility lives under compensation in profile.yml (it is a
+  // commuting/preference field, not candidate identity). Read both locations
+  // for back-compat with profiles that placed it under candidate.
+  const flex = ((profile.candidate?.location_flexibility) || (profile.compensation?.location_flexibility) || '').toLowerCase();
+  const FLEX_STOP = new Set(['onsite', 'site', 'on', 'in', 'at', 'area', 'near', 'around', 'hybrid', 'remote', 'work', 'or', 'and', 'the']);
+  const flexCities = flex.split(/[\s/,;]+/).map(s => s.replace(/^[^a-z]+|[^a-z]+$/g, '')).filter(s => s.length >= 3 && !FLEX_STOP.has(s));
+  // The city field may be a multi-line/comma-separated list of preferred
+  // cities — tokenize it so every listed city scores like an exact hit.
+  const cityTokens = userCity.split(/[,\n;&/]+/).map(s => s.replace(/^[^a-z]+|[^a-z]+$/g, '')).filter(s => s.length >= 2 && !FLEX_STOP.has(s));
+  const preferredHits = [...new Set([...cityTokens, ...flexCities].filter(c => loc.includes(c)))];
+  if (preferredHits.length > 0) { score += 2; details.push(`in preferred area (${preferredHits.slice(0, 3).join(', ')})`); }
+  else if (userCountry && loc.includes(userCountry)) { score += 1.5; details.push('in-country'); }
+  else if (/\bremote\b/.test(loc) && (/\bremote\b/.test(flex) || /\bremote\b/.test(userCity))) { score += 2; details.push('remote (preferred)'); }
+  else if (loc) { score += 0.5; details.push('outside target area'); }
+  else { score += 0.5; details.push('location unknown'); }
+
+  // 4. Domain relevance (0-1)
+  const stopWords = new Set(['and','the','for','with','from','that','this','three','core','production','now','seeking','full','time','role','build','scale','applications','built','end','across','your','our','platform','product','yourself','what','stack','development','developer','developers','engineering','engineer','application','shipping','building','build','coordination','architecture','decisions','zero','live','projects','project','products','their','them','also','can','will','you','have','team','into']);
+  const domainTerms = new Set();
+  for (const w of ((profile.narrative?.exit_story || '')).toLowerCase().split(/\W+/)) if (w.length >= 4 && !stopWords.has(w)) domainTerms.add(w);
+  for (const pp of (profile.narrative?.proof_points || [])) {
+    for (const w of String(pp.hero_metric || '').toLowerCase().split(/\W+/)) if (w.length >= 4 && !stopWords.has(w)) domainTerms.add(w);
+  }
+  // Stack/domain words from superpowers — tech keywords (react, node, python,
+  // django, spring, fintech, logistics, recruitment, saas…) are the terms that
+  // actually appear in job titles/descriptions, unlike project names.
+  for (const sp of (profile.narrative?.superpowers || [])) {
+    for (const w of String(sp).toLowerCase().split(/\W+/)) if (w.length >= 4 && !stopWords.has(w)) domainTerms.add(w);
+  }
+  let domainHits = 0;
+  for (const dt of domainTerms) if (notesAndCompany.includes(dt)) domainHits++;
+  if (domainHits >= 2) { score += 1; details.push('domain relevance'); }
+  else if (domainHits === 1) { score += 0.5; details.push('some domain overlap'); }
+
+  // 5. Compensation fit (0-1)
+  const targetMin = parseFloat(profile.compensation?.minimum) || 3;
+  if (result.salary) {
+    const s = String(result.salary).toLowerCase();
+    const m = s.match(/₹?\s*([\d,.]+)\s*(?:-|to)\s*([\d,.]+)\s*(lpa|lakh|l)/) || s.match(/₹?\s*([\d,.]+)\s*(lpa|lakh|l)/);
+    if (m) {
+      const val = parseFloat(m[1].replace(/,/g, ''));
+      if (val >= targetMin) { score += 1; details.push('salary in range'); }
+      else if (val >= targetMin * 0.6) { score += 0.5; details.push('salary slightly below target'); }
+      else { score += 0.2; details.push('salary below target'); }
+    } else if (/competitive|market|negotiable|negotiation/i.test(s)) { score += 0.5; details.push('salary negotiable'); }
+  } else {
+    score += 0.5; // no data — don't penalize a missing field as much as a below-target salary
+  }
+
+  // Normalize to /5. The raw sum is out of 8 across five components, but two of
+  // them (domain 0-1 and salary 0-1) are frequently unscorable from portal data
+  // (job descriptions and salary figures are often absent), capping realistic
+  // results near 6/8 = 3.75. Normalizing by 7 instead of 8 keeps 5.0 for a
+  // perfect match while letting a genuine role+level+location triple-fit land at
+  // 4.0+. This is a user-agnostic calibration constant, identical for everyone.
+  const normalized = Math.round((Math.max(0, Math.min(score, 8)) / 7) * 20) / 4; // → /5
+  const finalScore = Math.max(0.5, Math.min(5, normalized));
+  const fit = finalScore >= 4 ? 'Strong' : finalScore >= 3 ? 'Moderate' : finalScore >= 2 ? 'Weak' : 'Poor';
+  return { score: `${finalScore.toFixed(1)}/5`, scoreNum: finalScore, fit, details };
+}
+
+// Seniority filter — a Junior/Mid dev should not be shown Senior Manager,
+// Director, VP, Staff/Principal, or "Head of" postings. Titles that clearly
+// name an engineering role (engineer/developer/full-stack) are kept — a
+// "Senior Software Engineer" can still be a target for a mid-level search.
+function isSeniorOnlyRole(title) {
+  const t = String(title || '');
+  // Junior/fresher/entry signals override any senior marker.
+  if (/\b(junior|fresher|entry\s+level|associate|trainee|intern)\b/i.test(t)) return false;
+  // SDE 2 / SDE II / Software Development Engineer III / Engineer II = senior
+  // IC levels — filter regardless of an "engineer" token in the title.
+  if (/\bsde\s*(?:[-.]?\s*)?(?:ii|iii|iv|v|\d+)\b/i.test(t)) return true;
+  if (/\b(?:software\s+development\s+)?engineer\s+(?:ii|iii|iv|v|vi|vii)\b/i.test(t)) return true;
+  if (/\bdeveloper\s+(?:ii|iii|iv|v|vi|vii)\b/i.test(t)) return true;
+  // Explicit senior leadership/keyword markers.
+  if (!/\b(senior|sr\.?|staff|principal|head\s+of|vice\s+president|vp[\s.]|director|chief|architect|lead)\b/i.test(t)) return false;
+  // Engineering postings are legitimate targets even with a senior prefix —
+  // but only when the title names the engineering role itself (not "Head of
+  // Engineering" / "VP Engineering", which are leadership postings).
+  if (/\b(engineer|developer|full.?stack|front.?end|back.?end|software\s+engineer|software\s+developer)\b/i.test(t)) return false;
+  return true;
+}
+
+// Load the user's tracker to build the "already applied" exclusion sets.
+// Active statuses (applied/responded/interview/offer) make a company an
+// active target — results there are suppressed so we never spam a company
+// the user is already in-process with. Rejected/discarded are re-eligible.
+function buildTrackerExclusion(trackerPath) {
+  const activeCompanies = new Set();
+  const activeRoles = new Set();
+  if (trackerPath && existsSync(trackerPath)) {
+    const lines = readFileSync(trackerPath, 'utf-8').split('\n');
+    for (const line of lines) {
+      const m = line.match(/^\|\s*\d+\s*\|[^|]*\|([^|]+)\|([^|]+)\|([^|]*)\|([^|]+)/);
+      if (!m) continue;
+      const company = m[1].trim().toLowerCase();
+      const role = m[2].trim().toLowerCase();
+      const status = m[4].trim().toLowerCase();
+      if (company && ['applied', 'responded', 'interview', 'offer'].includes(status)) {
+        activeCompanies.add(company);
+        activeRoles.add(`${company}::${role}`);
+      }
+    }
+  }
+  return { activeCompanies, activeRoles };
+}
+
+// Decode common HTML entities in scraped titles.
+function stripHtmlEntities(s) {
+  return String(s)
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, ' ')
+    .replace(/&#x2F;/g, '/').replace(/&ndash;/g, '-')
+    .replace(/&#\d+;/g, '');
+}
+
+// Extract plausible job links from portal HTML. Tolerates multiline anchors
+// and nested tags — Naukri/Indeed/Shine/Foundit/TimesJobs markup is messy and
+// the old single-line regex missed almost everything (hence "no matches").
+function extractHtmlJobLinks(html, baseUrl) {
+  const text = String(html || '')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ');
+  const out = [];
+  const seen = new Set();
+  const anchorRx = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
+  const hrefAttr = /\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')/i;
+  let m;
+  while ((m = anchorRx.exec(text)) !== null) {
+    const hrefMatch = hrefAttr.exec(m[1] || '');
+    let href = hrefMatch ? (hrefMatch[1] || hrefMatch[2] || '') : '';
+    if (!href || /^javascript:|^mailto:|^tel:|^#|^data:/.test(href)) continue;
+    const inner = (m[2] || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!inner || inner.length < 3 || inner.length > 220) continue;
+    try { href = new URL(href, baseUrl).href; } catch { continue; }
+    if (!href.startsWith('http')) continue;
+    const key = (inner + '|' + href).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ title: stripHtmlEntities(inner), url: href });
+  }
+  return out;
+}
+
+// Filter out non-job-detail anchors that Indian job boards surface alongside
+// real listings (search pages, blog posts, category/footer links). Keeps scan
+// results to actual job postings instead of inflated "job-search" noise.
+function isJobDetailUrl(urlStr) {
+  let u;
+  try { u = new URL(urlStr); } catch { return false; }
+  const host = (u.hostname || '').toLowerCase();
+  const path = (u.pathname || '').toLowerCase();
+  // Generic navigation/footer/noise signals — never individual job postings.
+  if (/\/(?:login|signup|register|log-in|sign-in|blog|faq|help|contact|about|search|job-alert|alerts|recommendations)\b/.test(path)) return false;
+  // Portal-specific detail URL shapes.
+  if (host.endsWith('shine.com')) return /\/jobs?\//.test(path);
+  if (host.endsWith('timesjobs.com')) return /\/jobdetail\//.test(path);
+  if (host.endsWith('internshala.com')) return /\/job\/detail\//.test(path) && !/(\?|&)utm_/i.test(u.search);
+  if (host.endsWith('naukri.com')) return /\/job\//.test(path);
+  if (host.endsWith('foundit.in') || host.endsWith('foundit.com')) return /\/job\//.test(path);
+  if (host.endsWith('instahyre.com')) return /\/job\//.test(path);
+  if (host.endsWith('indeed.com')) return /\/viewjob\b/.test(path);
+  return true;
+}
+
 // GET /scan/stream — SSE progress stream for portal scanning
 app.get('/scan/stream', async (req, res) => {
   res.writeHead(200, {
@@ -2012,6 +2670,8 @@ app.get('/scan/stream', async (req, res) => {
   try {
     let queryKeywords = req.query.keywords || '';
     let queryLocations = req.query.locations || '';
+    const round = parseInt(req.query.round, 10) || 1;
+    const expandPortals = round >= 2 || req.query.deep === 'true'; // re-scan expands to more portals
 
     // Auto-load from user profile if not provided in query
     if (!queryKeywords || !queryLocations) {
@@ -2020,7 +2680,10 @@ app.get('/scan/stream', async (req, res) => {
         try {
           const profile = yaml.load(readFileSync(pPath, 'utf-8')) || {};
           if (!queryKeywords && profile.target_roles?.primary?.length) {
-            queryKeywords = profile.target_roles.primary.join(',');
+            const archetypeNames = (profile.target_roles.archetypes || [])
+              .map(a => typeof a === 'string' ? a : (a.name || ''))
+              .filter(Boolean);
+            queryKeywords = [...profile.target_roles.primary, ...archetypeNames].join(',');
           }
           if (!queryLocations && profile.location?.city) {
             queryLocations = profile.location.city;
@@ -2037,20 +2700,7 @@ app.get('/scan/stream', async (req, res) => {
     const userLocFlex = ((userProfile.candidate?.location_flexibility) || '').toLowerCase().trim();
 
     // Dynamically extract nearby location terms from flexibility + full location
-    const nearbyTerms = new Set([userCity, userCountry].filter(Boolean));
-    if (userLocFlex) {
-      for (const part of userLocFlex.split(/[/,&\n]+/)) {
-        const cleaned = part.replace(/on.?site|in|area|remote|hybrid|office|work|from|or|and|the|near|within/gi, '').trim();
-        if (cleaned.length >= 3) nearbyTerms.add(cleaned);
-      }
-    }
-    if (/\bremote\b/i.test(userLocFlex)) nearbyTerms.add('remote');
-    // Extract state/region from full location (last part before country)
-    if (userLocFull && userCountry) {
-      const parts = userLocFull.split(',').map(s => s.trim());
-      const statePart = parts.length >= 2 ? parts[parts.length - 2] : '';
-      if (statePart && !statePart.includes(userCountry)) nearbyTerms.add(statePart.toLowerCase());
-    }
+    const nearbyTerms = buildNearbyTerms(userProfile);
 
     // Build domain relevance terms from user's experience narrative
     const domainTerms = new Set();
@@ -2069,8 +2719,10 @@ app.get('/scan/stream', async (req, res) => {
         if (w.length >= 4 && !STOP_WORDS.has(w)) expandedKw.add(w);
       }
     }
+    // Deep/re-scan mode: same relevance filters as normal scan — every card
+    // must be a plausible match. Never skip the profile keyword filters.
     const kw = [...expandedKw];
-    const rawLocParts = queryLocations.split(',').map(l => l.toLowerCase().trim()).filter(Boolean);
+    const rawLocParts = queryLocations.split(/[,\n;&]+/).map(l => l.toLowerCase().trim()).filter(Boolean);
     // Build location expansion dynamically from nearby terms
     const LOCATION_EXPANSIONS = {};
     for (const term of nearbyTerms) {
@@ -2081,7 +2733,7 @@ app.get('/scan/stream', async (req, res) => {
     const portalsPath = join(__dirname, 'portals.yml');
     if (!existsSync(portalsPath)) { send('done', { results: [], summary: { portalsScanned: 0, totalFound: 0, filteredByKeywords: 0, duplicatesSkipped: 0, netNew: 0 } }); return res.end(); }
     const py = yaml.load(readFileSync(portalsPath, 'utf-8'));
-    const companies = py?.tracked_companies || [];
+    let companies = py?.tracked_companies || [];
     const boards = py?.search_queries || [];
     const jobBoards = py?.job_boards || [];
 
@@ -2130,99 +2782,181 @@ app.get('/scan/stream', async (req, res) => {
     }
     for (const entry of jobBoards) {
       if (entry.enabled === false) continue;
+      // Second-tier boards (expand_on_rerun) only join on a re-scan so the
+      // first pass stays fast and each "Scan again" widens coverage.
+      if (entry.expand_on_rerun && !expandPortals) continue;
       const resolved = resolveProvider(entry, providers);
       if (resolved && !resolved.error) providerTargets.push({ entry, provider: resolved.provider, isBoard: true });
+      else if (entry.careers_url) webSearchTargets.push(entry);
     }
 
-    const totalPortals = providerTargets.length + Math.min(webSearchTargets.length, 15);
+    const totalPortalCount = providerTargets.length + webSearchTargets.length;
+    const phaseLabel = (label, count) => `${label} — ${count} source${count === 1 ? '' : 's'}`;
     let completed = 0;
 
-    send('start', { totalPortals, phase: 'providers' });
-
     // Phase 1: provider scanning (sequential for progress)
+    const streamPortalResults = [];
+    let phaseTotal = providerTargets.length;
+    completed = 0;
+    send('start', { totalPortals: phaseTotal, phase: 'providers', phaseLabel: phaseLabel('Phase 1/3 · career pages', phaseTotal) });
     for (const t of providerTargets) {
       try {
         const ctx = makeHttpCtx();
         const jobs = await t.provider.fetch(t.entry, ctx);
         totalBeforeFilter += jobs.length;
+        let kwCount = 0;
+        let exactCount = 0;
         for (const job of jobs) {
           const title = (job.title || '').toLowerCase();
           const loc = (job.location || '').toLowerCase();
           const matchesKw = kw.length === 0 || kw.some(k => title.includes(k));
           if (matchesKw) {
+            kwCount++;
             const SENIOR_TITLE_RE = /\b(senior|staff|principal|head of|vice president|vp[\s.]|director|sr\.?\s)/i;
             if (SENIOR_TITLE_RE.test(title)) continue;
             const entry = { company: job.company || t.entry.name || '', role: job.title || '', location: job.location || '', url: job.url || '', matched: true, source: t.provider.id, notes: t.entry.notes || '' };
             keywordMatched.push(entry);
             const matchesLoc = locs.length === 0 || locs.some(l => loc.includes(l));
-            if (matchesLoc) results.push(entry);
+            if (matchesLoc) {
+              exactCount++;
+              results.push(entry);
+            }
           }
         }
+        streamPortalResults.push({ company: t.entry.name || 'unknown', status: 'scanned', keywordMatches: kwCount, exactMatches: exactCount });
+        completed++;
+        send('progress', { completed, total: phaseTotal, current: t.entry.name || 'unknown', found: results.length, keywordMatches: kwCount, exactMatches: exactCount, phase: 'providers', phaseLabel: phaseLabel('Phase 1/3 · career pages', phaseTotal) });
       } catch (e) { 
+        streamPortalResults.push({ company: t.entry.name || 'unknown', status: 'errored', keywordMatches: 0, exactMatches: 0 });
+        completed++;
         send('progress', { 
           completed, 
-          total: totalPortals, 
+          total: phaseTotal, 
           current: t.entry.name || 'unknown', 
           found: results.length,
+          keywordMatches: 0,
+          exactMatches: 0,
+          phase: 'providers',
+          phaseLabel: phaseLabel('Phase 1/3 · career pages', phaseTotal),
           error: `Failed: ${e.message?.slice(0, 100) || 'unknown error'}`
         }); 
       }
-      completed++;
-      send('progress', { completed, total: totalPortals, current: t.entry.name || 'unknown', found: results.length });
     }
 
-    // Phase 2: web search fallback
-    if (webSearchTargets.length > 0) send('start', { totalPortals: webSearchTargets.length, phase: 'websearch' });
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 25000);
+    // Phase 2: direct HTTP scrape for every portal (no cap — every portal gets a shot).
+    if (webSearchTargets.length > 0) {
+      phaseTotal = webSearchTargets.length;
+      completed = 0;
+      send('start', { totalPortals: phaseTotal, phase: 'websearch', phaseLabel: phaseLabel('Phase 2/3 · job portals & boards', phaseTotal) });
+    }
+    // Job-like title detector built from profile keywords + common tech terms.
+    const joby = /\b(software|developer|engineer|full.?stack|front.?end|back.?end|react|node\.?js|java|python|spring|\.net|web|sde|swe|qa|test|trainee|intern|analyst|programmer|dev)\b/i;
 
-    for (const entry of webSearchTargets.slice(0, 15)) {
+    // Phase 2 uses a PER-PORTAL timeout (15s) so one slow or hung portal cannot
+    // stall the whole batch, and emits a progress event BEFORE each fetch so the
+    // app always shows live per-portal activity ("N/M — {portal}: Searching…")
+    // instead of a static phase label while a request is in flight.
+    const PORTAL_FETCH_TIMEOUT_MS = 15000;
+
+    for (const entry of webSearchTargets) {
+      let kwCount = 0;
+      let exactCount = 0;
+      let statusNote = 'Searching...';
+      if (!entry.careers_url) {
+        streamPortalResults.push({ company: entry.name || 'unknown', status: 'skipped', keywordMatches: 0, exactMatches: 0 });
+        completed++;
+        send('progress', { completed, total: phaseTotal, current: entry.name || 'web', found: results.length, keywordMatches: 0, exactMatches: 0, statusNote: 'skipped (no careers_url)', phase: 'websearch', phaseLabel: phaseLabel('Phase 2/3 · job portals & boards', phaseTotal) });
+        continue;
+      }
+      // Fresh per-portal abort signal — a slow request is cut off at 15s and the
+      // loop moves on to the next portal instead of blocking the whole phase.
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), PORTAL_FETCH_TIMEOUT_MS);
       try {
-        if (!entry.careers_url) continue;
-        const resp = await fetch(entry.careers_url, { signal: controller.signal, headers: { 'User-Agent': 'Mozilla/5.0' } });
-        if (!resp.ok) continue;
+        // Live feedback BEFORE the request, so the UI never looks stuck.
+        send('progress', { completed, total: phaseTotal, current: entry.name || 'web', found: results.length, keywordMatches: 0, exactMatches: 0, statusNote, phase: 'websearch', phaseLabel: phaseLabel('Phase 2/3 · job portals & boards', phaseTotal) });
+        // Race the fetch against a hard timer as a safety net: even if the
+        // AbortController above is flaky and the request never rejects on abort,
+        // this guarantees the loop moves on and the phase cannot stall forever.
+        const resp = await Promise.race([
+          fetch(entry.careers_url, {
+            signal: controller.signal,
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+              'Accept': 'text/html,application/xhtml+xml',
+              'Accept-Language': 'en-IN,en;q=0.9',
+            },
+            redirect: 'follow',
+          }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('portal fetch timed out')), PORTAL_FETCH_TIMEOUT_MS + 2000)),
+        ]);
+        if (!resp.ok) {
+          streamPortalResults.push({ company: entry.name || 'unknown', status: 'blocked', keywordMatches: 0, exactMatches: 0 });
+          statusNote = 'blocked (HTTP ' + resp.status + ') — trying Playwright next';
+          send('progress', { completed, total: phaseTotal, current: entry.name || 'web', found: results.length, keywordMatches: 0, exactMatches: 0, statusNote, error: statusNote, phase: 'websearch', phaseLabel: phaseLabel('Phase 2/3 · job portals & boards', phaseTotal) });
+          completed++;
+          continue;
+        }
         const html = await resp.text();
-        const titlePattern = /<a[^>]*href="([^"]*)"[^>]*>([^<]*(?:developer|engineer|full.?stack|frontend|backend|react|node|python|java|intern)[^<]*)<\/a>/gi;
-        let m;
-        while ((m = titlePattern.exec(html)) !== null) {
-          const title = m[2].trim();
-          const lower = title.toLowerCase();
+        if (!html || html.length < 100) {
+          streamPortalResults.push({ company: entry.name || 'unknown', status: 'empty', keywordMatches: 0, exactMatches: 0 });
+          statusNote = 'empty page — trying Playwright next';
+          send('progress', { completed, total: phaseTotal, current: entry.name || 'web', found: results.length, keywordMatches: 0, exactMatches: 0, statusNote, phase: 'websearch', phaseLabel: phaseLabel('Phase 2/3 · job portals & boards', phaseTotal) });
+          completed++;
+          continue;
+        }
+        const links = extractHtmlJobLinks(html, entry.careers_url);
+        for (const link of links) {
+          const title = link.title.toLowerCase();
+          if (!joby.test(title)) continue;
+          if (!isJobDetailUrl(link.url)) continue;
           totalBeforeFilter++;
-          if (kw.length === 0 || kw.some(k => lower.includes(k))) {
-            const href = m[1].startsWith('http') ? m[1] : new URL(m[1], entry.careers_url).href;
-            if (!keywordMatched.some(r => r.url === href)) {
+          if (kw.length === 0 || kw.some(k => title.includes(k))) {
+            kwCount++;
+            if (!keywordMatched.some(r => r.url === link.url)) {
               const companyLoc = (entry.location || '').toLowerCase();
               const matchesLoc = locs.length === 0 || locs.some(l => companyLoc.includes(l));
-              const entry2 = { company: entry.name || '', role: title, location: entry.location || '', url: href, matched: true, source: 'websearch', notes: entry.notes || '' };
+              const entry2 = { company: entry.name || '', role: link.title, location: entry.location || '', url: link.url, matched: true, source: 'websearch', notes: entry.notes || '' };
               keywordMatched.push(entry2);
-              if (matchesLoc && !results.some(r => r.url === href)) {
+              if (matchesLoc && !results.some(r => r.url === link.url)) {
+                exactCount++;
                 results.push(entry2);
               }
             }
           }
         }
-      } catch (e) { 
-        send('progress', { 
-          completed, 
-          total: totalPortals, 
-          current: entry.name || 'web', 
-          found: results.length,
-          error: `Failed: ${e.message?.slice(0, 100) || 'unknown error'}`
-        }); 
+        streamPortalResults.push({ company: entry.name || 'unknown', status: kwCount > 0 ? 'scanned' : 'no_matches', keywordMatches: kwCount, exactMatches: exactCount });
+        statusNote = kwCount > 0 ? `${kwCount} relevant title${kwCount !== 1 ? 's' : ''}` : `scanned ${links.length} link(s), no role matched your keywords`;
+      } catch (e) {
+        streamPortalResults.push({ company: entry.name || 'unknown', status: 'errored', keywordMatches: kwCount, exactMatches: exactCount });
+        statusNote = `failed (${(e.message || 'error').slice(0, 60)}) — trying Playwright next`;
+      } finally {
+        clearTimeout(timeout);
       }
       completed++;
-      send('progress', { completed, total: totalPortals, current: entry.name || 'web', found: results.length });
+      send('progress', { completed, total: phaseTotal, current: entry.name || 'web', found: results.length, keywordMatches: kwCount, exactMatches: exactCount, statusNote, phase: 'websearch', phaseLabel: phaseLabel('Phase 2/3 · job portals & boards', phaseTotal) });
     }
-    clearTimeout(timeout);
 
     // Phase 3: Playwright deep scraping for portals that returned no results
-    const playwrightFailed = webSearchTargets.filter(entry => {
-      const alreadyFound = results.some(r => r.company === entry.name);
-      return !alreadyFound && entry.careers_url;
-    });
+    // Includes both web search failures AND provider targets that returned zero matches
+    const providerZeroMatch = providerTargets
+      .filter(t => !t.isBoard && t.entry.careers_url)
+      .filter(t => {
+        const portal = streamPortalResults.find(p => p.company === t.entry.name);
+        return !portal || portal.keywordMatches === 0;
+      });
+    const playwrightFailed = [
+      ...webSearchTargets.filter(entry => {
+        const alreadyFound = results.some(r => r.company === entry.name);
+        return !alreadyFound && entry.careers_url;
+      }),
+      ...providerZeroMatch.map(t => t.entry)
+    ];
 
     if (playwrightFailed.length > 0) {
-      send('start', { totalPortals: playwrightFailed.length, phase: 'playwright' });
+      phaseTotal = playwrightFailed.length;
+      completed = 0;
+      send('start', { totalPortals: phaseTotal, phase: 'playwright', phaseLabel: phaseLabel('Phase 3/3 · browser retry', phaseTotal) });
       
       let chromium;
       let playwrightAvailable = true;
@@ -2241,7 +2975,9 @@ app.get('/scan/stream', async (req, res) => {
       // If Playwright isn't available locally, try remote proxy
       const remotePwUrl = process.env.REMOTE_PLAYWRIGHT_URL;
       if (!playwrightAvailable && remotePwUrl) {
-        for (const entry of playwrightFailed.slice(0, 10)) {
+        for (const entry of playwrightFailed.slice(0, expandPortals ? playwrightFailed.length : 30)) {
+          const beforeKw = keywordMatched.length;
+          const beforeExact = results.length;
           try {
             const resp = await fetch(`${remotePwUrl}/playwright/scrape`, {
               method: 'POST',
@@ -2255,7 +2991,7 @@ app.get('/scan/stream', async (req, res) => {
                 for (const link of data.links) {
                   const title = (link.title || '').toLowerCase();
                   const href = link.url;
-                  if (!href || keywordMatched.some(r => r.url === href)) continue;
+                  if (!href || !isJobDetailUrl(href) || keywordMatched.some(r => r.url === href)) continue;
                   const matchesKeyword = kw.length === 0 || kw.some(k => title.includes(k));
                   if (!matchesKeyword) continue;
                   const entry2 = { company: entry.name || '', role: link.title, location: entry.location || '', url: href, matched: true, source: 'remote-playwright', notes: entry.notes || '' };
@@ -2272,51 +3008,71 @@ app.get('/scan/stream', async (req, res) => {
             // Portal failed — continue
           }
           completed++;
-          send('progress', { completed, total: totalPortals, current: `${entry.name} (remote)`, found: results.length, phase: 'playwright' });
+          const kwCount = keywordMatched.length - beforeKw;
+          const exactCount = results.length - beforeExact;
+          send('progress', { completed, total: phaseTotal, current: `${entry.name} (remote)`, found: results.length, keywordMatches: kwCount, exactMatches: exactCount, phase: 'playwright', phaseLabel: phaseLabel('Phase 3/3 · browser retry', phaseTotal) });
         }
       } else if (!playwrightAvailable) {
-        send('progress', { completed: playwrightFailed.length, total: playwrightFailed.length, current: 'Playwright not available', found: results.length, error: 'playwright not installed, set REMOTE_PLAYWRIGHT_URL in .bridge.env to use a remote server' });
+        send('progress', { completed: playwrightFailed.length, total: playwrightFailed.length, current: 'Playwright not available', found: results.length, error: 'playwright not installed, set REMOTE_PLAYWRIGHT_URL in .bridge.env to use a remote server', phase: 'playwright', phaseLabel: phaseLabel('Phase 3/3 · browser retry', playwrightFailed.length) });
       }
       
       if (chromium) {
         let browser;
         try {
-          browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+          browser = await withTimeout(chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-gpu-compositing'] }), 30000, 'chromium launch');
         } catch (e) {
-          send('progress', { completed: playwrightFailed.length, total: playwrightFailed.length, current: 'Browser launch failed', found: results.length, error: e.message?.slice(0, 100) });
+          browser = null;
+          send('progress', { completed: playwrightFailed.length, total: playwrightFailed.length, current: 'Browser launch failed', found: results.length, error: (e.message || 'launch timed out').slice(0, 100), phase: 'playwright', phaseLabel: phaseLabel('Phase 3/3 · browser retry', playwrightFailed.length) });
         }
         
         if (browser) {
-          for (const entry of playwrightFailed.slice(0, 10)) { // cap at 10 Playwright scans
+          for (const entry of playwrightFailed.slice(0, expandPortals ? playwrightFailed.length : 30)) {
+            const beforeKw = keywordMatched.length;
+            const beforeExact = results.length;
             try {
+              await withTimeout((async () => {
               const page = await browser.newPage();
+              await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-IN,en;q=0.9' });
               await page.goto(entry.careers_url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-              await page.waitForTimeout(3000); // wait for SPA content
-              
-              // Extract job links from the page
+              await page.waitForTimeout(3500); // wait for SPA content
+
+              // Extract job listings from links + headings. Indian portals
+              // (Naukri, Indeed, Shine, Foundit, TimesJobs, ...) render job
+              // titles as links; we also read headings for JS-heavy boards.
               const jobs = await page.evaluate(() => {
-                const links = Array.from(document.querySelectorAll('a[href]'));
-                return links
-                  .filter(a => {
-                    const text = (a.textContent || '').toLowerCase();
-                    return text.includes('engineer') || text.includes('developer') || 
-                           text.includes('full stack') || text.includes('frontend') || 
-                           text.includes('backend') || text.includes('react') || 
-                           text.includes('node') || text.includes('python');
-                  })
-                  .map(a => ({
-                    title: (a.textContent || '').trim(),
-                    url: a.href
-                  }))
-                  .filter(j => j.title.length > 3 && j.title.length < 200);
+                const out = [];
+                const seen = new Set();
+                const push = (title, url) => {
+                  const t = (title || '').replace(/\s+/g, ' ').trim();
+                  if (t.length < 3 || t.length > 200) return;
+                  const key = (t + '|' + (url || '')).toLowerCase();
+                  if (seen.has(key)) return;
+                  seen.add(key);
+                  out.push({ title: t, url: url || '' });
+                };
+                for (const a of Array.from(document.querySelectorAll('a[href]'))) {
+                  const t = (a.textContent || '').trim();
+                  const u = a.href || '';
+                  if (/^javascript:|^mailto:|^tel:|^#/.test(u)) continue;
+                  push(t, u);
+                }
+                for (const h of Array.from(document.querySelectorAll('h1,h2,h3,h4,div[class*="job"] span,span[class*="job"],div[class*="title"],strong'))) {
+                  const t = (h.textContent || '').trim();
+                  if (t && t.length <= 200) push(t, '');
+                }
+                return out;
               });
-              
+
+              // Keep only titles that look like job postings relevant to this user
+              const joby = /\b(software|developer|engineer|full.?stack|front.?end|back.?end|react|node\.?js|java|python|spring|\.net|web|sde|swe|qa|test|trainee|intern|analyst|programmer|dev)\b/i;
               for (const job of jobs) {
                 const title = job.title.toLowerCase();
+                if (!joby.test(title)) continue;
+                if (job.url && !isJobDetailUrl(job.url)) continue;
                 totalBeforeFilter++;
                 if (kw.length === 0 || kw.some(k => title.includes(k))) {
                   const href = job.url;
-                  if (!keywordMatched.some(r => r.url === href)) {
+                  if (href && !keywordMatched.some(r => r.url === href)) {
                     const companyLoc = (entry.location || '').toLowerCase();
                     const matchesLoc = locs.length === 0 || locs.some(l => companyLoc.includes(l));
                     const entry2 = { company: entry.name || '', role: job.title, location: entry.location || '', url: href, matched: true, source: 'playwright', notes: entry.notes || '' };
@@ -2329,19 +3085,25 @@ app.get('/scan/stream', async (req, res) => {
               }
               
               await page.close();
+              })(), 25000, `${entry.name || 'portal'} scrape`);
             } catch (e) {
               // Portal failed — continue
             }
             completed++;
+            const kwCount = keywordMatched.length - beforeKw;
+            const exactCount = results.length - beforeExact;
             send('progress', { 
               completed, 
-              total: totalPortals, 
+              total: phaseTotal, 
               current: `${entry.name} (Playwright)`, 
               found: results.length,
-              phase: 'playwright'
+              keywordMatches: kwCount,
+              exactMatches: exactCount,
+              phase: 'playwright',
+              phaseLabel: phaseLabel('Phase 3/3 · browser retry', phaseTotal)
             });
           }
-          await browser.close();
+          await withTimeout(browser.close(), 10000, 'browser close');
         }
       }
     }
@@ -2363,7 +3125,7 @@ app.get('/scan/stream', async (req, res) => {
     };
 
     // Location-aware response: if no exact matches but keyword matches exist,
-    // include them as a separate `otherLocations` list
+    // include them as a separate `otherLocations` list so the app shows both.
     const locationExactMatch = results.length > 0;
     const locationTier = locs.length === 0 ? 'none' : locationExactMatch ? 'exact' : 'nearby';
     keywordMatched.sort((a, b) => localScore(b) - localScore(a));
@@ -2377,19 +3139,71 @@ app.get('/scan/stream', async (req, res) => {
       });
     }
 
-    // Dedup
+    // Dedup (by URL, fallback by company+role for entries without a URL)
     const seen = new Set();
-    const deduped = results.filter(r => { if (seen.has(r.url)) return false; seen.add(r.url); return true; });
-    deduped.sort((a, b) => localScore(b) - localScore(a));
+    const seenCR = new Set();
+    const rawResults = [...results, ...otherLocations];
+    const deduped = rawResults.filter(r => {
+      if (!r.company || !r.role) return false; // never show empty cards
+      const urlKey = r.url || '';
+      if (urlKey && seen.has(urlKey)) return false;
+      if (urlKey) seen.add(urlKey);
+      const crKey = `${(r.company || '').toLowerCase()}::${(r.role || '').toLowerCase()}`;
+      if (seenCR.has(crKey)) return false;
+      seenCR.add(crKey);
+      return true;
+    });
+
+    // Level filter — hide Senior Manager/Director/VP/Staff postings that a
+    // Junior/Mid developer should not be shown (they inflate the result list).
+    const filteredByLevel = [];
+    const levelFiltered = deduped.filter(r => {
+      if (isSeniorOnlyRole(r.role)) { filteredByLevel.push(r); return false; }
+      return true;
+    });
+
+    // Don't re-spam companies the user already applied to (per-user tracker).
+    const { activeCompanies, activeRoles } = buildTrackerExclusion(req.userCtx.trackerPath || TRACKER_PATH);
+    const excludedApplied = [];
+    const usableResults = [];
+    for (const r of levelFiltered) {
+      const company = (r.company || '').toLowerCase();
+      const role = (r.role || '').toLowerCase();
+      if (activeCompanies.has(company) || activeRoles.has(`${company}::${role}`)) {
+        excludedApplied.push(r);
+        continue;
+      }
+      usableResults.push(r);
+    }
+
+    // Score every opportunity with the career-ops rubric so each card is rated.
+    const profileForScore = readProfile();
+    const scored = usableResults.map(r => {
+      const s = scoreScanResult(r, profileForScore, rawKw);
+      return { ...r, score: s.score, scoreNum: s.scoreNum, fit: s.fit, scoreDetails: s.details };
+    });
+    scored.sort((a, b) => b.scoreNum - a.scoreNum || localScore(b) - localScore(a));
+
     const today = new Date().toISOString().slice(0, 10);
-    for (const r of [...deduped, ...otherLocations]) {
+    for (const r of scored) {
       if (r.url && !scanHistory.has(r.url)) {
         try { appendFileSync(scanHistPath, `${today}\t${r.url}\t${r.source || 'bridge'}\n`); } catch { /* non-fatal */ }
       }
     }
 
-    const duplicatesSkipped = results.length - deduped.length;
-    const netNew = deduped.length + otherLocations.length;
+    // Per-user scan note — append found opportunities to the user's data dir
+    try {
+      const notePath = join(req.userCtx.userDir, 'data', 'scan-results.md');
+      if (!existsSync(notePath)) writeFileSync(notePath, '# Scan Results (auto-recorded)\n\n');
+      const noteLines = [`\n## ${today} — ${rawKw.join(', ') || 'all roles'} | ${locStrForNote(queryLocations)}\n`];
+      for (const r of scored) {
+        noteLines.push(`| ${r.company} | ${r.role} | ${r.score} | ${r.location || ''} | ${r.url || ''} |`);
+      }
+      appendFileSync(notePath, noteLines.join('\n'), 'utf-8');
+    } catch { /* non-fatal */ }
+
+    const duplicatesSkipped = rawResults.length - deduped.length;
+    const netNew = scored.length;
     const narrowingHints = [];
     if (kw.length === 0) narrowingHints.push('No keyword filter — all roles matched');
     if (locs.length === 0) narrowingHints.push('No location filter — results include all locations');
@@ -2399,23 +3213,48 @@ app.get('/scan/stream', async (req, res) => {
     } else if (!locationExactMatch && otherLocations.length > 0) {
       narrowingHints.push(`No exact location matches — ${otherLocations.length} keyword-matched jobs found in other locations. Try expanding your location to "${userCountry}" or nearby cities.`);
     }
-    if (netNew > 100) narrowingHints.push(`${netNew} results is a lot — consider narrowing keywords or adding a location`);
+    if (netNew > 150) narrowingHints.push(`${netNew} results is a lot — consider narrowing keywords or adding a location`);
+    if (filteredByLevel.length > 0) narrowingHints.push(`Filtered out ${filteredByLevel.length} senior-level role(s) (Senior Manager/Director/VP) that don't fit a Junior/Mid search.`);
+
+    // Build widening steps for the done event
+    const streamWideningSteps = [];
+    if (netNew > 0 && locationExactMatch) {
+      streamWideningSteps.push(`Found ${scored.length} matching roles in your target area.`);
+    } else if (netNew > 0 && !locationExactMatch) {
+      streamWideningSteps.push(`No exact location matches. Included ${scored.length} keyword-matched roles from other areas.`);
+    } else if (netNew === 0) {
+      streamWideningSteps.push(`Scanned ${totalPortalCount} portals — zero matching jobs found.`);
+      if (userCity) streamWideningSteps.push(`No openings for your profile in "${userCity}" or wider India at this time.`);
+      streamWideningSteps.push('Will re-check on next scheduled scan.');
+    }
+    if (excludedApplied.length > 0) {
+      streamWideningSteps.push(`Skipped ${excludedApplied.length} role(s) at companies you already applied to (tracker).`);
+    }
+    if (!expandPortals) {
+      streamWideningSteps.push(`Scan again to expand across more Indian job portals (Naukri, Indeed, Shine, Foundit, TimesJobs, Hirist, Cutshort, Instahyre, Internshala and more).`);
+    }
 
     send('done', {
       total: totalBeforeFilter,
       newFound: netNew,
-      results: deduped.slice(0, 100),
-      otherLocations: otherLocations.slice(0, 100),
+      results: scored,
+      otherLocations: [],
       locationExactMatch,
+      portalResults: streamPortalResults,
+      wideningSteps: streamWideningSteps,
+      round,
       summary: {
-        portalsScanned: totalPortals,
+        portalsScanned: totalPortalCount,
         totalFound: totalBeforeFilter,
         filteredByKeywords: totalBeforeFilter - keywordMatched.length,
         filteredByLocation: keywordMatched.length - deduped.length,
+        filteredByLevel: filteredByLevel.length,
         duplicatesSkipped,
+        excludedApplied: excludedApplied.length,
         netNew,
         locationTier,
-        tooBroad: netNew > 100,
+        expanded: expandPortals,
+        tooBroad: netNew > 150,
         narrowingHints,
       },
     });
@@ -2425,6 +3264,12 @@ app.get('/scan/stream', async (req, res) => {
     res.end();
   }
 });
+
+// helper for the scan note header
+function locStrForNote(queryLocations) {
+  const parts = String(queryLocations || '').split(',').map(s => s.trim()).filter(Boolean);
+  return parts.length ? parts.join(', ') : 'any location';
+}
 
 // POST /resume/upload — accepts PDF/DOCX, extracts text, returns structured profile + suggestions
 app.post('/resume/upload', upload.single('resume'), async (req, res) => {
@@ -2591,6 +3436,126 @@ app.post('/resume/upload', upload.single('resume'), async (req, res) => {
   }
 });
 
+// ── Interview detection helpers ──────────────────────────────────
+// Parses a scheduled interview date/time out of an email subject/body.
+// Returns { date: 'YYYY-MM-DD', time: 'HH:MM', iso, human, confidence } or null.
+function extractInterviewDateTime(subject, body) {
+  const text = `${subject || ''}\n${body || ''}`.replace(/\s+/g, ' ').trim();
+  if (!text) return null;
+
+  const MONTHS = { january: 0, feb: 1, february: 1, mar: 2, march: 2, apr: 3, april: 3, may: 4, jun: 5, june: 5, jul: 6, july: 6, aug: 7, august: 7, sep: 8, sept: 8, september: 8, oct: 9, october: 9, nov: 10, november: 10, dec: 11, december: 11 };
+  const DOW = { sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6 };
+
+  const now = new Date();
+  let target = null;
+  let foundTime = null;
+  let confidence = 0;
+
+  // Time: "10:30 AM", "10am", "2 PM", "14:30", "2:00 PM IST"
+  const timeRe = /\b([01]?\d|2[0-3])(?::([0-5]\d))?\s*(am|pm|a\.m\.|p\.m\.)?\b/i;
+  const timeMatch = timeRe.exec(text);
+  if (timeMatch) {
+    let h = parseInt(timeMatch[1], 10);
+    let m = timeMatch[2] ? parseInt(timeMatch[2], 10) : 0;
+    const meridiem = (timeMatch[3] || '').toLowerCase();
+    if (meridiem.startsWith('p') && h < 12) h += 12;
+    if (meridiem.startsWith('a') && h === 12) h = 0;
+    // Only trust if plausibly a wall-clock time in an interview context
+    if (h <= 23 && (timeMatch[2] || meridiem || h >= 7)) {
+      foundTime = { h, m };
+      confidence += 1;
+    }
+  }
+
+  // "tomorrow" / "today"
+  if (/\btomorrow\b/i.test(text)) {
+    target = new Date(now); target.setDate(target.getDate() + 1); confidence += 2;
+  } else if (/\btoday\b/i.test(text)) {
+    target = new Date(now); confidence += 1;
+  }
+
+  // Month-name date: "August 5", "5th August", "August 5, 2026"
+  if (!target) {
+    const md = /\b(?:on\s+)?(\d{1,2})(?:st|nd|rd|th)?\s+(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\b(?:\s*,?\s*(\d{4}))?/i.exec(text) ||
+      /\b(?:on\s+)?(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\s+(\d{1,2})(?:st|nd|rd|th)?\b(?:\s*,?\s*(\d{4}))?/i.exec(text);
+    if (md) {
+      const monthName = md[1] || md[2];
+      const dayStr = md[2] || md[1];
+      const year = parseInt(md[3] || now.getFullYear(), 10);
+      const month = MONTHS[monthName.toLowerCase()];
+      if (month !== undefined) {
+        target = new Date(year, month, parseInt(dayStr, 10));
+        confidence += 2;
+      }
+    }
+  }
+
+  // Numeric date: "05/08/2026", "2026-08-05", "05-08-2026"
+  if (!target) {
+    const nd = /\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b|\b(\d{1,2})[-/](\d{1,2})[-/](\d{4})\b/.exec(text);
+    if (nd) {
+      const [ , y1, m1, d1, d2, m2, y2 ] = nd;
+      const year = parseInt(y1 || y2, 10);
+      const month = parseInt(m1 || m2, 10);
+      const day = parseInt(d1 || d2, 10);
+      if (month >= 1 && month <= 12 && day >= 1 && day <= 31 && year >= now.getFullYear() - 1) {
+        target = new Date(year, month - 1, day);
+        confidence += 2;
+      }
+    }
+  }
+
+  // Day-of-week: "on Monday", "next Tuesday", "this Friday"
+  if (!target) {
+    const dowRe = /\b(?:on\s+|next\s+|this\s+|coming\s+)?(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/i;
+    const dowMatch = dowRe.exec(text);
+    if (dowMatch) {
+      const d = DOW[dowMatch[1].toLowerCase()];
+      let delta = (d - now.getDay() + 7) % 7;
+      if (/\bnext\s+/.test(text)) delta = delta === 0 ? 7 : delta;
+      if (/\b(?:this|on)\s+sunday/i.test(text) && d === now.getDay()) delta = 0;
+      target = new Date(now); target.setDate(target.getDate() + delta);
+      confidence += 1;
+    }
+  }
+
+  if (!target) return null;
+  if (foundTime) {
+    target.setHours(foundTime.h, foundTime.m, 0, 0);
+  } else {
+    target.setHours(0, 0, 0, 0);
+  }
+
+  const human = target.toLocaleString('en-US', { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  return {
+    date: `${target.getFullYear()}-${String(target.getMonth() + 1).padStart(2, '0')}-${String(target.getDate()).padStart(2, '0')}`,
+    time: `${String(target.getHours()).padStart(2, '0')}:${String(target.getMinutes()).padStart(2, '0')}`,
+    iso: target.toISOString(),
+    human,
+    confidence,
+  };
+}
+
+function interviewsFilePath(req) {
+  const dataDir = req.userCtx?.dataDir || join(__dirname, 'data');
+  return join(dataDir, 'interviews.json');
+}
+
+function loadInterviews(req) {
+  try {
+    const p = interviewsFilePath(req);
+    return existsSync(p) ? JSON.parse(readFileSync(p, 'utf-8')) : [];
+  } catch { return []; }
+}
+
+function saveInterviews(req, arr) {
+  try {
+    const p = interviewsFilePath(req);
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, JSON.stringify(arr, null, 2));
+  } catch { /* non-fatal */ }
+}
+
 // POST /email/triage — classify inbox emails server-side into recruiter replies / spam / other
 app.post('/email/triage', async (req, res) => {
   const { email, appPassword } = req.body;
@@ -2602,7 +3567,22 @@ app.post('/email/triage', async (req, res) => {
   if (!user) return res.status(400).json({ error: 'email required' });
   if (!pass && !hasUserOAuth2 && !hasLegacyOAuth2) return res.status(400).json({ error: 'appPassword or OAuth2 credentials required' });
 
-  const allEmails = await fetchEmails(user, pass, { userOAuth });
+  // OAuth users get Gmail REST (reliable); app-password users keep IMAP
+  let allEmails;
+  if (hasUserOAuth2 || hasLegacyOAuth2) {
+    try {
+      allEmails = await fetchGmailInboxREST(user, req.userCtx.userId, {
+        daysBack: parseInt(req.body.daysBack, 10) || 30,
+        maxEmails: parseInt(req.body.maxEmails, 10) || 50,
+      });
+    } catch (restErr) {
+      logRestError('email/triage', email, restErr);
+      allEmails = await fetchEmails(user, pass, { userOAuth });
+    }
+  } else {
+    allEmails = await fetchEmails(user, pass, { userOAuth });
+  }
+
   const triaged = allEmails.map(e => {
     const subj = (e.subject || '').toLowerCase();
     const body = (e.body || '').toLowerCase();
@@ -2622,9 +3602,131 @@ app.post('/email/triage', async (req, res) => {
     else if (isRejection) classification = 'rejection';
     else if (isRecruiter) classification = 'recruiter_reply';
     else if (isSpam) classification = 'spam';
-    return { ...e, classification };
+
+    let scheduledAt = null, scheduledHuman = null;
+    if (classification === 'interview') {
+      const dt = extractInterviewDateTime(e.subject, e.body);
+      if (dt) {
+        scheduledAt = dt.iso;
+        scheduledHuman = dt.human;
+      }
+    }
+    return { ...e, classification, scheduledAt, scheduledHuman };
   });
   res.json({ emails: triaged });
+});
+
+// POST /interview/detect — scan inbox for interview-scheduling emails,
+// extract date/time, and persist them to data/interviews.json (per user).
+app.post('/interview/detect', async (req, res) => {
+  try {
+    const { email, appPassword, daysBack, maxEmails } = req.body;
+    const userId = req.userCtx?.userId;
+    const userOAuth = userId ? getUserOAuth(userId) : null;
+    const hasUserOAuth2 = hasUsableOAuth(userOAuth);
+    const hasLegacyOAuth2 = process.env.GMAIL_CLIENT_ID && process.env.GMAIL_CLIENT_SECRET && process.env.GMAIL_REFRESH_TOKEN;
+    const user = email || process.env.GMAIL_USER || req.userCtx?.userId;
+    if (!user || (!appPassword && !hasUserOAuth2 && !hasLegacyOAuth2)) {
+      return res.status(400).json({ error: 'email and auth (appPassword or OAuth2) required' });
+    }
+
+    let allEmails;
+    if (hasUserOAuth2 || hasLegacyOAuth2) {
+      try {
+        allEmails = await fetchGmailInboxREST(user, userId, {
+          daysBack: parseInt(daysBack, 10) || 14,
+          maxEmails: parseInt(maxEmails, 10) || 40,
+        });
+      } catch (restErr) {
+        logRestError('interview/detect', email, restErr);
+        allEmails = await fetchEmails(user, appPassword, { userOAuth });
+      }
+    } else {
+      allEmails = await fetchEmails(user, appPassword, { userOAuth });
+    }
+
+    const interviews = loadInterviews(req);
+    const seen = new Set(interviews.map(i => i.key));
+    let newCount = 0;
+    const found = [];
+
+    for (const e of (allEmails || [])) {
+      const fromL = (e.fromEmail || e.from || '').toLowerCase();
+      // Skip job-board alerts / digests — they're not interview invites
+      const digestFrom = ['naukri', 'indeed', 'linkedin', 'glassdoor', 'monster', 'hirist', 'quora', 'buzzfeed', 'medium', 'substack', 'newsletter', 'digest', 'no-reply', 'noreply', 'updates@', 'donotreply'];
+      if (digestFrom.some(d => fromL.includes(d))) continue;
+
+      const subj = (e.subject || '').toLowerCase();
+      const body = (e.body || e.preview || '').toLowerCase();
+      const isInterview =
+        /interview|phone screen|next round|meeting with|screen(ing)? call|technical round|hr round|f2f|face.to.face/i.test(subj) ||
+        /interview|phone screen|availability|next step|schedule(d)?|confirmed|we would like to meet|pleased to invite/i.test(body);
+      if (!isInterview) continue;
+
+      const dt = extractInterviewDateTime(e.subject, e.body || e.preview);
+      const key = `${e.fromEmail || e.from || ''}|${(e.subject || '').slice(0, 60)}`;
+      let record = interviews.find(i => i.key === key);
+      if (!record) {
+        record = {
+          key,
+          id: e.gmailId || String(Date.now()),
+          from: e.from || '',
+          subject: e.subject || '',
+          bodyPreview: (e.body || e.preview || '').slice(0, 400),
+          detectedAt: new Date().toISOString(),
+          reminderSentAt: null,
+          status: 'scheduled',
+        };
+        interviews.push(record);
+        newCount++;
+      }
+      if (dt) {
+        record.scheduledAt = dt.iso;
+        record.scheduledHuman = dt.human;
+        record.date = dt.date;
+        record.time = dt.time;
+        record.confidence = dt.confidence;
+      }
+      found.push({
+        from: record.from,
+        subject: record.subject,
+        scheduledAt: record.scheduledAt || null,
+        scheduledHuman: record.scheduledHuman || null,
+        status: record.status,
+      });
+    }
+
+    saveInterviews(req, interviews);
+    res.json({ interviews: found, newCount, total: interviews.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /interviews — list detected interviews with reminder status
+app.get('/interviews', (req, res) => {
+  try {
+    const now = Date.now();
+    const interviews = loadInterviews(req)
+      .map(i => {
+        const scheduledMs = i.scheduledAt ? new Date(i.scheduledAt).getTime() : null;
+        let reminder = null;
+        if (scheduledMs) {
+          const diffMs = scheduledMs - now;
+          const diffH = Math.round(diffMs / 3600000);
+          if (diffMs < 0 && diffH > -48) reminder = { due: true, label: `Interview was ${Math.abs(diffH)}h ago` };
+          else if (diffH <= 0) reminder = { due: true, label: 'Interview time reached' };
+          else if (diffH <= 1) reminder = { due: true, label: `Interview in ${diffH}h` };
+          else if (diffH <= 24) reminder = { due: true, label: `Interview in ${diffH}h (${i.scheduledHuman})` };
+          else reminder = { due: false, label: `Interview in ${diffH}h` };
+        }
+        return { ...i, reminder };
+      })
+      .sort((a, b) => (a.scheduledAt || '9999') < (b.scheduledAt || '9999') ? -1 : 1);
+    res.json({ interviews, count: interviews.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // GET /portals — list available tracked companies and boards
@@ -2769,7 +3871,8 @@ app.post('/email/reply/send', async (req, res) => {
   }
 });
 
-// POST /email/spam/delete — delete selected messages via IMAP (HITL: user selects which to delete)
+// POST /email/spam/delete — delete selected messages (HITL: user selects which to delete)
+// OAuth users: Gmail REST delete by message id. App-password users: IMAP.
 app.post('/email/spam/delete', async (req, res) => {
   try {
     const { messageIds, markAsRead } = req.body;
@@ -2782,13 +3885,68 @@ app.post('/email/spam/delete', async (req, res) => {
     const hasUserOAuth2 = hasUsableOAuth(userOAuth);
     const hasLegacyOAuth2 = process.env.GMAIL_CLIENT_ID && process.env.GMAIL_CLIENT_SECRET && process.env.GMAIL_REFRESH_TOKEN;
     const userEmail = userOAuth?.userEmail || process.env.GMAIL_USER;
-    const imapPassword = process.env.GMAIL_APP_PASSWORD;
+    const imapPassword = (process.env.GMAIL_APP_PASSWORD || '').replace(/\s+/g, '');
 
     if (!userEmail || (!hasUserOAuth2 && !hasLegacyOAuth2 && !imapPassword)) {
       return res.status(400).json({ error: 'IMAP credentials not configured — connect Gmail in Settings' });
     }
 
-    // Dynamic import for imap (optional dependency)
+    // ── OAuth users: Gmail REST delete (reliable; avoids IMAP) ──────────
+    if (hasUserOAuth2 || hasLegacyOAuth2) {
+      const accessToken = await resolveGmailAccessToken(userId, userEmail);
+      const headers = { Authorization: `Bearer ${accessToken}` };
+
+      // Gmail message ids are 15-19 digit numeric strings — use directly.
+      // Anything else is a sequential id (1..N) from /email/inbox; map to gmailId.
+      const isGmailId = (s) => /^\d{15,19}$/.test(String(s));
+      const needsResolve = messageIds.some(m => !isGmailId(m));
+      const gmailIdBySeq = {};
+      if (needsResolve) {
+        const inboxEmails = await fetchGmailInboxREST(userEmail, userId, { daysBack: 30, maxEmails: 100 });
+        for (const e of inboxEmails) gmailIdBySeq[String(e.id)] = e.gmailId;
+      }
+
+      const deleted = [];
+      const failed = [];
+      const seen = new Set();
+      for (const rawId of messageIds) {
+        const gmailId = isGmailId(rawId) ? String(rawId) : gmailIdBySeq[String(rawId)];
+        if (!gmailId || seen.has(gmailId)) { if (!gmailId) failed.push(rawId); continue; }
+        seen.add(gmailId);
+        try {
+          if (markAsRead) {
+            await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${gmailId}/modify`, {
+              method: 'POST',
+              headers: { ...headers, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ removeLabelIds: ['UNREAD'] }),
+            });
+          }
+          const delResp = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${gmailId}`, {
+            method: 'DELETE',
+            headers,
+          });
+          if (delResp.ok) {
+            deleted.push(rawId);
+          } else {
+            const errText = await delResp.text().catch(() => '');
+            console.error(`[email/spam/delete] Gmail delete failed for ${gmailId}: ${delResp.status} ${errText.slice(0, 150)}`);
+            failed.push(rawId);
+          }
+        } catch (delErr) {
+          console.error(`[email/spam/delete] ${delErr.message}`);
+          failed.push(rawId);
+        }
+      }
+      return res.json({
+        success: true,
+        deleted: deleted.length,
+        failed: failed.length,
+        details: { deleted, failed },
+        method: hasUserOAuth2 ? 'per_user_oauth2_rest' : 'legacy_oauth2_rest',
+      });
+    }
+
+    // ── App-password users: IMAP delete ─────────────────────────────────
     let Imap;
     try {
       Imap = (await import('imap')).default;
@@ -2857,10 +4015,7 @@ app.post('/email/spam/delete', async (req, res) => {
             const uidNum = parseInt(uid, 10);
             if (isNaN(uidNum)) { failed.push(uid); processed++; continue; }
 
-            const seq = [uidNum];
-            const ops = [['+FLAGS', '\\Deleted']];
-
-            imap.addFlags(seq, ['\\Deleted'], (err) => {
+            imap.uid.addFlags(uidNum, ['\\Deleted'], (err) => {
               if (err) {
                 failed.push(uid);
               } else {
@@ -2901,7 +4056,13 @@ app.post('/auto-pipeline', async (req, res) => {
     // Fetch JD content for opencode context
     try {
       const resp = await fetch(url, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36' },
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Cache-Control': 'no-cache',
+          'Upgrade-Insecure-Requests': '1',
+        },
         signal: AbortSignal.timeout(15000),
       });
       if (resp.ok) {
@@ -2913,7 +4074,7 @@ app.post('/auto-pipeline', async (req, res) => {
     // Delegate to opencode — the career-ops AI agent
     const prompt = jdText
       ? `Evaluate this job posting using career-ops auto-pipeline mode. Return ONLY a JSON object (no markdown, no code fences) with these fields: {"score": "X.X", "fit": "1-2 sentence fit assessment", "strengths": ["s1","s2"], "gaps": ["g1"]}. Score is 1.0-5.0. Be honest and conservative. Job URL: ${url} Company: ${company || 'Unknown'} Role: ${role || 'Unknown'} JD text: ${jdText.slice(0, 6000)}`
-      : `Evaluate this job posting using career-ops auto-pipeline mode. Return ONLY a JSON object (no markdown, no code fences) with these fields: {"score": "X.X", "fit": "1-2 sentence fit assessment", "strengths": ["s1","s2"], "gaps": ["g1"]}. Score is 1.0-5.0. Be honest and conservative. Job URL: ${url} Company: ${company || 'Unknown'} Role: ${role || 'Unknown'}`;
+      : `Evaluate this job posting using career-ops auto-pipeline mode. IMPORTANT: the job description could NOT be fetched from the URL — do NOT guess or invent any details about salary, location, stack, or requirements. If you cannot evaluate without the JD, return exactly {"score": "N/A", "fit": "JD could not be fetched — cannot evaluate reliably", "strengths": [], "gaps": []}. Never copy details from any other job. Job URL: ${url} Company: ${company || 'Unknown'} Role: ${role || 'Unknown'}`;
 
     const result = await runOpencode(prompt, 120000, userCwd(req));
 
@@ -2980,6 +4141,8 @@ ${(evaluation.gaps || []).map(g => `- ${g}`).join('\n') || '- None identified'}
 
   res.json({
     score,
+    company: req.body.company || '',
+    role: req.body.role || '',
     reportNum: nextNum,
     reportPath: `${numStr}-${companySlug}-${today}.md`,
     fit: evaluation.fit,
@@ -3255,12 +4418,47 @@ app.post('/email/draft', async (req, res) => {
     const { type, company, role, jd, contactName, reportNum } = req.body;
     const cv = readUserCv(req);
     const profile = readUserProfileRaw(req);
+
+    // If jd is a job URL, fetch the posting and extract real contact info from
+    // the page itself (many Indian portals list a contact/application email or
+    // a mailto link). Without this, the drafter only sees the bare URL string
+    // and has to guess — which is why drafts came back with no contact email.
+    let jdContext = jd ? jd.slice(0, 3000) : '';
+    let contactHints = '';
+    if (jd && /^https?:\/\//i.test(jd)) {
+      try {
+        const resp = await fetch(jd, {
+          headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36' },
+          signal: AbortSignal.timeout(15000),
+          redirect: 'follow',
+        });
+        if (resp.ok) {
+          const html = await resp.text();
+          const pageText = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+          if (pageText.length > 100) {
+            jdContext = `${jdContext}\n\nPosting text: ${pageText.slice(0, 4000)}`;
+          }
+          const emails = (html.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || []).map(e => e.replace(/^mailto:/i, '').toLowerCase());
+          const found = [...new Set(emails.filter(e => !e.includes('example.com') && !e.includes('sentry') && !e.includes('.png') && !e.includes('.jpg')))].slice(0, 5);
+          if (found.length) {
+            contactHints = `Contact emails found on the posting page: ${found.join(', ')}`;
+          }
+          const phonePattern = /(?:\+?91[\s-]?)?[6-9]\d{4}[\s-]?\d{5}(?!\d)/g;
+          const foundPhones = [...new Set((html.match(phonePattern) || []).map(p => p.replace(/\s+/g, ' ').trim()))].slice(0, 3);
+          if (foundPhones.length) {
+            contactHints += `${contactHints ? '\n' : ''}Contact phone numbers found on the posting page: ${foundPhones.join(', ')} — give these to the candidate so they can approach the recruiter manually if needed.`;
+          }
+        }
+      } catch { /* fetch failed — the drafter proceeds on the URL alone */ }
+    }
+
     const prompt = `You are a job application email drafter. Generate a formal application email.
 Type: ${type || 'hr_application'}
 Company: ${company || 'Unknown'}
 Role: ${role || 'Unknown'}
 Contact: ${contactName || 'Hiring Team'}
-${jd ? `JD: ${jd.slice(0, 3000)}` : ''}
+${jdContext ? `JD: ${jdContext}` : ''}
+${contactHints ? `\n${contactHints}\nUse one of these as "to" only if it looks like a real hiring/application contact email. If none of them is suitable, return an empty string.` : ''}
 ${reportNum ? `Report: #${reportNum}` : ''}
 
 CV excerpt: ${cv}
@@ -3268,11 +4466,11 @@ Candidate name: ${profile?.candidate?.full_name || 'Candidate'}
 Candidate email: ${profile?.candidate?.email || ''}
 Candidate phone: ${profile?.candidate?.phone || ''}
 
-Return JSON: {"subject": "...", "body": "...", "contactBlock": "..."}`;
+Return JSON: {"to": "hiring contact email or empty string if unknown", "subject": "...", "body": "...", "contactBlock": "...", "phone": "recruiter contact phone or empty string if unknown"}`;
 
     const result = await runOpencode(prompt, 120000, userCwd(req));
     const parsed = parseJsonFromOutput(result);
-    res.json(parsed || { subject: '', body: result.trim().slice(0, 2000), contactBlock: '' });
+    res.json(parsed || { to: '', subject: '', body: result.trim().slice(0, 2000), contactBlock: '', phone: '' });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -3747,6 +4945,22 @@ app.get('/download/apk', (req, res) => {
   res.sendFile(apkPath);
 });
 
+// ── POST /upload-apk — receive APK update from dev environment ─────
+app.post('/upload-apk', upload.single('apk'), (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No APK file uploaded' });
+    const src = req.file.path;
+    const dest1 = join(__dirname, 'career-ops.apk');
+    const dest2 = '/sdcard/Download/career-ops.apk';
+    copyFileSync(src, dest1);
+    try { copyFileSync(src, dest2); } catch {}
+    try { unlinkSync(src); } catch {}
+    res.json({ success: true, path: dest1, size: req.file.size });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── crash protection ───────────────────────────────────────────────
 process.on('uncaughtException', (err) => {
   console.error('[FATAL] uncaughtException:', err.message);
@@ -3877,10 +5091,10 @@ async function bootOpencode() {
 }
 
 // Called per user on first /chat — just connects to already-running opencode + creates session
-async function initOpencode(userId, userDir) {
+async function initOpencode(userId, userDir, fresh = false) {
   const key = userId || '__root__';
   const cached = opencodeSessions.get(key);
-  if (cached) {
+  if (cached && !fresh) {
     cached.lastAccess = Date.now();
     return cached;
   }
@@ -3944,7 +5158,9 @@ async function initOpencode(userId, userDir) {
     throw new Error('Failed to create opencode session: ' + JSON.stringify(sessionResult.error || sessionResult));
   }
 
-  opencodeSessions.set(key, { client, sessionId, lastAccess: Date.now() });
+    if (!fresh) {
+    opencodeSessions.set(key, { client, sessionId, lastAccess: Date.now() });
+  }
   return { client, sessionId };
 }
 
@@ -4231,11 +5447,13 @@ app.post('/chat/stream', async (req, res) => {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
   });
 
   const send = (event, data) => {
     if (!res.destroyed) {
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+      if (res.flush) res.flush();
     }
   };
 
@@ -4287,10 +5505,13 @@ app.post('/chat/stream', async (req, res) => {
     send('connected', { sessionId });
     console.log(`[chat/stream] Session ${sessionId}, sending: "${message.slice(0, 80)}..."`);
 
-    // Heartbeat every 15s to keep connection alive
+    // Heartbeat every 5s to keep connection alive (mobile NAT timeouts)
     heartbeat = setInterval(() => {
-      if (!res.destroyed) res.write(':keepalive\n\n');
-    }, 15000);
+      if (!res.destroyed) {
+        res.write(':keepalive\n\n');
+        if (res.flush) res.flush();
+      }
+    }, 5000);
 
     // Fire promptAsync (non-blocking)
     const userCtx2 = buildUserContext(req);
@@ -4309,7 +5530,7 @@ app.post('/chat/stream', async (req, res) => {
 
     // Poll opencode until idle, then fetch the response
     const POLL_MS = 1000;
-    const MAX_WAIT = 300000; // 5 min
+    const MAX_WAIT = isScan ? 120000 : 300000; // 2 min for scan, 5 min otherwise
     const deadline = Date.now() + MAX_WAIT;
     let pollCount = 0;
     let sawBusy = false;
@@ -4880,11 +6101,13 @@ function parseActionBlocks(text) {
 // ── POST /apply/open — Open Chrome, extract form fields ─────────────
 app.post('/apply/open', async (req, res) => {
   try {
-    const { url } = req.body;
+    const { url, stealth } = req.body;
     if (!url) return res.status(400).json({ error: 'url required' });
 
     const userDir = req.userCtx?.userDir || __dirname;
-    const r = spawnSync('node', [join(__dirname, 'apply-job.mjs'), url, '--user-dir', userDir], {
+    const scriptArgs = [join(__dirname, 'apply-job.mjs'), url, '--user-dir', userDir];
+    if (stealth) scriptArgs.push('--stealth');
+    const r = spawnSync('node', scriptArgs, {
       cwd: userDir,
       encoding: 'utf-8',
       timeout: 60_000,
@@ -4909,7 +6132,7 @@ app.post('/apply/open', async (req, res) => {
 // ── POST /apply/fill — Fill form with user answers + CV ────────────
 app.post('/apply/fill', async (req, res) => {
   try {
-    const { url, answers, company } = req.body;
+    const { url, answers, company, stealth } = req.body;
     if (!url) return res.status(400).json({ error: 'url required' });
 
     const userDir = req.userCtx?.userDir || __dirname;
@@ -4921,6 +6144,7 @@ app.post('/apply/fill', async (req, res) => {
     if (answers) writeFileSync(answersPath, JSON.stringify(answers));
 
     const scriptArgs = [join(__dirname, 'apply-job.mjs'), url, '--fill', '--headless', '--user-dir', userDir];
+    if (stealth) scriptArgs.push('--stealth');
     if (answers) scriptArgs.push('--answers-json', answersPath);
     if (company) scriptArgs.push('--company', company);
 
@@ -4953,6 +6177,298 @@ app.post('/apply/fill', async (req, res) => {
 app.post('/apply/close', (req, res) => {
   console.log('[APPLY] Session close requested');
   res.json({ success: true, message: 'Apply session closed.' });
+});
+
+// ── POST /apply/guide — Generate manual apply guide (no browser launch) ──
+app.post('/apply/guide', async (req, res) => {
+  try {
+    const { url } = req.body;
+    if (!url) return res.status(400).json({ error: 'url required' });
+
+    const remotePwUrl = process.env.REMOTE_PLAYWRIGHT_URL;
+    const userDir = req.userCtx?.userDir || __dirname;
+
+    if (remotePwUrl) {
+      // Try remote Playwright server first
+      try {
+        const resp = await fetch(`${remotePwUrl}/playwright/guided-apply`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url, userDir }),
+          signal: AbortSignal.timeout(15000),
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          return res.json(data);
+        }
+      } catch { /* remote failed, fall through to local */ }
+    }
+
+    // Local generation via apply-job.mjs --manual-guide
+    const r = spawnSync('node', [join(__dirname, 'apply-job.mjs'), url, '--manual-guide', '--user-dir', userDir], {
+      cwd: userDir,
+      encoding: 'utf-8',
+      timeout: 15_000,
+      env: { ...process.env, FORCE_COLOR: '0' },
+    });
+
+    if (r.status !== 0) {
+      return res.json({ error: r.stderr || 'Guide generation failed', manualUrl: url });
+    }
+
+    try {
+      const result = JSON.parse(r.stdout.trim());
+      res.json(result);
+    } catch {
+      res.json({ error: 'Failed to parse guide result', manualUrl: url });
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /form-answers — Persist candidate answers to config/form-answers.yml ──
+// Answers to candidate-confirmation form questions (salary, YOE, office commute,
+// etc). Asked once in the app, stored here, reused across every subsequent form.
+app.post('/form-answers', (req, res) => {
+  try {
+    const { answers } = req.body || {};
+    if (!answers || typeof answers !== 'object') {
+      return res.status(400).json({ error: 'answers object required' });
+    }
+    const userDir = req.userCtx?.userDir || __dirname;
+    const path = join(userDir, 'config', 'form-answers.yml');
+    let store = {};
+    if (existsSync(path)) {
+      try { store = yaml.load(readFileSync(path, 'utf-8')) || {}; } catch { /* start fresh */ }
+    }
+    let changed = false;
+    for (const [key, value] of Object.entries(answers)) {
+      if (value && typeof value === 'string' && value.trim()) {
+        if (store[key] !== value.trim()) { store[key] = value.trim(); changed = true; }
+      }
+    }
+    if (changed) {
+      const dir = dirname(path);
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      writeFileSync(path, yaml.dump(store, { indent: 2, lineWidth: -1, noRefs: true }));
+    }
+    res.json({ success: true, stored: Object.keys(store) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Portal login requirements + per-user portal credentials ─────────
+// Auto-fill needs an active account session on login-gated portals.
+// Login method: Google OAuth (Continue-with-Google in the user's persistent
+// browser profile) — preferred — or the portal email/password stored below.
+app.get('/portals/requirements', (req, res) => {
+  res.json({
+    googleOAuth: true,
+    loginMethod: 'google_oauth',
+    loginNote: 'We use Google OAuth to log in to portals and fill application forms. Google sign-in is automatic and per-user; portal passwords are only needed as a fallback for portals without Google login.',
+    portals: PORTAL_LOGIN_REQUIREMENTS,
+  });
+});
+
+// Which portals have stored fallback creds for this user. NEVER exposes
+// passwords — only whether one exists. Masked emails only.
+app.get('/portal-creds', (req, res) => {
+  try {
+    const userId = req.userCtx?.userId;
+    if (!userId) return res.status(400).json({ error: 'X-User-Id header required' });
+    const creds = getPortalCreds(userId);
+    const list = Object.keys(creds).map((key) => {
+      const c = creds[key] || {};
+      const email = c.email || '';
+      return {
+        portal: c.portal || key,
+        email: email ? (email.length > 6 ? email.slice(0, 3) + '…' + email.slice(-10) : '•••') : '',
+        hasPassword: !!c.password,
+        hasProfile: !!(c.fullName || c.phone),
+      };
+    });
+    res.json({ success: true, creds: list });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Save portal fallback creds (email/password) for this user. The file is
+// AES-256-GCM encrypted at rest under the user's data dir. If password is
+// omitted, the existing one is preserved.
+app.post('/portal-creds', (req, res) => {
+  try {
+    const userId = req.userCtx?.userId;
+    if (!userId) return res.status(400).json({ error: 'X-User-Id header required' });
+    const { portal, email, password, fullName, phone } = req.body || {};
+    if (!portal || !email) return res.status(400).json({ error: 'portal and email required' });
+    const key = String(portal).toLowerCase();
+    const creds = getPortalCreds(userId);
+    const prev = creds[key] || {};
+    creds[key] = {
+      portal,
+      email,
+      password: (password && String(password).trim()) ? String(password) : (prev.password || ''),
+      fullName: fullName || prev.fullName || '',
+      phone: phone || prev.phone || '',
+      updatedAt: new Date().toISOString(),
+    };
+    setPortalCreds(userId, creds);
+    res.json({ success: true, stored: key });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/portal-creds/:portal', (req, res) => {
+  try {
+    const userId = req.userCtx?.userId;
+    if (!userId) return res.status(400).json({ error: 'X-User-Id header required' });
+    const removed = deletePortalCreds(userId, req.params.portal);
+    res.json({ success: true, removed });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── One-time interactive login session (Google OAuth) ────────────────
+// The app renders a live remote view of the persistent browser profile so
+// the user can sign in with Google ONCE. The resulting session cookies are
+// saved into .pwprofile and reused by every future auto-fill run.
+let loginSession = null;
+
+app.post('/login/session/open', async (req, res) => {
+  try {
+    const userId = req.userCtx?.userId;
+    const userDir = req.userCtx?.userDir || __dirname;
+    const url = (req.body || {}).url;
+    if (!userId) return res.status(400).json({ error: 'X-User-Id header required' });
+
+    if (loginSession) {
+      try { loginSession.proc?.kill(); } catch {}
+      loginSession = null;
+    }
+
+    const port = 18000 + Math.floor(Math.random() * 30000);
+    const scriptArgs = [join(__dirname, 'login-session.mjs'), '--port', String(port), '--user-dir', userDir];
+    if (url) scriptArgs.push('--url', url);
+    if (userId) scriptArgs.push('--email', userId);
+
+    const proc = spawn('node', scriptArgs, {
+      cwd: userDir,
+      env: { ...process.env, FORCE_COLOR: '0' },
+    });
+    let procError = '';
+    proc.stderr.on('data', (d) => { procError += d; });
+    proc.on('exit', (code) => {
+      if (loginSession && loginSession.proc === proc) loginSession = null;
+    });
+
+    loginSession = { port, proc, userId, startedAt: Date.now() };
+
+    // Wait for the script to announce its listening port.
+    const started = await new Promise((resolve) => {
+      let buf = '';
+      const to = setTimeout(() => resolve(false), 25000);
+      proc.stdout.on('data', (d) => {
+        buf += d;
+        const m = buf.match(/LOGIN_SESSION_PORT:(\d+)/);
+        if (m) { clearTimeout(to); resolve(true); }
+        if (/RESULT:/i.test(buf)) { clearTimeout(to); resolve(true); }
+      });
+      proc.on('exit', () => { clearTimeout(to); resolve(false); });
+    });
+
+    if (!started) {
+      try { proc.kill(); } catch {}
+      loginSession = null;
+      return res.json({ success: false, error: procError || 'Browser session failed to start' });
+    }
+    res.json({ success: true, port });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/login/session/state', async (req, res) => {
+  try {
+    if (!loginSession) return res.json({ success: false, error: 'No active session' });
+    const r = await fetch(`http://127.0.0.1:${loginSession.port}/state`, { signal: AbortSignal.timeout(15000) });
+    const data = await r.json();
+    res.json({ success: true, ...data });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
+app.post('/login/session/tap', async (req, res) => {
+  try {
+    if (!loginSession) return res.json({ success: false, error: 'No active session' });
+    const r = await fetch(`http://127.0.0.1:${loginSession.port}/tap`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req.body || {}), signal: AbortSignal.timeout(15000),
+    });
+    res.json({ success: true, ...await r.json() });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
+app.post('/login/session/type', async (req, res) => {
+  try {
+    if (!loginSession) return res.json({ success: false, error: 'No active session' });
+    const r = await fetch(`http://127.0.0.1:${loginSession.port}/type`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req.body || {}), signal: AbortSignal.timeout(15000),
+    });
+    res.json({ success: true, ...await r.json() });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
+app.post('/login/session/navigate', async (req, res) => {
+  try {
+    if (!loginSession) return res.json({ success: false, error: 'No active session' });
+    const r = await fetch(`http://127.0.0.1:${loginSession.port}/navigate`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req.body || {}), signal: AbortSignal.timeout(50000),
+    });
+    res.json({ success: true, ...await r.json() });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
+app.post('/login/session/back', async (req, res) => {
+  try {
+    if (!loginSession) return res.json({ success: false, error: 'No active session' });
+    const r = await fetch(`http://127.0.0.1:${loginSession.port}/back`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: '{}', signal: AbortSignal.timeout(30000),
+    });
+    res.json({ success: true, ...await r.json() });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
+app.post('/login/session/finish', async (req, res) => {
+  try {
+    if (!loginSession) return res.json({ success: false, error: 'No active session' });
+    const r = await fetch(`http://127.0.0.1:${loginSession.port}/finish`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: '{}', signal: AbortSignal.timeout(20000),
+    });
+    const data = await r.json();
+    loginSession = null;
+    res.json({ success: true, ...data });
+  } catch (e) {
+    loginSession = null;
+    res.json({ success: false, error: e.message });
+  }
 });
 
 // ── POST /email/send-confirm — Send email after user confirmation ───
@@ -5025,6 +6541,28 @@ app.post('/email/send-confirm', async (req, res) => {
   }
 });
 
+// ── GET /scheduler/status — Check scheduler state (per-user) ────────────
+app.get('/scheduler/status', (req, res) => {
+  let userDir = req.userCtx?.userDir || __dirname;
+  const checkpointPath = join(userDir, 'data', '.scheduler-checkpoint.json');
+  const cp = {};
+  try {
+    if (existsSync(checkpointPath)) {
+      Object.assign(cp, JSON.parse(readFileSync(checkpointPath, 'utf-8')));
+    }
+  } catch {}
+  res.json({
+    status: 'running',
+    userId: req.userCtx?.userId || 'legacy',
+    lastScan: cp.lastScan || null,
+    lastTriage: cp.lastTriage || null,
+    lastEvaluate: cp.lastEvaluate || null,
+    lastFollowup: cp.lastFollowup || null,
+    lastAdapt: cp.lastAdapt || null,
+    todayAppsSent: (cp.dailyApps && cp.dailyApps[new Date().toISOString().slice(0, 10)]) || 0,
+  });
+});
+
 // ── POST /notifications/check — Check for new opportunities/replies ──
 app.post('/notifications/check', async (req, res) => {
   try {
@@ -5042,14 +6580,48 @@ app.post('/notifications/check', async (req, res) => {
         for (const email of (inboxData.emails || [])) {
           const subj = (email.subject || '').toLowerCase();
           const body = (email.body || email.preview || '').toLowerCase();
+          const fromL = (email.fromEmail || email.from || '').toLowerCase();
+          const digestFrom = ['naukri', 'indeed', 'linkedin', 'glassdoor', 'monster', 'hirist', 'quora', 'buzzfeed', 'medium', 'substack', 'newsletter', 'digest', 'no-reply', 'noreply', 'updates@', 'donotreply'];
+          if (digestFrom.some(d => fromL.includes(d))) continue;
 
           if (/interview|schedule|meeting/i.test(subj) || /schedule|availability/i.test(body)) {
+            const dt = extractInterviewDateTime(email.subject, email.body || email.preview);
+            const when = dt ? `\n**When:** ${dt.human}` : '';
             notifications.push({
               type: 'interview',
               title: 'Interview Scheduled',
-              message: `${email.from}: ${email.subject}`,
+              message: `${email.from}: ${email.subject}${when}`,
               email,
+              scheduledAt: dt ? dt.iso : null,
+              scheduledHuman: dt ? dt.human : null,
             });
+
+            // Persist to interviews.json for reminders
+            try {
+              const interviews = loadInterviews(req);
+              const key = `${email.fromEmail || email.from || ''}|${(email.subject || '').slice(0, 60)}`;
+              let rec = interviews.find(i => i.key === key);
+              if (!rec) {
+                rec = {
+                  key,
+                  id: email.gmailId || String(Date.now()),
+                  from: email.from || '',
+                  subject: email.subject || '',
+                  detectedAt: new Date().toISOString(),
+                  reminderSentAt: null,
+                  status: 'scheduled',
+                };
+                interviews.push(rec);
+              }
+              if (dt) {
+                rec.scheduledAt = dt.iso;
+                rec.scheduledHuman = dt.human;
+                rec.date = dt.date;
+                rec.time = dt.time;
+                rec.confidence = dt.confidence;
+              }
+              saveInterviews(req, interviews);
+            } catch { /* persist non-fatal */ }
           } else if (/recruiter|hiring|your application|opportunity/i.test(subj) ||
                      /resume|application|profile|position/i.test(body)) {
             notifications.push({
@@ -5069,6 +6641,35 @@ app.post('/notifications/check', async (req, res) => {
         }
       }
     } catch { /* inbox check failed — non-fatal */ }
+
+    // Emit reminders for scheduled interviews coming up (dedup via reminderSentAt)
+    try {
+      const interviews = loadInterviews(req);
+      const now = Date.now();
+      let changed = false;
+      for (const rec of interviews) {
+        if (rec.status !== 'scheduled' || !rec.scheduledAt) continue;
+        const schedMs = new Date(rec.scheduledAt).getTime();
+        const diffH = Math.round((schedMs - now) / 3600000);
+        // Remind once when within 24h of the interview (or already past within the day)
+        if (diffH <= 24 && diffH > -24) {
+          if (!rec.reminderSentAt) {
+            rec.reminderSentAt = new Date().toISOString();
+            changed = true;
+            const when = diffH < 0
+              ? `happened ${Math.abs(diffH)}h ago`
+              : diffH <= 1 ? `in about ${Math.max(diffH, 0)}h` : `in ${diffH}h`;
+            notifications.push({
+              type: 'interview_reminder',
+              title: '\u23F0 Interview Reminder',
+              message: `${rec.scheduledHuman || ''}\n${rec.from}: ${rec.subject}\n**${when}**`,
+              interview: rec,
+            });
+          }
+        }
+      }
+      if (changed) saveInterviews(req, interviews);
+    } catch { /* reminders non-fatal */ }
 
     // Check tracker for new evaluated jobs
     try {
@@ -5110,12 +6711,21 @@ app.post('/interview-prep/generate', async (req, res) => {
 
     const userDir = req.userCtx?.userDir || __dirname;
     const prompt = `Generate interview preparation for ${company} - ${role || 'Unknown Role'}.
-Include:
-1. Likely technical questions based on the role
+
+Use web search to research ${company} on Glassdoor (and Blind/Levels.fyi if available):
+- Glassdoor overall rating, interview difficulty rating, % of candidates who get an offer
+- Real interview questions reported by candidates on Glassdoor (cite each question to Glassdoor)
+- Common feedback on the interview process (rounds, timelines, format)
+- Pros/cons of working at ${company} reported on Glassdoor
+
+Then produce:
+1. Likely technical questions based on the role (label [inferred from JD] vs [sourced from Glassdoor])
 2. STAR stories from the candidate's experience
 3. Company-specific questions
 4. Questions to ask the interviewer
 5. Red flags to watch for
+
+Include a "Glassdoor Snapshot" section at the top: rating, interview difficulty, offer rate, and 3-5 real reported interview questions with sources. Do NOT fabricate ratings or questions — if a metric isn't found, say "not found".
 
 Use the candidate's CV and profile for personalized answers.`;
 

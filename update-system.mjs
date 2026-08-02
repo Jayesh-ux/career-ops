@@ -16,7 +16,7 @@
  */
 
 import { execFile, execFileSync, execSync } from 'child_process';
-import { readFileSync, writeFileSync, existsSync, unlinkSync, rmSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, unlinkSync, rmSync, readdirSync, symlinkSync, lstatSync, mkdirSync, readlinkSync } from 'fs';
 import { join, dirname, posix as pathPosix } from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 
@@ -55,6 +55,43 @@ export const PLAYWRIGHT_INSTALL_TIMEOUT_MS = parsePositiveInt(process.env.CAREER
 export const DASHBOARD_REBUILD_TIMEOUT_MS = parsePositiveInt(process.env.CAREER_OPS_DASHBOARD_REBUILD_TIMEOUT_MS, 60000);
 export const UPDATE_PATH_CHECKOUT_BUDGET_MS = parsePositiveInt(process.env.CAREER_OPS_UPDATE_PATH_CHECKOUT_BUDGET_MS, 5000);
 export const REEXEC_BUFFER_TIMEOUT_MS = parsePositiveInt(process.env.CAREER_OPS_REEXEC_BUFFER_TIMEOUT_MS, 60000);
+
+// Termux/proot l2s hardlinks ~/.cache/ms-playwright binaries into /.l2s/,
+// which breaks Chromium asset loading (icudtl.dat / *.pak / snapshots all
+// fail). Browsers installed to the clean /opt/ms-playwright path work. This
+// helper re-points the default Playwright cache location at /opt via symlinks
+// so EVERY script that uses Playwright's default browser discovery (scan.mjs,
+// generate-pdf.mjs, doctor.mjs, apply-job.mjs fallback, etc.) resolves the
+// clean copies without each script needing its own env bootstrap.
+function ensurePlaywrightSymlinks() {
+  const CLEAN_DIR = '/opt/ms-playwright';
+  const cacheDir = join(process.env.HOME || '', '.cache', 'ms-playwright');
+  try {
+    const entries = readdirSync(CLEAN_DIR);
+    for (const name of entries) {
+      if (!name.startsWith('chromium')) continue;
+      const target = join(CLEAN_DIR, name);
+      const link = join(cacheDir, name);
+      if (!existsSync(link)) {
+        mkdirSync(cacheDir, { recursive: true });
+        symlinkSync(target, link);
+        console.log(`[playwright] linked ${link} -> ${target}`);
+      } else if (lstatSync(link).isSymbolicLink()) {
+        if (readlinkSync(link) !== target) {
+          unlinkSync(link);
+          symlinkSync(target, link);
+          console.log(`[playwright] re-linked ${link} -> ${target}`);
+        }
+      } else if (readdirSync(link).length === 0) {
+        unlinkSync(link);
+        symlinkSync(target, link);
+        console.log(`[playwright] linked (replaced empty dir) ${link} -> ${target}`);
+      }
+    }
+  } catch (err) {
+    console.log(`[playwright] symlink setup skipped: ${err.message}`);
+  }
+}
 
 // System layer paths — ONLY these files get updated
 const SYSTEM_PATHS = [
@@ -931,6 +968,9 @@ async function apply() {
     }
 
     // 5. Install any new dependencies
+    // Browsers must land on a clean path (Termux/proot l2s breaks Chromium
+    // asset loading from the default ~/.cache location).
+    process.env.PLAYWRIGHT_BROWSERS_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH || '/opt/ms-playwright';
     try {
       execSync('npm install --silent', { cwd: ROOT, timeout: NPM_INSTALL_TIMEOUT_MS });
     } catch {
@@ -943,6 +983,7 @@ async function apply() {
     } catch {
       console.log('playwright install skipped (run manually: npx playwright install chromium)');
     }
+    ensurePlaywrightSymlinks();
 
     // 6. Rebuild compiled dashboard if Go sources changed
     rebuildDashboardBinaryIfNeeded();

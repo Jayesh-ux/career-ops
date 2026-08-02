@@ -32,7 +32,7 @@ object NetworkModule {
     @Singleton
     fun provideOkHttpClient(userPrefs: UserPrefs): OkHttpClient {
         return OkHttpClient.Builder()
-            .connectTimeout(30, TimeUnit.SECONDS)
+            .connectTimeout(60, TimeUnit.SECONDS)
             .readTimeout(600, TimeUnit.SECONDS)
             .writeTimeout(120, TimeUnit.SECONDS)
             .addInterceptor { chain ->

@@ -40,7 +40,7 @@ fun GoogleSignInScreen(
 
     val gso = remember {
         GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
-            .requestServerAuthCode(WEB_CLIENT_ID)
+            .requestServerAuthCode(WEB_CLIENT_ID, true)
             .requestEmail()
             .requestScopes(
                 Scope("https://www.googleapis.com/auth/gmail.send"),
@@ -114,7 +114,7 @@ fun GoogleSignInScreen(
             "scope=openid email https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly&" +
             "access_type=offline&" +
             "login_hint=$email&" +
-            "prompt=none"
+            "prompt=consent"
         val intent = GoogleOAuthActivity.createIntent(context, authUri)
         gmailOAuthLauncher.launch(intent)
     }

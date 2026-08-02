@@ -2,6 +2,7 @@ package com.careerops.app.ui.chat
 
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -31,6 +32,24 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 
+// One source of truth for quick actions. Playwright scraping is part of
+// scanning jobs, so it is intentionally NOT a separate action here.
+private enum class QuickActionKind(val label: String, val prompt: String) {
+    SCAN("Scan jobs", "scan for full stack developer jobs"),
+    INBOX("Check inbox", "check my inbox for new emails"),
+    SPAM("Clean spam", "clean spam from my inbox"),
+    EVALUATE("Evaluate job", "evaluate this job: "),
+    TRACKER("Show tracker", "show my applications tracker")
+}
+
+private fun quickActionIcon(action: QuickActionKind) = when (action) {
+    QuickActionKind.SCAN -> Icons.Default.Search
+    QuickActionKind.INBOX -> Icons.Default.Email
+    QuickActionKind.SPAM -> Icons.Default.Delete
+    QuickActionKind.EVALUATE -> Icons.Default.Star
+    QuickActionKind.TRACKER -> Icons.Default.List
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
@@ -47,6 +66,7 @@ fun ChatScreen(
     val streamingText by viewModel.streamingText.collectAsState()
     val progressText by viewModel.progressText.collectAsState()
     var inputText by remember { mutableStateOf("") }
+    var showQueueDialog by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val debugListState = rememberLazyListState()
     val focusManager = LocalFocusManager.current
@@ -70,7 +90,16 @@ fun ChatScreen(
         }
     }
 
+    // Persist chat history when leaving the screen (background, navigation, etc.)
+    DisposableEffect(Unit) {
+        onDispose {
+            viewModel.persistMessages()
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
     Scaffold(
+        containerColor = MaterialTheme.colorScheme.background,
         topBar = {
             TopAppBar(
                 title = {
@@ -112,19 +141,100 @@ fun ChatScreen(
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.primaryContainer
+                    containerColor = MaterialTheme.colorScheme.surface
                 )
             )
         },
         bottomBar = {
             Surface(tonalElevation = 3.dp, shadowElevation = 8.dp) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 12.dp, vertical = 8.dp)
-                        .imePadding(),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
+                Column {
+                    // Always-available quick actions — horizontally scrollable.
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState())
+                            .padding(horizontal = 12.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        QuickActionKind.values().forEach { action ->
+                            AssistChip(
+                                onClick = { viewModel.sendMessage(action.prompt) },
+                                label = { Text(action.label, fontSize = 12.sp) },
+                                leadingIcon = {
+                                    Icon(
+                                        quickActionIcon(action),
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                },
+                                shape = RoundedCornerShape(8.dp)
+                            )
+                        }
+                    }
+                    // Persistent HITL quick actions — always visible, never disappear.
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedButton(
+                            onClick = { viewModel.stopProcessing() },
+                            enabled = viewModel.canStop,
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(vertical = 2.dp),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Icon(Icons.Default.Close, null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Stop", fontSize = 12.sp)
+                        }
+                        OutlinedButton(
+                            onClick = { viewModel.retryLast() },
+                            enabled = viewModel.canRetry,
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(vertical = 2.dp),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Icon(Icons.Default.Refresh, null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(if (viewModel.canResume) "Resume" else "Retry", fontSize = 12.sp)
+                        }
+                        OutlinedButton(
+                            onClick = { viewModel.editLastDraft() },
+                            enabled = viewModel.hasLastDraft,
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(vertical = 2.dp),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Icon(Icons.Default.Edit, null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Edit", fontSize = 12.sp)
+                        }
+                        OutlinedButton(
+                            onClick = { showQueueDialog = true },
+                            enabled = viewModel.hasQueued,
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(vertical = 2.dp),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Icon(Icons.Default.List, null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                if (viewModel.queued.isEmpty()) "Queue" else "Queue (${viewModel.queued.size})",
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 8.dp)
+                            .imePadding(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
                     OutlinedTextField(
                         value = inputText,
                         onValueChange = { inputText = it },
@@ -158,6 +268,7 @@ fun ChatScreen(
                 }
             }
         }
+        }
     ) { paddingValues ->
             Box(
                 modifier = Modifier
@@ -165,8 +276,7 @@ fun ChatScreen(
                     .padding(paddingValues)
             ) {
                 // Chat messages — fills remaining space between topBar and bottomBar
-                SelectionContainer {
-                    LazyColumn(
+                LazyColumn(
                         state = listState,
                         modifier = Modifier
                             .fillMaxSize()
@@ -181,18 +291,14 @@ fun ChatScreen(
                                 is ChatMessage.Typing -> TypingBubble(message)
                                 is ChatMessage.ToolStatus -> ToolStatusBubble(message)
                                 is ChatMessage.JobCard -> JobCardBubble(message)
-                                is ChatMessage.EmailDraft -> EmailDraftBubble(message)
+                                 is ChatMessage.EmailDraft -> EmailDraftBubble(message)
+                                 is ChatMessage.ReplyDraft -> ReplyDraftBubble(message)
                                 is ChatMessage.Evaluation -> EvaluationCard(message)
                                 is ChatMessage.ActivityLog -> ActivityLogCard(message)
-                                is ChatMessage.ProcessingCard -> ProcessingCard(message)
-                            }
-                        }
-                        // Quick action cards for empty state
-                        if (messages.size <= 1 && streamingText.isEmpty() && progressText.isEmpty()) {
-                            item(key = "quick-actions") {
-                                QuickActionCards(onAction = { text ->
-                                    viewModel.sendMessage(text)
-                                })
+                                 is ChatMessage.ProcessingCard -> ProcessingCard(message)
+                                 is ChatMessage.ScanActions -> ScanActionsCard(message)
+                                 is ChatMessage.ScanResultsCard -> ScanResultsSummaryCard(message)
+                                 is ChatMessage.FormQuestion -> FormQuestionCard(message)
                             }
                         }
                         // Live-updating streaming bubble
@@ -208,7 +314,6 @@ fun ChatScreen(
                             }
                         }
                     }
-                }
 
                 // Debug panel (overlays on top of chat)
                 AnimatedVisibility(
@@ -270,6 +375,103 @@ fun ChatScreen(
                 }
             }
     }
+
+    // Full-screen scan results list (all found jobs, apply/discard)
+    val overlay = viewModel.scanResultsOverlay
+    if (overlay != null) {
+        ScanResultsScreen(
+            summary = viewModel.scanResultsOverlaySummary(),
+            jobs = overlay,
+            onBack = { viewModel.closeScanResults() },
+            onApply = { viewModel.applyFromScanResults(it) },
+            onDiscard = { viewModel.discardFromScanResults(it) }
+        )
+    }
+
+    // Draft editor — opened by the persistent "Edit" quick action or the
+    // Edit button on any email/reply draft card.
+    val editingDraftId = viewModel.editingDraftId
+    if (editingDraftId != null) {
+        AlertDialog(
+            onDismissRequest = { viewModel.closeDraftEditor() },
+            title = { Text("Edit Draft") },
+            text = {
+                Column {
+                    Text("Edits apply to this draft. You still confirm before sending.", fontSize = 12.sp)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = viewModel.editingDraftText,
+                        onValueChange = { viewModel.updateEditingDraftText(it) },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 180.dp),
+                        placeholder = { Text("Edit the email body...") },
+                        maxLines = 15
+                    )
+                }
+            },
+            confirmButton = {
+                Button(onClick = { viewModel.saveDraftEdit() }) {
+                    Text("Save")
+                }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = { viewModel.closeDraftEditor() }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    // Queue viewer — shows tasks queued while the agent was busy.
+    if (showQueueDialog) {
+        AlertDialog(
+            onDismissRequest = { showQueueDialog = false },
+            title = { Text("Queued Tasks") },
+            text = {
+                val queued = viewModel.queued
+                if (queued.isEmpty()) {
+                    Text("Nothing queued right now.")
+                } else {
+                    Column(
+                        modifier = Modifier.verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        queued.forEachIndexed { index, task ->
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(
+                                    text = "${index + 1}. $task",
+                                    modifier = Modifier.padding(10.dp),
+                                    fontSize = 13.sp
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showQueueDialog = false
+                        viewModel.clearQueue()
+                    },
+                    enabled = viewModel.hasQueued
+                ) {
+                    Text("Clear Queue")
+                }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = { showQueueDialog = false }) {
+                    Text("Close")
+                }
+            }
+        )
+    }
+}
 }
 
 @Composable
@@ -280,15 +482,17 @@ fun UserBubble(message: ChatMessage.User) {
     ) {
         Surface(
             shape = RoundedCornerShape(16.dp, 16.dp, 4.dp, 16.dp),
-            color = MaterialTheme.colorScheme.primary,
+            color = MaterialTheme.colorScheme.surfaceVariant,
             modifier = Modifier.fillMaxWidth(0.85f)
         ) {
-            Text(
-                text = message.text,
-                color = MaterialTheme.colorScheme.onPrimary,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
-                fontSize = 15.sp
-            )
+            SelectionContainer {
+                Text(
+                    text = message.text,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                    fontSize = 15.sp
+                )
+            }
         }
     }
 }
@@ -310,12 +514,13 @@ fun SystemBubble(message: ChatMessage.System) {
                 .fillMaxWidth(0.95f)
                 .heightIn(max = if (expanded) 2000.dp else 800.dp)
         ) {
-            Column(
-                modifier = Modifier
-                    .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 16.dp, vertical = 12.dp)
-            ) {
-                // Parse and render markdown-like content
+            SelectionContainer {
+                Column(
+                    modifier = Modifier
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 16.dp, vertical = 12.dp)
+                ) {
+                    // Parse and render markdown-like content
                 val lines = displayText.split("\n")
                 for (line in lines) {
                     val trimmed = line.trim()
@@ -405,15 +610,15 @@ fun SystemBubble(message: ChatMessage.System) {
                         Text(
                             if (expanded) "Show less" else "Show more (${message.text.length} chars)",
                             fontSize = 12.sp,
-                            color = MaterialTheme.colorScheme.primary
+                            color = MaterialTheme.colorScheme.onSurface
                         )
                     }
+                }
                 }
             }
         }
     }
 }
-
 @Composable
 fun TypingBubble(message: ChatMessage.Typing) {
     Row(
@@ -575,7 +780,18 @@ fun JobCardBubble(message: ChatMessage.JobCard) {
             
             if (message.location.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(4.dp))
-                Text(text = message.location, fontSize = 12.sp, color = MaterialTheme.colorScheme.outline)
+                Text(text = message.location, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+
+            if (message.url.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = message.url.replaceFirst("https://", "").replaceFirst("http://", "").take(70),
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
             
             Spacer(modifier = Modifier.height(12.dp))
@@ -676,6 +892,185 @@ fun EmailDraftBubble(message: ChatMessage.EmailDraft) {
                 }
             }
         )
+    }
+}
+
+@Composable
+fun ReplyDraftBubble(message: ChatMessage.ReplyDraft) {
+    var showConfirm by remember { mutableStateOf(false) }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(0.92f),
+        shape = RoundedCornerShape(12.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.Email, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Column {
+                    Text("Reply (${message.replyType})", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Text("To: ${message.to}", fontSize = 12.sp, color = MaterialTheme.colorScheme.outline)
+                    if (message.subject.isNotEmpty()) {
+                        Text("Subject: ${message.subject}", fontSize = 12.sp, color = MaterialTheme.colorScheme.outline)
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+            Surface(
+                shape = RoundedCornerShape(8.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = message.body,
+                    modifier = Modifier.padding(12.dp),
+                    fontSize = 13.sp,
+                    lineHeight = 18.sp
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { showConfirm = true }, modifier = Modifier.weight(1f)) {
+                    Icon(Icons.Default.Send, null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Send")
+                }
+                OutlinedButton(onClick = { message.onEdit?.invoke() }, modifier = Modifier.weight(1f)) {
+                    Icon(Icons.Default.Edit, null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Edit")
+                }
+            }
+        }
+    }
+
+    if (showConfirm) {
+        AlertDialog(
+            onDismissRequest = { showConfirm = false },
+            title = { Text("Send Reply?") },
+            text = {
+                Column {
+                    Text("To: ${message.to}")
+                    if (message.subject.isNotEmpty()) {
+                        Text("Subject: ${message.subject}", fontSize = 12.sp)
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text("This will send the reply immediately. Continue?", fontSize = 13.sp)
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    showConfirm = false
+                    message.onSend?.invoke()
+                }) {
+                    Text("Send")
+                }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = { showConfirm = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+}
+
+@Composable
+fun FormQuestionCard(message: ChatMessage.FormQuestion) {
+    Card(
+        modifier = Modifier.fillMaxWidth(0.92f),
+        shape = RoundedCornerShape(12.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f)
+        )
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Default.Info,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = message.label.ifEmpty { "Question" },
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    if (message.required) {
+                        Text(
+                            "Required",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+                }
+            }
+
+            if (message.answered) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "\u2713 ${message.answer}",
+                        modifier = Modifier.padding(12.dp),
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+            } else {
+                if (message.hint.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = message.hint,
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Spacer(modifier = Modifier.height(10.dp))
+                if (message.options.isNotEmpty()) {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        message.options.forEach { option ->
+                            OutlinedButton(
+                                onClick = { message.onAnswer?.invoke(option) },
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(option, fontSize = 13.sp)
+                            }
+                        }
+                    }
+                } else {
+                    var text by remember { mutableStateOf("") }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedTextField(
+                            value = text,
+                            onValueChange = { text = it },
+                            modifier = Modifier.weight(1f),
+                            placeholder = { Text("Type your answer...") },
+                            singleLine = true,
+                            shape = RoundedCornerShape(12.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        FilledIconButton(
+                            onClick = { message.onAnswer?.invoke(text) },
+                            enabled = text.isNotBlank()
+                        ) {
+                            Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Answer")
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -889,87 +1284,6 @@ fun ActivityLogCard(message: ChatMessage.ActivityLog) {
 }
 
 @Composable
-fun QuickActionCards(onAction: (String) -> Unit) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 8.dp, vertical = 4.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        Text(
-            text = "Quick actions",
-            fontSize = 12.sp,
-            fontWeight = FontWeight.Medium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(start = 4.dp, bottom = 2.dp)
-        )
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            AssistChip(
-                onClick = { onAction("scan for full stack developer jobs") },
-                label = { Text("Scan jobs", fontSize = 13.sp) },
-                leadingIcon = {
-                    Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(16.dp))
-                },
-                modifier = Modifier.weight(1f)
-            )
-            AssistChip(
-                onClick = { onAction("search more opportunities using Playwright") },
-                label = { Text("Playwright search", fontSize = 13.sp) },
-                leadingIcon = {
-                    Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(16.dp))
-                },
-                modifier = Modifier.weight(1f)
-            )
-        }
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            AssistChip(
-                onClick = { onAction("check my inbox for new emails") },
-                label = { Text("Check inbox", fontSize = 13.sp) },
-                leadingIcon = {
-                    Icon(Icons.Default.Email, contentDescription = null, modifier = Modifier.size(16.dp))
-                },
-                modifier = Modifier.weight(1f)
-            )
-            AssistChip(
-                onClick = { onAction("clean spam from my inbox") },
-                label = { Text("Clean spam", fontSize = 13.sp) },
-                leadingIcon = {
-                    Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(16.dp))
-                },
-                modifier = Modifier.weight(1f)
-            )
-        }
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            AssistChip(
-                onClick = { onAction("evaluate this job: ") },
-                label = { Text("Evaluate job", fontSize = 13.sp) },
-                leadingIcon = {
-                    Icon(Icons.Default.Star, contentDescription = null, modifier = Modifier.size(16.dp))
-                },
-                modifier = Modifier.weight(1f)
-            )
-            AssistChip(
-                onClick = { onAction("show my applications tracker") },
-                label = { Text("Show tracker", fontSize = 13.sp) },
-                leadingIcon = {
-                    Icon(Icons.Default.List, contentDescription = null, modifier = Modifier.size(16.dp))
-                },
-                modifier = Modifier.weight(1f)
-            )
-        }
-    }
-}
-
-@Composable
 fun ProcessingCard(message: ChatMessage.ProcessingCard) {
     val steps = message.workflowSteps
     val hasSteps = steps.isNotEmpty()
@@ -1081,6 +1395,110 @@ fun ProcessingCard(message: ChatMessage.ProcessingCard) {
                     color = MaterialTheme.colorScheme.primary,
                     trackColor = MaterialTheme.colorScheme.surfaceVariant,
                 )
+            }
+        }
+    }
+}
+
+@Composable
+fun ScanResultsSummaryCard(message: ChatMessage.ScanResultsCard) {
+    Card(
+        modifier = Modifier.fillMaxWidth(0.95f),
+        shape = RoundedCornerShape(12.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f)
+        )
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                text = "🔍 ${message.summary}",
+                fontWeight = FontWeight.Bold,
+                fontSize = 15.sp,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "${message.results.size} opportunities to review · ${message.scanned} roles found",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.height(10.dp))
+
+            // Preview the top 3 matches so the user can see quality at a glance
+            for (job in message.results.take(3)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "• ${job.company} — ${job.role}",
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (job.score.isNotEmpty() && job.score != "N/A") {
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = job.score,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
+            }
+            if (message.results.size > 3) {
+                Spacer(modifier = Modifier.height(3.dp))
+                Text(
+                    text = "…and ${message.results.size - 3} more",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+            Button(
+                onClick = { message.onViewAll?.invoke() },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("View all ${message.results.size} jobs →", fontSize = 14.sp)
+            }
+        }
+    }
+}
+
+@Composable
+fun ScanActionsCard(message: ChatMessage.ScanActions) {
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        if (message.expandLocationLabel.isNotEmpty()) {
+            OutlinedButton(
+                onClick = { message.onExpandLocation?.invoke() },
+                modifier = Modifier.fillMaxWidth(0.9f)
+            ) {
+                Text(message.expandLocationLabel, fontSize = 13.sp)
+            }
+        }
+        if (message.tryKeywordsLabel.isNotEmpty()) {
+            OutlinedButton(
+                onClick = { message.onTryKeywords?.invoke() },
+                modifier = Modifier.fillMaxWidth(0.9f)
+            ) {
+                Text(message.tryKeywordsLabel, fontSize = 13.sp)
+            }
+        }
+        if (message.deepScanLabel.isNotEmpty()) {
+            OutlinedButton(
+                onClick = { message.onDeepScan?.invoke() },
+                modifier = Modifier.fillMaxWidth(0.9f)
+            ) {
+                Text(message.deepScanLabel, fontSize = 13.sp)
             }
         }
     }

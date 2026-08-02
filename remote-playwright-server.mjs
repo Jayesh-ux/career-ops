@@ -48,32 +48,45 @@ function runApplyJob(args) {
 
 // ── Extract mode: load a job URL, extract form fields, generate answers ──
 app.post('/playwright/extract', (req, res) => {
-  const { url, headless, userDir } = req.body || {};
+  const { url, headless, userDir, stealth } = req.body || {};
   if (!url) return res.status(400).json({ error: 'url required' });
 
   const args = [url, '--headless'];
+  if (stealth) args.push('--stealth');
   if (userDir) args.push('--user-dir', userDir);
   if (headless === false) args.splice(args.indexOf('--headless'), 1);
 
   console.log(`[remote-pw] extract ${url}`);
   const output = runApplyJob(args);
-  if (output.error) return res.status(502).json(output);
   res.json(output);
 });
 
 // ── Fill mode: fill an application form with pre-generated answers ──
 app.post('/playwright/fill', (req, res) => {
-  const { url, answersJson, company, headless, userDir } = req.body || {};
+  const { url, answersJson, company, headless, userDir, stealth } = req.body || {};
   if (!url) return res.status(400).json({ error: 'url required' });
   if (!answersJson) return res.status(400).json({ error: 'answersJson required' });
 
   const args = [url, '--fill', '--answers-json', answersJson, '--headless'];
+  if (stealth) args.push('--stealth');
   if (company) args.push('--company', company);
   if (userDir) args.push('--user-dir', userDir);
 
   console.log(`[remote-pw] fill ${url}`);
   const output = runApplyJob(args);
-  if (output.error) return res.status(502).json(output);
+  res.json(output);
+});
+
+// ── Guided apply: generate manual apply guide with field mapping ──
+app.post('/playwright/guided-apply', (req, res) => {
+  const { url, headless, userDir } = req.body || {};
+  if (!url) return res.status(400).json({ error: 'url required' });
+
+  const args = [url, '--manual-guide'];
+  if (userDir) args.push('--user-dir', userDir);
+
+  console.log(`[remote-pw] guided-apply ${url}`);
+  const output = runApplyJob(args);
   res.json(output);
 });
 
@@ -147,8 +160,9 @@ app.get('/playwright/health', (req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Remote Playwright server on http://0.0.0.0:${PORT}`);
-  console.log(`POST /playwright/extract  -- extract form fields (via apply-job.mjs)`);
-  console.log(`POST /playwright/fill     -- fill application form (via apply-job.mjs)`);
-  console.log(`POST /playwright/scrape   -- scrape page links (inline Playwright)`);
-  console.log(`GET  /playwright/health   -- health check`);
+  console.log(`POST /playwright/extract       -- extract form fields (via apply-job.mjs)`);
+  console.log(`POST /playwright/fill          -- fill application form (via apply-job.mjs)`);
+  console.log(`POST /playwright/guided-apply  -- manual apply guide with field mapping (no browser)`);
+  console.log(`POST /playwright/scrape        -- scrape page links (inline Playwright)`);
+  console.log(`GET  /playwright/health        -- health check`);
 });

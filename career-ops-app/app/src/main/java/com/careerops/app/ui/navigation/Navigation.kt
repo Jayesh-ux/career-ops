@@ -13,6 +13,7 @@ import androidx.compose.ui.Modifier
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import androidx.navigation.navArgument
 import com.careerops.app.data.model.GoogleIdTokenRequest
 import com.careerops.app.data.model.OAuthExchangeRequest
 import com.careerops.app.data.remote.CareerOpsApi
@@ -23,6 +24,7 @@ import com.careerops.app.ui.onboarding.ProfileFormScreen
 import com.careerops.app.ui.onboarding.UploadResumeScreen
 import com.careerops.app.ui.screens.applications.ApplicationsScreen
 import com.careerops.app.ui.screens.dashboard.DashboardScreen
+import com.careerops.app.ui.screens.settings.PortalLoginScreen
 import com.careerops.app.ui.screens.settings.SettingsScreen
 import com.careerops.app.util.UserPrefs
 import kotlinx.coroutines.Dispatchers
@@ -34,11 +36,30 @@ object Routes {
     const val ONBOARDING_GOOGLE = "onboarding/google"
     const val ONBOARDING_RESUME = "onboarding/resume"
     const val ONBOARDING_PROFILE = "onboarding/profile"
+    const val ONBOARDING_PORTAL = "onboarding/portal"
     const val ONBOARDING_CONFIRM = "onboarding/confirm"
     const val CHAT = "chat"
     const val DASHBOARD = "dashboard"
     const val APPLICATIONS = "applications"
     const val SETTINGS = "settings"
+    const val PROFILE = "profile"
+    const val PORTAL_LOGIN = "portal_login"
+}
+
+/**
+ * A user is "onboarded" if local prefs say so OR the bridge already has a
+ * profile with a name for them. Falls back to local prefs when the bridge is
+ * unreachable, so a network blip never re-runs onboarding.
+ */
+private suspend fun hasOnboardedProfile(api: CareerOpsApi, userPrefs: UserPrefs): Boolean {
+    if (userPrefs.isOnboarded) return true
+    return try {
+        val onboarded = api.getProfile().name.isNotBlank()
+        if (onboarded) userPrefs.isOnboarded = true
+        onboarded
+    } catch (_: Exception) {
+        false
+    }
 }
 
 @Composable
@@ -78,7 +99,7 @@ fun CareerOpsNavHost(
                                     if (resp.hasGmailAuth) {
                                         // Already has Gmail access — done
                                         scope.launch(Dispatchers.Main) {
-                                            val next = if (userPrefs.isOnboarded) Routes.CHAT else Routes.ONBOARDING_RESUME
+                                            val next = if (hasOnboardedProfile(api, userPrefs)) Routes.CHAT else Routes.ONBOARDING_RESUME
                                             navController.navigate(next) {
                                                 popUpTo(Routes.ONBOARDING_GOOGLE) { inclusive = true }
                                             }
@@ -107,7 +128,7 @@ fun CareerOpsNavHost(
                                         userPrefs.userEmail = resolvedEmail
                                     }
                                     scope.launch(Dispatchers.Main) {
-                                        val next = if (userPrefs.isOnboarded) Routes.CHAT else Routes.ONBOARDING_RESUME
+                                        val next = if (hasOnboardedProfile(api, userPrefs)) Routes.CHAT else Routes.ONBOARDING_RESUME
                                         navController.navigate(next) {
                                             popUpTo(Routes.ONBOARDING_GOOGLE) { inclusive = true }
                                         }
@@ -145,8 +166,27 @@ fun CareerOpsNavHost(
                 api = api,
                 userPrefs = userPrefs,
                 onComplete = {
-                    navController.navigate(Routes.ONBOARDING_CONFIRM) {
+                    navController.navigate(Routes.ONBOARDING_PORTAL) {
                         popUpTo(Routes.ONBOARDING_PROFILE) { inclusive = true }
+                    }
+                }
+            )
+        }
+
+        composable(Routes.ONBOARDING_PORTAL) {
+            PortalLoginScreen(
+                portalName = "Google",
+                startUrl = "https://accounts.google.com/signin",
+                api = api,
+                inOnboarding = true,
+                onDone = {
+                    navController.navigate(Routes.ONBOARDING_CONFIRM) {
+                        popUpTo(Routes.ONBOARDING_PORTAL) { inclusive = true }
+                    }
+                },
+                onClose = {
+                    navController.navigate(Routes.ONBOARDING_CONFIRM) {
+                        popUpTo(Routes.ONBOARDING_PORTAL) { inclusive = true }
                     }
                 }
             )
@@ -196,7 +236,44 @@ fun CareerOpsNavHost(
                         launchSingleTop = true
                     }
                 },
-                userPrefs = userPrefs
+                onEditProfile = {
+                    navController.navigate(Routes.PROFILE)
+                },
+                onStartPortalLogin = { portal, url ->
+                    navController.navigate("${Routes.PORTAL_LOGIN}?url=${android.net.Uri.encode(url)}&portal=${android.net.Uri.encode(portal)}")
+                },
+                userPrefs = userPrefs,
+                api = api
+            )
+        }
+
+        composable(
+            route = "${Routes.PORTAL_LOGIN}?url={url}&portal={portal}",
+            arguments = listOf(
+                navArgument("url") { defaultValue = "https://accounts.google.com/signin" },
+                navArgument("portal") { defaultValue = "Google" }
+            )
+        ) { entry ->
+            val url = entry.arguments?.getString("url") ?: "https://accounts.google.com/signin"
+            val portal = entry.arguments?.getString("portal") ?: "Google"
+            PortalLoginScreen(
+                portalName = portal,
+                startUrl = url,
+                api = api,
+                onDone = { navController.popBackStack() },
+                onClose = { navController.popBackStack() }
+            )
+        }
+
+        composable(Routes.PROFILE) {
+            ProfileFormScreen(
+                email = userPrefs.userEmail,
+                api = api,
+                userPrefs = userPrefs,
+                onComplete = { navController.popBackStack() },
+                title = "Edit Profile",
+                subtitle = "Update your job search details.",
+                saveLabel = "Save"
             )
         }
     }

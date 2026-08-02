@@ -61,6 +61,14 @@ class UserPrefs(context: Context) {
         get() = prefs.getBoolean("automation_running", false)
         set(value) = prefs.edit().putBoolean("automation_running", value).apply()
 
+    var autoApply: Boolean
+        get() = prefs.getBoolean("auto_apply", false)
+        set(value) = prefs.edit().putBoolean("auto_apply", value).apply()
+
+    var autoReply: Boolean
+        get() = prefs.getBoolean("auto_reply", false)
+        set(value) = prefs.edit().putBoolean("auto_reply", value).apply()
+
     var pendingEvents: String
         get() = prefs.getString("pending_events", "") ?: ""
         set(value) = prefs.edit().putString("pending_events", value).apply()

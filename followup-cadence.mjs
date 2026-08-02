@@ -289,7 +289,7 @@ export function computeNextFollowupDate(status, appDate, lastFollowupDate, follo
 function analyze() {
   const apps = parseTracker();
   if (apps.length === 0) {
-    return { error: 'No applications found in tracker.' };
+    return { ok: true, followups: [], entries: [], message: 'No applications found in tracker yet.' };
   }
 
   const followups = parseFollowups();
@@ -403,6 +403,11 @@ function printSummary(result) {
     return;
   }
 
+  if (result.message) {
+    console.log(`\n${result.message}\n`);
+    return;
+  }
+
   const { metadata, entries } = result;
 
   console.log(`\n${'='.repeat(70)}`);
@@ -453,5 +458,4 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     console.log(JSON.stringify(result, null, 2));
   }
 
-  if (result.error) process.exit(1);
-}
+  if (result.error) process.exit(1);}

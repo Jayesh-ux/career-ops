@@ -147,6 +147,65 @@ interface CareerOpsApi {
     @POST("chat/reset")
     suspend fun resetChat(): Map<String, Any>
 
+    // ── Playwright Apply ───────────────────────────────────────────
+    @POST("apply/open")
+    suspend fun applyOpen(@Body request: ApplyOpenRequest): ApplyOpenResponse
+
+    @POST("apply/fill")
+    suspend fun applyFill(@Body request: ApplyFillRequest): ApplyFillResponse
+
+    @POST("apply/guide")
+    suspend fun applyGuide(@Body body: Map<String, String>): Map<String, Any>
+
+    @POST("apply/close")
+    suspend fun applyClose(): Map<String, Any>
+
+    // ── Candidate form answers (persisted config/form-answers.yml) ──
+    @POST("form-answers")
+    suspend fun saveFormAnswers(@Body body: Map<String, Any>): Map<String, Any>
+
+    // ── Portal logins (Google OAuth primary, portal password fallback) ──
+    @GET("portals/requirements")
+    suspend fun getPortalRequirements(): PortalRequirementsResponse
+
+    @GET("portal-creds")
+    suspend fun getPortalCreds(): PortalCredsResponse
+
+    @POST("portal-creds")
+    suspend fun savePortalCreds(@Body request: PortalCredsRequest): Map<String, Any>
+
+    @DELETE("portal-creds/{portal}")
+    suspend fun deletePortalCreds(@Path("portal") portal: String): Map<String, Any>
+
+    // ── One-time interactive login session (Google OAuth) ─────────────
+    @POST("login/session/open")
+    suspend fun openLoginSession(@Body body: Map<String, String>): Map<String, Any>
+
+    @GET("login/session/state")
+    suspend fun getLoginSessionState(): Map<String, Any>
+
+    @POST("login/session/tap")
+    suspend fun loginSessionTap(@Body body: Map<String, Any>): Map<String, Any>
+
+    @POST("login/session/type")
+    suspend fun loginSessionType(@Body body: Map<String, String>): Map<String, Any>
+
+    @POST("login/session/navigate")
+    suspend fun loginSessionNavigate(@Body body: Map<String, String>): Map<String, Any>
+
+    @POST("login/session/back")
+    suspend fun loginSessionBack(): Map<String, Any>
+
+    @POST("login/session/finish")
+    suspend fun finishLoginSession(): Map<String, Any>
+
     @GET("debug")
     suspend fun debug(): Map<String, Any>
+
+    // ── Interviews ────────────────────────────────────────────────
+    @POST("interview/detect")
+    suspend fun detectInterviews(@Body body: Map<String, String>): InterviewDetectResponse
+
+    @GET("interviews")
+    suspend fun getInterviews(): InterviewsResponse
 }

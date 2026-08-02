@@ -63,7 +63,7 @@ if (_userDirIdx !== -1 && process.argv[_userDirIdx + 1]) {
   _userDir = process.argv[_userDirIdx + 1];
 }
 
-const PORTALS_PATH = _userDir && require('fs').existsSync(path.join(_userDir, 'portals.yml'))
+const PORTALS_PATH = _userDir && existsSync(path.join(_userDir, 'portals.yml'))
   ? path.join(_userDir, 'portals.yml')
   : (process.env.CAREER_OPS_PORTALS || 'portals.yml');
 const PROFILE_PATH = _userDir ? path.join(_userDir, 'config/profile.yml') : (process.env.CAREER_OPS_PROFILE || 'config/profile.yml');

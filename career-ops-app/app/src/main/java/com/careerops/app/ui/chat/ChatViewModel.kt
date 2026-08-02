@@ -7,6 +7,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.careerops.app.data.model.*
@@ -17,11 +18,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import okhttp3.ResponseBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.MediaType.Companion.toMediaType
+import retrofit2.HttpException
 import org.json.JSONArray
 import org.json.JSONObject
 import javax.inject.Inject
@@ -40,6 +44,7 @@ sealed class ChatMessage {
         val score: String = "",
         val url: String = "",
         val location: String = "",
+        val salary: String = "",
         val onApply: (() -> Unit)? = null,
         val onSkip: (() -> Unit)? = null
     ) : ChatMessage()
@@ -54,13 +59,23 @@ sealed class ChatMessage {
         val onSend: (() -> Unit)? = null,
         val onEdit: (() -> Unit)? = null
     ) : ChatMessage()
+    data class ReplyDraft(
+        override val id: Long = nextId(),
+        val to: String,
+        val subject: String,
+        val body: String,
+        val replyType: String,
+        val onSend: (() -> Unit)? = null,
+        val onEdit: (() -> Unit)? = null
+    ) : ChatMessage()
     data class Evaluation(
         override val id: Long = nextId(),
         val company: String = "",
         val role: String = "",
         val score: String = "",
         val summary: String = "",
-        val reportPath: String = ""
+        val reportPath: String = "",
+        val onApply: (() -> Unit)? = null
     ) : ChatMessage()
 
     data class ActivityLog(
@@ -80,6 +95,38 @@ sealed class ChatMessage {
         val progress: Float = 0f,
         val currentTool: String = "",
         val portalName: String = ""
+    ) : ChatMessage()
+
+    data class ScanActions(
+        override val id: Long = nextId(),
+        val expandLocationLabel: String = "",
+        val tryKeywordsLabel: String = "",
+        val deepScanLabel: String = "",
+        val otherLocations: List<ScanResult> = emptyList(),
+        val onExpandLocation: (() -> Unit)? = null,
+        val onTryKeywords: (() -> Unit)? = null,
+        val onDeepScan: (() -> Unit)? = null
+    ) : ChatMessage()
+
+    data class FormQuestion(
+        override val id: Long = nextId(),
+        val fieldId: String,
+        val category: String = "",
+        val label: String = "",
+        val required: Boolean = false,
+        val options: List<String> = emptyList(),
+        val hint: String = "",
+        val answered: Boolean = false,
+        val answer: String = "",
+        val onAnswer: ((String) -> Unit)? = null
+    ) : ChatMessage()
+
+    data class ScanResultsCard(
+        override val id: Long = nextId(),
+        val summary: String,
+        val scanned: Int,
+        val results: List<ScanResult>,
+        val onViewAll: (() -> Unit)? = null
     ) : ChatMessage()
 
     companion object {
@@ -137,7 +184,7 @@ class ChatViewModel @Inject constructor(
         private const val TAG = "CareerOps"
         private const val MAX_DEBUG_LOG = 200
         private const val MAX_RESPONSE_TIMES = 50
-        private const val MAX_MESSAGES = 200
+        private const val MAX_MESSAGES = 1200
         private const val MAX_SYSTEM_TEXT = 3000
         private const val MAX_STREAMING_TEXT = 50000
         private val ACTION_REGEX = Regex("\\[ACTION:(\\w+)\\]([\\s\\S]*?)\\[/ACTION\\]")
@@ -158,8 +205,35 @@ class ChatViewModel @Inject constructor(
     }
 
     val messages = mutableStateListOf<ChatMessage>()
-    var isProcessing by mutableStateOf(false)
-        private set
+
+    // ── CLI-like operation control ──────────────────────────────────────
+    // isProcessing drives the persistent Stop/Retry bar. When it flips to
+    // false we automatically drain any messages the user queued while busy.
+    private var _isProcessing by mutableStateOf(false)
+    var isProcessing: Boolean
+        get() = _isProcessing
+        private set(value) {
+            _isProcessing = value
+            if (!value && !suppressDrain) drainQueue()
+        }
+    private var suppressDrain = false
+
+    /** Messages sent while busy — they run one-by-one after the current task. */
+    private val queuedMessages = mutableStateListOf<String>()
+
+    /** True when the last operation was interrupted by Stop (drives "Resume"). */
+    private var wasInterrupted by mutableStateOf(false)
+
+    val queued: List<String> get() = queuedMessages.toList()
+    val hasQueued: Boolean get() = queuedMessages.isNotEmpty()
+
+    fun clearQueue() {
+        if (queuedMessages.isNotEmpty()) {
+            messages.add(ChatMessage.System("\u23F9\uFE0F **Cleared ${queuedMessages.size} queued task(s).**"))
+            queuedMessages.clear()
+            persistMessages()
+        }
+    }
     
     var showDebug by mutableStateOf(false)
         private set
@@ -181,6 +255,38 @@ class ChatViewModel @Inject constructor(
     private var inboxPollJob: kotlinx.coroutines.Job? = null
     private var processingCardId: Long? = null
 
+    /** The currently-running operation so the persistent HITL "Stop" can cancel it. */
+    private var activeJob: kotlinx.coroutines.Job? = null
+
+    /** Draft editor state — driven by the persistent "Edit" quick action and draft cards. */
+    var editingDraftId by mutableStateOf<Long?>(null)
+        private set
+    var editingDraftText by mutableStateOf("")
+        private set
+    private var scanKeywords: String = ""
+    private var scanLocations: String = ""
+    private var scanRound: Int = 0
+
+    // Full-screen scan results overlay (all jobs in one scrollable list)
+    var scanResultsOverlay: List<ScanResult>? by mutableStateOf(null)
+        private set
+    private var scanResultsSummary: String = ""
+    fun openScanResults(summary: String, results: List<ScanResult>) {
+        scanResultsSummary = summary
+        scanResultsOverlay = results
+    }
+    fun closeScanResults() { scanResultsOverlay = null }
+    fun scanResultsOverlaySummary(): String = scanResultsSummary
+    fun applyFromScanResults(job: ScanResult) {
+        // Close the overlay so the draft steps are visible in the chat below.
+        scanResultsOverlay = null
+        viewModelScope.launch { draftApplication(job.company, job.role, job.url) }
+    }
+    fun discardFromScanResults(job: ScanResult) {
+        messages.add(ChatMessage.System("Discarded: ${job.company} — ${job.role}"))
+        persistMessages()
+    }
+
     init {
         // Restore persisted chat history
         val restored = restoreMessages()
@@ -190,12 +296,11 @@ class ChatViewModel @Inject constructor(
             messages.add(ChatMessage.System(
                 "Hey! I'm your job search assistant. Here's what I can do:\n\n" +
                 "🔍 **Scan** job portals for matching roles\n" +
-                "🌐 **Playwright** — scrape career pages for more opportunities\n" +
                 "📄 **Tailor** your resume for each opportunity\n" +
                 "📝 **Evaluate** any job posting (A-G scoring)\n" +
                 "✉️ **Apply** — draft and send application emails\n" +
-                "🤖 **Auto-fill** application forms via Playwright\n" +
-                "📬 **IMAP** — monitor inbox for recruiter replies\n" +
+                "📫 **IMAP** — monitor inbox for recruiter replies\n" +
+                "🤖 **Playwright** — auto-fill application forms\n" +
                 "🗑️ **Spam** — filter and delete junk mail\n" +
                 "📋 **Track** all applications in one place\n" +
                 "🔔 **Follow up** on pending applications\n" +
@@ -210,6 +315,15 @@ class ChatViewModel @Inject constructor(
 
         debugLog.add(DebugEntry("init", "ViewModel created, session: none"))
 
+        // Persist whenever the message list changes so chat survives process
+        // kills — not just onDispose (which never runs if the app is killed
+        // while chat is on screen).
+        viewModelScope.launch {
+            snapshotFlow { messages.toList() }
+                .debounce(500)
+                .collect { persistMessages() }
+        }
+
         // Start inbox polling (check every 60s for new recruiter replies)
         startInboxPolling()
     }
@@ -218,38 +332,30 @@ class ChatViewModel @Inject constructor(
         inboxPollJob?.cancel()
         inboxPollJob = viewModelScope.launch {
             while (true) {
-                kotlinx.coroutines.delay(60_000) // every 60s
+                kotlinx.coroutines.delay(30_000) // every 30s
                 if (prefs.userEmail.isEmpty()) continue
                 try {
                     val inbox = api.getInbox(
                         email = prefs.userEmail,
-                        daysBack = 1,
-                        maxEmails = 10
+                        daysBack = 14,
+                        maxEmails = 50
                     )
                     val replies = inbox.emails.filter { email ->
-                        !email.isSpam && (
-                            email.subject.contains(Regex("(?i)(interview|schedule|offer|selected|shortlist|next steps|re:|reply)")) ||
-                            email.body.contains(Regex("(?i)(interview|schedule|offer|next round|phone screen|we reviewed)")
-                        ))
+                        !email.isSpam && looksLikeRecruiterReply(email)
                     }
                     for (reply in replies) {
-                        // Avoid duplicates by checking if already shown
-                        val alreadyShown = messages.any { msg ->
+                        val alreadyNotified = messages.any { msg ->
                             msg is ChatMessage.System && msg.text.contains(reply.subject)
                         }
-                        if (!alreadyShown) {
-                            // Show toast notification
-                            Toast.makeText(
-                                app,
-                                "New: ${reply.subject}",
-                                Toast.LENGTH_LONG
-                            ).show()
-
+                        if (!alreadyNotified) {
+                            Toast.makeText(app, "Possible reply: ${reply.from} — ${reply.subject}", Toast.LENGTH_LONG).show()
+                            // NOTIFY ONLY. Never auto-draft or auto-send from polling —
+                            // the user must explicitly ask to draft a reply.
                             messages.add(ChatMessage.System(
-                                "\uD83D\uDCE8 **New recruiter reply:**\n" +
+                                "\uD83D\uDCE8 **Possible recruiter reply:**\n" +
                                 "From: ${reply.from}\n" +
-                                "Subject: ${truncateIfNeeded(reply.subject)}\n" +
-                                "Say \"reply to ${reply.from}\" to draft a response."
+                                "Subject: ${truncateIfNeeded(reply.subject)}\n\n" +
+                                "_Nothing was drafted or sent. To reply, say **'reply to {company}'** and I'll prepare a draft for your review._"
                             ))
                         }
                     }
@@ -268,8 +374,9 @@ class ChatViewModel @Inject constructor(
                 val response = withContext(Dispatchers.IO) {
                     // Use direct HTTP call since we don't have a Retrofit endpoint yet
                     val client = okhttp3.OkHttpClient.Builder().build()
+                    val baseUrl = prefs.bridgeServerUrl.trimEnd('/')
                     val request = okhttp3.Request.Builder()
-                        .url("http://127.0.0.1:8787/notifications/check")
+                        .url("$baseUrl/notifications/check")
                         .post("{}".toRequestBody("application/json".toMediaType()))
                         .build()
                     client.newCall(request).execute()
@@ -290,6 +397,7 @@ class ChatViewModel @Inject constructor(
                         // Add to chat
                         val icon = when (type) {
                             "interview" -> "\uD83C\uDF1F"
+                            "interview_reminder" -> "\u23F0"
                             "recruiter_reply" -> "\uD83D\uDCE8"
                             "offer" -> "\uD83C\uDF89"
                             "new_opportunities" -> "\uD83D\uDD0D"
@@ -321,12 +429,13 @@ class ChatViewModel @Inject constructor(
             try {
                 val response = withContext(Dispatchers.IO) {
                     val client = okhttp3.OkHttpClient.Builder().build()
+                    val baseUrl = prefs.bridgeServerUrl.trimEnd('/')
                     val json = org.json.JSONObject()
                         .put("company", company)
                         .put("role", role)
                     val body = json.toString().toRequestBody("application/json".toMediaType())
                     val request = okhttp3.Request.Builder()
-                        .url("http://127.0.0.1:8787/interview-prep/generate")
+                        .url("$baseUrl/interview-prep/generate")
                         .post(body)
                         .build()
                     client.newCall(request).execute()
@@ -343,11 +452,11 @@ class ChatViewModel @Inject constructor(
                         "\uD83C\uDF1F **Interview Prep: $company**\n\n${truncateIfNeeded(preparation)}"
                     ))
                 } else {
-                    messages.add(ChatMessage.System("Failed to generate interview prep: ${response.code}"))
+                    messages.add(ChatMessage.System("Couldn't generate interview prep right now. Please try again."))
                 }
             } catch (e: Exception) {
                 removeProcessing()
-                messages.add(ChatMessage.System("Error generating interview prep: ${e.message}"))
+                messages.add(ChatMessage.System("Couldn't generate interview prep right now. Please try again."))
             } finally {
                 isProcessing = false
             }
@@ -394,7 +503,19 @@ class ChatViewModel @Inject constructor(
 
     fun sendMessage(text: String) {
         if (text.isBlank()) return
-        
+
+        // CLI-like queueing: if we're busy, park the message and run it later.
+        if (isProcessing) {
+            queuedMessages.add(text)
+            messages.add(ChatMessage.System(
+                "\u23F3 **Queued** — I'm busy with another task. I'll run \"${text.take(60)}\" " +
+                    "as soon as it finishes. Tap **Queue** to view or clear it."
+            ))
+            persistMessages()
+            return
+        }
+
+        wasInterrupted = false
         lastUserMessage = text
         messages.add(ChatMessage.User(text))
         isProcessing = true
@@ -410,77 +531,379 @@ class ChatViewModel @Inject constructor(
         val lower = text.lowercase()
 
         // ── Intent routing: hit backend directly for known intents ──────
-        if (lower.contains("scan") || lower.contains("find job") || lower.contains("search")) {
-            viewModelScope.launch { handleDirectScan() }
+        // Playwright / deeper search → opencode (has browser + all tools)
+        if (lower.contains("playwright") && (lower.contains("search") || lower.contains("fill") || lower.contains("apply"))) {
+            debugLog.add(DebugEntry("route", "playwright search → opencode"))
+        } else if (lower.contains("search more") || lower.contains("use playwright") || lower.contains("use browser") || lower.contains("also search") || lower.contains("deeper search")) {
+            debugLog.add(DebugEntry("route", "deep search → opencode"))
+        } else if (lower.contains("scan") || lower.contains("find job") || lower.contains("search")) {
+            debugLog.add(DebugEntry("route", "scan intent → handleDirectScan"))
+            activeJob = viewModelScope.launch { handleDirectScan() }
             return
         }
         if (lower.contains("inbox") || lower.contains("check email") || lower.contains("any reply") || lower.contains("any recruiter")) {
-            viewModelScope.launch { handleDirectInbox() }
+            activeJob = viewModelScope.launch { handleDirectInbox() }
             return
         }
         if (lower.contains("spam") || lower.contains("clean inbox") || lower.contains("delete spam")) {
-            viewModelScope.launch { handleDirectSpam() }
+            activeJob = viewModelScope.launch { handleDirectSpam() }
             return
         }
         if ((lower.startsWith("reply") || lower.startsWith("respond")) && (lower.contains("recruiter") || lower.contains("email") || lower.contains("interview"))) {
-            viewModelScope.launch { handleDirectReply(text) }
+            activeJob = viewModelScope.launch { handleDirectReply(text) }
             return
         }
-        if (lower.startsWith("apply ") && (lower.contains("http") || lower.contains("www"))) {
-            viewModelScope.launch { handleDirectApply(text) }
+        if ((lower.startsWith("apply ") || lower.startsWith("evaluate ")) && (lower.contains("http") || lower.contains("www"))) {
+            activeJob = viewModelScope.launch { handleDirectApply(text) }
             return
         }
         if (lower.contains("tracker") || lower.contains("show my application")) {
-            viewModelScope.launch { handleDirectTracker() }
+            activeJob = viewModelScope.launch { handleDirectTracker() }
+            return
+        }
+        if (lower.contains("check interview") || lower.contains("any interview") || lower.contains("interview status") || lower.contains("upcoming interview") || lower.contains("interview reminder") || lower.contains("interview schedule")) {
+            activeJob = viewModelScope.launch { handleCheckInterviews() }
+            return
+        }
+        if ((lower.contains("auto-fill") || lower.contains("autofill") || lower.contains("auto fill") || (lower.contains("playwright") && lower.contains("fill"))) && (lower.contains("http") || lower.contains("www"))) {
+            activeJob = viewModelScope.launch { handleDirectAutoFill(text) }
+            return
+        }
+        if (lower.contains("schedule") || lower.contains("automation status") || lower.contains("scheduler")) {
+            activeJob = viewModelScope.launch { handleDirectSchedule() }
+            return
+        }
+        if ((lower.startsWith("follow") || lower.startsWith("followup") || lower.startsWith("follow up")) && lower.contains("company")) {
+            activeJob = viewModelScope.launch { handleDirectFollowUp(text) }
+            return
+        }
+        if (lower.startsWith("confirm fill") || lower.equals("confirm fill", ignoreCase = true)) {
+            activeJob = viewModelScope.launch { handleConfirmFill() }
+            return
+        }
+        if (lower.startsWith("send follow") || lower.startsWith("send followup") || lower.startsWith("send follow-up")) {
+            activeJob = viewModelScope.launch { handleSendFollowUp(text) }
+            return
+        }
+        if (_pendingFollowUpBody.isNotEmpty() && lower.contains("follow up") == false &&
+            Regex("[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}").containsMatchIn(text)) {
+            // User supplied a recipient email while a follow-up is pending —
+            // store it and ask for explicit confirmation before sending.
+            activeJob = viewModelScope.launch { handleCaptureFollowUpTo(text) }
+            return
+        }
+        if (lower.contains("interview prep") || lower.contains("interview preparation") || lower.startsWith("prepare for")) {
+            activeJob = viewModelScope.launch {
+                handleInterviewPrep(text)
+            }
             return
         }
 
         // ── Fallback: route to opencode for AI-heavy tasks ──────────────
-        viewModelScope.launch { handleOpencodeChat(text, startTime) }
+        activeJob = viewModelScope.launch { handleOpencodeChat(text, startTime) }
     }
 
-    // ── Direct scan via POST /scan — bypasses opencode entirely ──────────
-    private suspend fun handleDirectScan() {
+    // ── Scan: uses /scan/stream SSE for live per-portal progress ─────────
+    private suspend fun handleDirectScan(
+        overrideKeywords: String? = null,
+        overrideLocations: String? = null,
+        deep: Boolean = false,
+        round: Int = 1
+    ) {
+        var timerJob: kotlinx.coroutines.Job? = null
         try {
-            val profile = withContext(Dispatchers.IO) { api.getProfile() }
-            val keywords = profile.targetRoles.takeIf { it.isNotEmpty() }
-                ?: emptyList()
-            val locations = profile.location.takeIf { it.isNotBlank() }?.let { listOf(it) }
-                ?: emptyList()
-            val response = withContext(Dispatchers.IO) {
-                api.scan(ScanRequest(keywords = keywords, locations = locations))
+            // Reuse any existing processing card (sendMessage already added one).
+            // This prevents a duplicate card that never gets removed.
+            isProcessing = true
+            ensureProcessingCard("Starting scan...")
+            persistMessages()
+            val scanStartTime = System.currentTimeMillis()
+            timerJob = viewModelScope.launch {
+                while (isProcessing) {
+                    val elapsed = (System.currentTimeMillis() - scanStartTime) / 1000
+                    updateProcessingCard(elapsed = "${elapsed}s")
+                    kotlinx.coroutines.delay(1000)
+                }
             }
+            updateProcessingCard(detail = "Looking up your profile...")
+
+            val profile = withContext(Dispatchers.IO) { api.getProfile() }
+            val profileKeywords = (profile.targetRoles + profile.archetypes)
+                .map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+                .takeIf { it.isNotEmpty() }
+                ?: emptyList()
+            val profileLocation = profile.location.takeIf { it.isNotBlank() } ?: ""
+
+            val keywords = if (overrideKeywords != null) {
+                overrideKeywords.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+            } else {
+                profileKeywords
+            }
+            val locations = if (overrideLocations != null) {
+                overrideLocations.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+            } else {
+                profileLocation.takeIf { it.isNotBlank() }?.let { listOf(it) } ?: emptyList()
+            }
+
+            // Store scan context for expansion actions
+            scanKeywords = keywords.joinToString(",")
+            scanLocations = locations.joinToString(",")
+            scanRound = round
+
+            val rolesStr = keywords.joinToString(", ")
+            val locStr = locations.joinToString(", ").takeIf { it.isNotBlank() } ?: "any location"
+
+            updateProcessingCard(detail = "Scanning for $rolesStr in $locStr...")
+
+            // Call /scan/stream SSE endpoint
+            val baseUrl = prefs.bridgeServerUrl.trimEnd('/')
+            val kwEncoded = java.net.URLEncoder.encode(keywords.joinToString(","), "UTF-8")
+            val locEncoded = java.net.URLEncoder.encode(locations.joinToString(","), "UTF-8")
+            val roundParam = if (round > 1) "&round=$round" else (if (deep) "&deep=true" else "")
+            val url = "$baseUrl/scan/stream?keywords=$kwEncoded&locations=$locEncoded$roundParam"
+
+            val client = okhttp3.OkHttpClient.Builder()
+                .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(300, java.util.concurrent.TimeUnit.SECONDS)
+                .build()
+
+            val request = okhttp3.Request.Builder()
+                .url(url)
+                .header("X-User-Id", prefs.userEmail)
+                .build()
+
+            val response = withContext(Dispatchers.IO) { client.newCall(request).execute() }
+            val body = response.body ?: throw Exception("No response body")
+
+            var finalResults: ScanResponse? = null
+
+            withContext(Dispatchers.IO) {
+                body.byteStream().bufferedReader().use { reader ->
+                    var currentEvent = ""
+                    val dataBuffer = StringBuilder()
+                    var line = reader.readLine()
+                    while (line != null) {
+                        when {
+                            line.startsWith("event: ") -> currentEvent = line.removePrefix("event: ").trim()
+                            line.startsWith("data: ") -> {
+                                dataBuffer.clear()
+                                dataBuffer.append(line.removePrefix("data: "))
+                            }
+                            line.isEmpty() && currentEvent.isNotEmpty() -> {
+                                val dataStr = dataBuffer.toString()
+                                try {
+                                    val json = JSONObject(dataStr)
+                                    when (currentEvent) {
+                                        "start" -> {
+                                            val total = json.optInt("totalPortals", 0)
+                                            val phase = json.optString("phase", "")
+                                            withContext(Dispatchers.Main) {
+                                                updateProcessingCard(
+                                                    detail = "Scanning $total portals ($phase phase)...",
+                                                    progress = 0f
+                                                )
+                                            }
+                                        }
+                                        "progress" -> {
+                                            val company = json.optString("current", "")
+                                            val kwMatches = json.optInt("keywordMatches", 0)
+                                            val completed = json.optInt("completed", 0)
+                                            val total = json.optInt("total", 0)
+                                            val statusNote = json.optString("statusNote", "")
+                                            val progress = if (total > 0) completed.toFloat() / total else 0f
+                                            val status = when {
+                                                statusNote.isNotEmpty() -> statusNote
+                                                kwMatches > 0 -> "$kwMatches match${if (kwMatches != 1) "es" else ""}"
+                                                else -> "no matches"
+                                            }
+                                            withContext(Dispatchers.Main) {
+                                                updateProcessingCard(
+                                                    detail = "$completed/$total — $company: $status",
+                                                    progress = progress
+                                                )
+                                            }
+                                        }
+                                        "done" -> {
+                                            val resultsArr = json.optJSONArray("results") ?: JSONArray()
+                                            val jobs = mutableListOf<ScanResult>()
+                                            for (i in 0 until resultsArr.length()) {
+                                                val j = resultsArr.getJSONObject(i)
+                                                jobs.add(ScanResult(
+                                                    company = j.optString("company", ""),
+                                                    role = j.optString("role", ""),
+                                                    url = j.optString("url", ""),
+                                                    location = j.optString("location", ""),
+                                                    salary = j.optString("salary", ""),
+                                                    score = j.optString("score", ""),
+                                                    fit = j.optString("fit", "")
+                                                ))
+                                            }
+                                            val portalResultsArr = json.optJSONArray("portalResults") ?: JSONArray()
+                                            val portals = mutableListOf<PortalResult>()
+                                            for (i in 0 until portalResultsArr.length()) {
+                                                val p = portalResultsArr.getJSONObject(i)
+                                                portals.add(PortalResult(
+                                                    company = p.optString("company", ""),
+                                                    status = p.optString("status", ""),
+                                                    keywordMatches = p.optInt("keywordMatches", 0),
+                                                    exactMatches = p.optInt("exactMatches", 0),
+                                                    error = p.optString("error", "")
+                                                ))
+                                            }
+                                            val wideningArr = json.optJSONArray("wideningSteps") ?: JSONArray()
+                                            val steps = mutableListOf<String>()
+                                            for (i in 0 until wideningArr.length()) { steps.add(wideningArr.getString(i)) }
+
+                                            val otherLocArr = json.optJSONArray("otherLocations") ?: JSONArray()
+                                            val otherJobs = mutableListOf<ScanResult>()
+                                            for (i in 0 until otherLocArr.length()) {
+                                                val j = otherLocArr.getJSONObject(i)
+                                                otherJobs.add(ScanResult(
+                                                    company = j.optString("company", ""),
+                                                    role = j.optString("role", ""),
+                                                    url = j.optString("url", ""),
+                                                    location = j.optString("location", ""),
+                                                    salary = j.optString("salary", ""),
+                                                    score = j.optString("score", ""),
+                                                    fit = j.optString("fit", "")
+                                                ))
+                                            }
+
+                                            finalResults = ScanResponse(
+                                                results = jobs,
+                                                total = json.optInt("total", 0),
+                                                newFound = json.optInt("newFound", 0),
+                                                portalsScanned = json.optJSONObject("summary")?.optInt("portalsScanned", portalResultsArr.length()) ?: portalResultsArr.length(),
+                                                locationExactMatch = if (json.has("locationExactMatch")) json.optBoolean("locationExactMatch") else null,
+                                                portalResults = portals,
+                                                wideningSteps = steps,
+                                                otherLocations = otherJobs
+                                            )
+                                        }
+                                        "error" -> {
+                                            val err = json.optString("error", "Scan failed")
+                                            withContext(Dispatchers.Main) { timerJob?.cancel(); removeProcessing(); isProcessing = false }
+                                            throw Exception(err)
+                                        }
+                                    }
+                                } catch (_: Exception) { }
+                                currentEvent = ""
+                                dataBuffer.clear()
+                            }
+                        }
+                        line = reader.readLine()
+                    }
+                }
+            }
+
+            timerJob?.cancel()
+            withContext(Dispatchers.Main) {
+                removeProcessing()
+                isProcessing = false
+
+                if (finalResults != null) {
+                    val r = finalResults!!
+
+                    // Show widening steps (honest match report)
+                    if (r.wideningSteps.isNotEmpty()) {
+                        for (step in r.wideningSteps) {
+                            messages.add(ChatMessage.System(step))
+                        }
+                    }
+
+                    if (r.results.isNotEmpty()) {
+                        val locLabel = if (r.locationExactMatch == true) "in $locStr" else "near $locStr (other areas)"
+                        messages.add(ChatMessage.System("Found **${r.results.size}** job(s) matching **$rolesStr** $locLabel (${r.portalsScanned} sources scanned, ${r.total} roles found):"))
+                        messages.add(ChatMessage.ScanResultsCard(
+                            summary = "Found ${r.results.size} jobs matching your profile",
+                            scanned = r.total,
+                            results = r.results,
+                            onViewAll = { openScanResults("${r.results.size} jobs for $rolesStr", r.results) }
+                        ))
+                    } else {
+                        messages.add(ChatMessage.System("No matching jobs found right now. I'll re-check on the next scheduled scan."))
+                    }
+
+                    // Scan report — readable per-portal summary (no cryptic "74 kw, 74 loc")
+                    if (r.portalResults.isNotEmpty()) {
+                        val matched = r.portalResults
+                            .filter { it.keywordMatches > 0 }
+                            .sortedByDescending { it.keywordMatches }
+                        val blocked = r.portalResults
+                            .filter { it.status == "errored" || it.error.isNotEmpty() || it.status == "blocked" }
+                        val report = mutableListOf<String>()
+                        report.add("**Scan report:** ${r.portalsScanned} portals checked · ${r.total} roles found · **${r.results.size} matched you**.")
+                        if (matched.isNotEmpty()) {
+                            val top = matched.take(8).joinToString(", ") { "${it.company}: ${it.keywordMatches} roles" }
+                            report.add("Top sources: $top${if (matched.size > 8) " +${matched.size - 8} more" else ""}")
+                        }
+                        if (blocked.isNotEmpty()) {
+                            report.add("⚠ ${blocked.size} portal(s) were blocked or empty — the scan retried them in the browser (Playwright).")
+                        }
+                        if (report.size > 1) {
+                            messages.add(ChatMessage.System(report.joinToString("\n")))
+                        }
+                    }
+
+                    // Add interactive expansion actions — every first-pass scan
+                    // invites the user to "Scan again" which widens across more
+                    // Indian job portals (Naukri, Indeed, Shine, Foundit, TimesJobs,
+                    // Hirist, Cutshort, Instahyre, Internshala, and more).
+                    val expandLabel = if (scanRound < 2) {
+                        "Scan again to search more Indian portals"
+                    } else {
+                        ""
+                    }
+                    val tryKwLabel = if (r.results.isEmpty()) "Try different keywords" else ""
+
+                    if (expandLabel.isNotEmpty() || tryKwLabel.isNotEmpty()) {
+                        messages.add(ChatMessage.ScanActions(
+                            expandLocationLabel = expandLabel,
+                            tryKeywordsLabel = tryKwLabel,
+                            deepScanLabel = "",
+                            otherLocations = r.otherLocations,
+                            onExpandLocation = if (expandLabel.isNotEmpty()) { {
+                                viewModelScope.launch { handleRerunScan("expand") }
+                            } } else null,
+                            onTryKeywords = if (tryKwLabel.isNotEmpty()) { {
+                                viewModelScope.launch { handleRerunScan("keywords") }
+                            } } else null,
+                            onDeepScan = null
+                        ))
+                    }
+                    persistMessages()
+                } else {
+                    messages.add(ChatMessage.System("Scan completed but could not parse results."))
+                }
+            }
+        } catch (e: java.net.SocketTimeoutException) {
+            timerJob?.cancel()
             removeProcessing()
             isProcessing = false
-
-            if (response.results.isEmpty()) {
-                messages.add(ChatMessage.System("Scan complete — no new matching jobs found."))
-                return
-            }
-
-            messages.add(ChatMessage.System("Found **${response.results.size}** matching jobs (total scanned: ${response.total}):\n\nNew offers: **${response.newFound}**"))
-
-            for (job in response.results.take(30)) {
-                messages.add(ChatMessage.JobCard(
-                    company = job.company,
-                    role = job.role,
-                    score = "",
-                    url = job.url,
-                    location = job.location,
-                    onApply = {
-                        viewModelScope.launch { draftApplication(job.company, job.role) }
-                    },
-                    onSkip = {
-                        messages.add(ChatMessage.System("Skipped: ${job.company}"))
-                    }
-                ))
-            }
-            persistMessages()
+            messages.add(ChatMessage.System("Couldn't reach the server. Make sure your bridge server is running."))
         } catch (e: Exception) {
+            timerJob?.cancel()
             removeProcessing()
             isProcessing = false
             messages.add(ChatMessage.System("Scan failed: ${e.message}"))
         }
+    }
+
+    // ── Consolidated scan re-run action ──────────────────────────────────
+    private data class ScanRerun(val label: String, val keywords: String, val locations: String, val deep: Boolean, val round: Int)
+
+    private suspend fun handleRerunScan(action: String) {
+        val rerun = when (action) {
+            "expand" -> ScanRerun(
+                "Scanning more Indian job portals (Naukri, Indeed, Shine, Foundit, TimesJobs, Hirist, Cutshort, Instahyre, Internshala and more)...",
+                scanKeywords, scanLocations, false, 2
+            )
+            "keywords" -> ScanRerun("Trying broader keywords...", "", scanLocations, false, 1)
+            "deep" -> ScanRerun("Running deep scan with Playwright (same filters)...", scanKeywords, scanLocations, true, 2)
+            else -> return
+        }
+        messages.add(ChatMessage.System(rerun.label))
+        handleDirectScan(overrideKeywords = rerun.keywords, overrideLocations = rerun.locations, deep = rerun.deep, round = rerun.round)
     }
 
     // ── Direct inbox via GET /email/inbox ─────────────────────────────────
@@ -532,7 +955,7 @@ class ChatViewModel @Inject constructor(
         } catch (e: Exception) {
             removeProcessing()
             isProcessing = false
-            messages.add(ChatMessage.System("Inbox check failed: ${e.message}"))
+            messages.add(ChatMessage.System("Couldn't check your inbox right now. Please try again."))
         }
     }
 
@@ -549,7 +972,9 @@ class ChatViewModel @Inject constructor(
             val inbox = withContext(Dispatchers.IO) {
                 api.getInbox(email = email, daysBack = 14, maxEmails = 50, includeSpam = true)
             }
-            val spamIds = inbox.emails.filter { it.isSpam }.mapNotNull { it.body.take(20) }
+            val spamIds = inbox.emails.filter { it.isSpam }.mapNotNull {
+                it.gmailId.ifEmpty { it.uid.ifEmpty { it.id } }.takeIf { id -> id.isNotEmpty() && id != "0" }
+            }
             if (spamIds.isEmpty()) {
                 removeProcessing()
                 isProcessing = false
@@ -567,7 +992,7 @@ class ChatViewModel @Inject constructor(
         } catch (e: Exception) {
             removeProcessing()
             isProcessing = false
-            messages.add(ChatMessage.System("Spam deletion failed: ${e.message}"))
+            messages.add(ChatMessage.System("Couldn't clean your inbox right now. Please try again."))
         }
     }
 
@@ -592,45 +1017,673 @@ class ChatViewModel @Inject constructor(
             removeProcessing()
             isProcessing = false
 
-            messages.add(ChatMessage.System(
-                "**Reply draft (${replyType}):**\n\n${response.replyBody}"
+            if (prefs.autoReply) {
+                // Note: autoReply no longer auto-sends — HITL is mandatory. The
+                // toggle only controls whether a draft is generated up-front.
+                messages.add(ChatMessage.System("\u23F3 Generating reply draft (${replyType})..."))
+            }
+            // Interactive: show ReplyDraft card for user approval
+            val replyBody = response.replyBody
+            val replyDraftId = ChatMessage.nextId()
+            messages.add(ChatMessage.ReplyDraft(
+                id = replyDraftId,
+                to = "",
+                subject = "Re: Your application",
+                body = replyBody,
+                replyType = replyType,
+                onSend = {
+                    viewModelScope.launch {
+                        try {
+                            withContext(Dispatchers.IO) {
+                                api.sendReplyDraft(mapOf(
+                                    "to" to "",
+                                    "subject" to "Re: Your application",
+                                    "body" to replyBody
+                                ))
+                            }
+                            messages.add(ChatMessage.System("\u2705 Reply sent."))
+                        } catch (e: Exception) {
+                            messages.add(ChatMessage.System("\u274C Failed to send reply."))
+                        }
+                    }
+                },
+                onEdit = {
+                    openDraftEditor(replyDraftId)
+                }
             ))
             persistMessages()
         } catch (e: Exception) {
             removeProcessing()
             isProcessing = false
-            messages.add(ChatMessage.System("Reply draft failed: ${e.message}"))
+            messages.add(ChatMessage.System("Couldn't draft a reply right now. Please try again."))
         }
     }
 
-    // ── Direct apply via POST /auto-pipeline ──────────────────────────────
+    // ── Direct apply via auto-pipeline + optional auto-send ───────────────
+    private fun extractCompanyFromUrl(url: String): String {
+        val cleaned = url.lowercase().trimEnd('/')
+        // Lever: jobs.lever.co/company/...
+        Regex("jobs\\.lever\\.co/([^/]+)").find(cleaned)?.let { return it.groupValues[1] }
+        // Greenhouse: boards.greenhouse.io/company/...
+        Regex("boards\\.greenhouse\\.io/([^/]+)").find(cleaned)?.let { return it.groupValues[1] }
+        // Ashby: jobs.ashbyhq.com/company
+        Regex("jobs\\.ashbyhq\\.com/([^/]+)").find(cleaned)?.let { return it.groupValues[1] }
+        // Workday: company.wd1.myworkdayjobs.com/...
+        Regex("([^.]+\\.wd\\d+\\.myworkdayjobs\\.com)").find(cleaned)?.let { return it.groupValues[1].split(".")[0] }
+        // LinkedIn: linkedin.com/jobs/view/... (no company in path)
+        // General: company.com/careers or careers.company.com
+        Regex("careers\\.([^./]+)\\.").find(cleaned)?.let { return it.groupValues[1] }
+        Regex("/([^./]+)\\.com/(careers|jobs)").find(cleaned)?.let { return it.groupValues[1] }
+        return ""
+    }
+
     private suspend fun handleDirectApply(text: String) {
+        val urlMatch = Regex("https?://\\S+").find(text)
+        if (urlMatch == null) {
+            removeProcessing(); isProcessing = false
+            messages.add(ChatMessage.System("Please paste a valid job URL."))
+            return
+        }
+        val url = urlMatch.value
+        var company = extractCompanyFromUrl(url)
+        var role = ""
+        try {
+            updateProcessingCard(detail = "Running auto-pipeline for $url...")
+            val evalResponse = withContext(Dispatchers.IO) {
+                api.autoPipeline(AutoPipelineRequest(url = url, company = company.ifEmpty { null }, role = null))
+            }
+            company = evalResponse.company?.takeIf { it.isNotEmpty() } ?: company.ifEmpty { "Unknown" }
+            role = evalResponse.role?.takeIf { it.isNotEmpty() } ?: role
+            val score = evalResponse.score
+            val scoreNum = score.replace("/5", "").toFloatOrNull() ?: 0f
+
+            removeProcessing(); isProcessing = false
+
+            val scoreLabel = if (scoreNum > 0) "$score/5" else score
+
+            // Step 2: Check tracker for duplicates
+            val tracker = withContext(Dispatchers.IO) { api.getTracker() }
+            if (isSpammed(company, tracker.applications)) {
+                messages.add(ChatMessage.Evaluation(
+                    company = company, role = role, score = scoreLabel,
+                    summary = "Fit: ${evalResponse.fit}\nStrengths: ${evalResponse.strengths.joinToString(", ")}\nGaps: ${evalResponse.gaps.joinToString(", ")}",
+                    reportPath = evalResponse.reportPath
+                ))
+                messages.add(ChatMessage.System("\u26A0\uFE0F Already applied to **$company** \u2014 skipping duplicate."))
+                persistMessages(); return
+            }
+
+            // Step 3: Show evaluation card with an Apply button (draft-only, HITL)
+            if (scoreNum >= 4.0f) {
+                messages.add(ChatMessage.Evaluation(
+                    company = company, role = role, score = scoreLabel,
+                    summary = "Fit: ${evalResponse.fit}\nStrengths: ${evalResponse.strengths.joinToString(", ")}\nGaps: ${evalResponse.gaps.joinToString(", ")}",
+                    reportPath = evalResponse.reportPath,
+                    onApply = { viewModelScope.launch { isProcessing = true; val c = ChatMessage.ProcessingCard(steps = emptyList(), currentStep = 0, elapsed = "0s"); processingCardId = c.id; messages.add(c); draftApplication(company, role) } }
+                ))
+            } else {
+                // Score too low or N/A — just show evaluation
+                messages.add(ChatMessage.Evaluation(
+                    company = company, role = role, score = scoreLabel,
+                    summary = "Fit: ${evalResponse.fit}\nStrengths: ${evalResponse.strengths.joinToString(", ")}\nGaps: ${evalResponse.gaps.joinToString(", ")}",
+                    reportPath = evalResponse.reportPath
+                ))
+                val reason = if (scoreNum < 4.0f && scoreNum > 0f) "Score $scoreLabel is below the 4.0 threshold" else "Score unavailable"
+                messages.add(ChatMessage.System("\u26A0\uFE0F **$company** \u2014 $reason. Review the evaluation above."))
+            }
+            persistMessages()
+        } catch (e: java.net.SocketTimeoutException) {
+            removeProcessing(); isProcessing = false
+            messages.add(ChatMessage.System("Couldn't reach the server. Make sure your bridge server is running."))
+            persistMessages()
+        } catch (e: Exception) {
+            removeProcessing(); isProcessing = false
+            messages.add(ChatMessage.System("Couldn't evaluate that posting. Please check the URL and try again."))
+            persistMessages()
+        }
+    }
+
+    // ── Check interviews: detect + list upcoming with reminders ───────────
+    private suspend fun handleCheckInterviews() {
+        try {
+            updateProcessingCard(detail = "Scanning inbox for interview invites...")
+            val baseUrl = prefs.bridgeServerUrl.trimEnd('/')
+            val client = okhttp3.OkHttpClient.Builder().build()
+
+            val detectBody = org.json.JSONObject()
+                .put("email", prefs.userEmail)
+                .put("daysBack", 14)
+                .put("maxEmails", 40)
+                .toString().toRequestBody("application/json".toMediaType())
+            val detectReq = okhttp3.Request.Builder()
+                .url("$baseUrl/interview/detect")
+                .post(detectBody)
+                .build()
+            withContext(Dispatchers.IO) { client.newCall(detectReq).execute() }
+
+            val listReq = okhttp3.Request.Builder()
+                .url("$baseUrl/interviews")
+                .get()
+                .build()
+            val response = withContext(Dispatchers.IO) { client.newCall(listReq).execute() }
+
+            removeProcessing()
+            isProcessing = false
+
+            if (response.isSuccessful) {
+                val body = response.body?.string() ?: ""
+                val json = org.json.JSONObject(body)
+                val arr = json.getJSONArray("interviews")
+                if (arr.length() == 0) {
+                    messages.add(ChatMessage.System(
+                        "\uD83D\uDCC5 **Interviews**\nNo interview invites detected in the last 14 days."
+                    ))
+                } else {
+                    val upcoming = (0 until arr.length())
+                        .map { arr.getJSONObject(it) }
+                        .filter { it.optString("status") == "scheduled" }
+                    val sb = StringBuilder("\uD83D\uDCC5 **Interviews (${arr.length()} found, ${upcoming.size} upcoming)**\n")
+                    for (i in upcoming.indices) {
+                        val iv = upcoming[i]
+                        val whenText = iv.optString("scheduledHuman", "time not stated — check email")
+                        val whenFinal = whenText.ifBlank { "time not stated — check email" }
+                        val reminder = iv.optJSONObject("reminder")
+                        val due = reminder?.optBoolean("due", false) == true
+                        sb.append("\n${i + 1}. **${iv.optString("from", "?").substringBefore("<").trim()}**\n")
+                        sb.append("   ${iv.optString("subject", "")}\n")
+                        sb.append("   \u23F0 ${whenFinal}\n")
+                        if (due) sb.append("   \u26A0\uFE0F ${reminder.optString("label", "due soon")}\n")
+                    }
+                    sb.append("\n_Say **'interview prep for {company}'** to prepare._")
+                    messages.add(ChatMessage.System(sb.toString()))
+                }
+            } else {
+                messages.add(ChatMessage.System("\u274C Couldn't check interviews right now. Please try again."))
+            }
+        } catch (e: Exception) {
+            removeProcessing()
+            isProcessing = false
+            messages.add(ChatMessage.System("\u274C Couldn't check interviews right now. Please try again."))
+        }
+    }
+
+    // ── Direct interview prep ──────────────────────────────────────────────
+    private suspend fun handleInterviewPrep(text: String) {        // Extract company name from text
+        val companyMatch = Regex("(?i)(?:interview prep(?:aration)? for|prepare for|research)\\s+(.+?)(?:\\s*$|\\s+(?:role|position|at))").find(text)
+        val company = companyMatch?.groupValues?.get(1)?.trim()?.removeSuffix(".") ?: ""
+        val roleMatch = Regex("(?i)(?:role|position)\\s+(.+?)(?:\\s*$|\\s+(?:at))").find(text)
+
+        if (company.isEmpty()) {
+            removeProcessing()
+            isProcessing = false
+            messages.add(ChatMessage.System(
+                "Which company do you want interview prep for?\n" +
+                "Say **'interview prep for {company}'**."
+            ))
+            return
+        }
+
+        val role = roleMatch?.groupValues?.get(1)?.trim()?.removeSuffix(".") ?: ""
+
+        try {
+            updateProcessingCard(detail = "Researching $company...")
+
+            val baseUrl = prefs.bridgeServerUrl.trimEnd('/')
+            val client = okhttp3.OkHttpClient.Builder().build()
+            val json = org.json.JSONObject()
+                .put("company", company)
+                .put("role", role)
+            val body = json.toString().toRequestBody("application/json".toMediaType())
+            val request = okhttp3.Request.Builder()
+                .url("$baseUrl/interview-prep/generate")
+                .post(body)
+                .build()
+
+            val response = withContext(Dispatchers.IO) { client.newCall(request).execute() }
+
+            removeProcessing()
+            isProcessing = false
+
+            if (response.isSuccessful) {
+                val respBody = response.body?.string() ?: ""
+                val respJson = try { org.json.JSONObject(respBody) } catch (_: Exception) { null }
+                val content = respJson?.optString("preparation", respBody) ?: respBody
+
+                messages.add(ChatMessage.System(
+                    "\uD83C\uDF1F **Interview Prep: $company**" +
+                    if (role.isNotEmpty()) " — $role" else "" +
+                    "\n\n${truncateIfNeeded(content)}"
+                ))
+            } else {
+                messages.add(ChatMessage.System("\u274C Interview prep failed for **$company**"))
+            }
+        } catch (e: Exception) {
+            removeProcessing()
+            isProcessing = false
+                messages.add(ChatMessage.System("\u274C Couldn't prepare interview insights. Please try again."))
+        }
+    }
+
+    // ── Direct auto-fill via POST /apply/open → POST /apply/fill ──────────
+    private suspend fun handleDirectAutoFill(text: String) {
         val urlMatch = Regex("https?://\\S+").find(text)
         if (urlMatch == null) {
             removeProcessing()
             isProcessing = false
-            messages.add(ChatMessage.System("Please paste a valid job URL."))
+            messages.add(ChatMessage.System("Please paste a valid job URL to auto-fill."))
             return
         }
+        startAutoFill(urlMatch.value)
+    }
+
+    // Shared Playwright auto-fill flow: /apply/open → /apply/fill (never auto-submits).
+    // Used by the typed "auto-fill <url>" command and by Apply when the job is a
+    // portal listing or no contact email exists.
+    private suspend fun startAutoFill(url: String, companyHint: String = "") {
         try {
-            val response = withContext(Dispatchers.IO) {
-                api.autoPipeline(AutoPipelineRequest(url = urlMatch.value))
+            ensureProcessingCard("Opening application form...")
+            updateProcessingCard(detail = "Opening application form...")
+
+            // Step 1: Open Chrome and extract form fields
+            val openResponse = withContext(Dispatchers.IO) {
+                api.applyOpen(ApplyOpenRequest(url = url, stealth = true))
             }
+
+            if (openResponse.error != null) {
+                removeProcessing()
+                isProcessing = false
+                messages.add(ChatMessage.System(
+                    "\u26A0\uFE0F Auto-fill failed: ${openResponse.error}\n" +
+                    "Open the listing and apply manually:\n${openResponse.manualUrl.ifBlank { url }}"
+                ))
+                return
+            }
+
+            val company = openResponse.company.ifEmpty { companyHint.ifEmpty { "Unknown" } }
+            val atsType = openResponse.atsType ?: "unknown"
+            val fieldCount = openResponse.fields.size
+            val answerCount = openResponse.answers.size
+
             removeProcessing()
             isProcessing = false
 
-            messages.add(ChatMessage.Evaluation(
-                company = response.company ?: "Unknown",
-                role = response.role ?: "",
-                score = response.score,
-                summary = "Fit: ${response.fit}\nStrengths: ${response.strengths.joinToString(", ")}\nGaps: ${response.gaps.joinToString(", ")}"
+            // Show field summary
+            messages.add(ChatMessage.System(
+                "\uD83E\uDD16 **Auto-Fill: $company**\n" +
+                "ATS Platform: **$atsType**\n" +
+                "Fields detected: **$fieldCount**\n" +
+                "Auto-answers generated: **$answerCount**\n\n" +
+                "I'll fill in the form with your profile data and attach your CV. " +
+                "**I will NOT submit** — you review and click Submit manually."
             ))
-            persistMessages()
+
+            // Show fields that will be filled
+            if (openResponse.fields.isNotEmpty()) {
+                val fieldSummary = openResponse.fields.take(10).joinToString("\n") { f ->
+                    val req = if (f.required) " *" else ""
+                    val val_ = openResponse.answers[f.id]?.let { " → $it" } ?: ""
+                    "  \u2022 **${f.label}**${req}$val_"
+                }
+                messages.add(ChatMessage.System(
+                    "**Fields to fill:**\n$fieldSummary" +
+                    if (openResponse.fields.size > 10) "\n  ... and ${openResponse.fields.size - 10} more" else ""
+                ))
+            }
+
+            // Store the URL, answers and questions for the confirm step
+            _pendingAutoFillUrl = url
+            _pendingAutoFillAnswers = openResponse.answers.toMutableMap()
+            _pendingAutoFillCompany = company
+            _pendingAutoFillQuestions = openResponse.pending_questions
+
+            // Ask the candidate for any fields we could not auto-fill — inline,
+            // before any fill happens. Answers are persisted to config/form-answers.yml
+            // so the same question is never asked twice.
+            val questions = openResponse.pending_questions
+            if (questions.isNotEmpty()) {
+                messages.add(ChatMessage.System(
+                    "\u2753 **${questions.size} question${if (questions.size != 1) "s" else ""} before I can fill the form for $company:**"
+                ))
+                for (q in questions) {
+                    val cardId = ChatMessage.nextId()
+                    messages.add(ChatMessage.FormQuestion(
+                        id = cardId,
+                        fieldId = q.field_id,
+                        category = q.category,
+                        label = q.label,
+                        required = q.required,
+                        options = q.options,
+                        hint = q.hint,
+                        onAnswer = { value -> answerAutoFillQuestion(cardId, q, value) }
+                    ))
+                }
+                messages.add(ChatMessage.System(
+                    "Answer the question${if (questions.size != 1) "s" else ""} above, then say **'confirm fill'** to auto-fill the form for **$company**."
+                ))
+            } else {
+                messages.add(ChatMessage.System(
+                    "Say **'confirm fill'** to proceed with auto-filling the form for **$company**."
+                ))
+            }
+
         } catch (e: Exception) {
             removeProcessing()
             isProcessing = false
-            messages.add(ChatMessage.System("Evaluation failed: ${e.message}"))
+            messages.add(ChatMessage.System("\u274C Couldn't auto-fill the form. Please try manually or check the URL."))
         }
+    }
+
+    // Pending auto-fill questions (fields that need the candidate's input)
+    private var _pendingAutoFillQuestions: List<ApplyPendingQuestion> = emptyList()
+
+    // Record the candidate's answer to a pending question, persist it to
+    // config/form-answers.yml (keyed by category so it is reused everywhere),
+    // merge it into the fill answers, and mark the question card answered.
+    private fun answerAutoFillQuestion(cardId: Long, q: ApplyPendingQuestion, value: String) {
+        val trimmed = value.trim()
+        if (trimmed.isEmpty()) {
+            messages.add(ChatMessage.System("Please provide an answer for: ${q.label}"))
+            return
+        }
+        // Update the question card to "answered"
+        val idx = messages.indexOfFirst { it.id == cardId }
+        if (idx >= 0) {
+            messages[idx] = ChatMessage.FormQuestion(
+                id = cardId,
+                fieldId = q.field_id,
+                category = q.category,
+                label = q.label,
+                required = q.required,
+                options = q.options,
+                hint = q.hint,
+                answered = true,
+                answer = trimmed,
+                onAnswer = { answerAutoFillQuestion(cardId, q, it) }
+            )
+        }
+        // Merge into fill answers
+        _pendingAutoFillAnswers = _pendingAutoFillAnswers + (q.field_id to trimmed)
+        // Persist keyed by category so future forms are auto-filled
+        if (q.category.isNotEmpty()) {
+            viewModelScope.launch {
+                try {
+                    withContext(Dispatchers.IO) {
+                        api.saveFormAnswers(mapOf("answers" to mapOf(q.category to trimmed)))
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+        messages.add(ChatMessage.System("\u2705 **${q.label}** → $trimmed"))
+        persistMessages()
+    }
+
+    // Job aggregator / portal hosts. These never expose a direct contact email, so
+    // Apply routes them to the auto-fill flow instead of an email draft.
+    private fun isPortalListingUrl(url: String): Boolean {
+        val host = url.lowercase()
+        return listOf(
+            "linkedin.com", "shine.com", "internshala.com", "naukri.com", "indeed.com",
+            "glassdoor.com", "monster.com", "foundit.com", "timesjobs.com", "cutshort.io",
+            "wellfound.com", "hirect.in", "apna.co", "talent.com", "jooble.org"
+        ).any { host.contains(it) }
+    }
+
+    // Pending auto-fill state
+    private var _pendingAutoFillUrl: String = ""
+    private var _pendingAutoFillAnswers: Map<String, String> = emptyMap()
+    private var _pendingAutoFillCompany: String = ""
+
+    // Confirm and execute auto-fill
+    private suspend fun handleConfirmFill() {
+        if (_pendingAutoFillUrl.isEmpty()) {
+            messages.add(ChatMessage.System("No pending auto-fill. Paste a job URL and say 'auto-fill' first."))
+            return
+        }
+        // All required pending questions must be answered before filling
+        val unanswered = _pendingAutoFillQuestions
+            .filter { it.required && it.field_id !in _pendingAutoFillAnswers }
+            .map { it.label }
+        if (unanswered.isNotEmpty()) {
+            messages.add(ChatMessage.System(
+                "Please answer ${unanswered.size} more question${if (unanswered.size != 1) "s" else ""} first: " +
+                unanswered.joinToString("; ") + "."
+            ))
+            return
+        }
+        try {
+            isProcessing = true
+            val card = ChatMessage.ProcessingCard(steps = emptyList(), currentStep = 0, elapsed = "0s")
+            processingCardId = card.id
+            messages.add(card)
+            updateProcessingCard(detail = "Filling form for $_pendingAutoFillCompany...")
+
+            val fillResponse = withContext(Dispatchers.IO) {
+                api.applyFill(ApplyFillRequest(
+                    url = _pendingAutoFillUrl,
+                    answers = _pendingAutoFillAnswers,
+                    company = _pendingAutoFillCompany
+                ))
+            }
+
+            removeProcessing()
+            isProcessing = false
+
+            if (fillResponse.success) {
+                val cvStatus = when {
+                    fillResponse.cvAttached -> "CV attached ✅"
+                    fillResponse.cvNote.isNotBlank() -> "⚠️ ${fillResponse.cvNote}"
+                    else -> "⚠️ No CV found to attach"
+                }
+                messages.add(ChatMessage.System(
+                    "\u2705 **Form filled for $_pendingAutoFillCompany**\n" +
+                    "ATS: ${fillResponse.atsType ?: "Unknown"}\n" +
+                    "Fields filled: ${fillResponse.filled.size}\n" +
+                    "Skipped: ${fillResponse.skipped.size}\n" +
+                    "$cvStatus\n\n" +
+                    "\u26A0\uFE0F **Review the form in the browser and submit manually.** " +
+                    "I never auto-submit applications."
+                ))
+            } else {
+                val reason = fillResponse.message.ifBlank { fillResponse.error ?: "Unknown error" }
+                val loginVia = fillResponse.loginVia
+                val loginHint = if (fillResponse.loginWall) {
+                    "\n\n🔑 This portal needs you to sign in before its form appears. " +
+                    "We automatically try Google OAuth login (your Google session) and any saved portal password, " +
+                    "then fill the form. If it still failed, log in once on the site (Settings → Portal Logins can store a " +
+                    "fallback password) and retry — the session is remembered per-account."
+                } else if (loginVia == "google-oauth") {
+                    "\n\n✅ Logged in with your Google account (OAuth) to reach the form."
+                } else if (loginVia == "portal-creds") {
+                    "\n\n✅ Logged in using your saved portal credentials to reach the form."
+                } else ""
+                messages.add(ChatMessage.System(
+                    "\u274C **Form fill failed for $_pendingAutoFillCompany**\n" +
+                    "$reason$loginHint\n\n" +
+                    "You can try again or apply manually: ${fillResponse.url.ifBlank { _pendingAutoFillUrl }}"
+                ))
+            }
+        } catch (e: Exception) {
+            removeProcessing()
+            isProcessing = false
+            messages.add(ChatMessage.System("\u274C Couldn't submit the form. Please try manually."))
+        } finally {
+            _pendingAutoFillUrl = ""
+            _pendingAutoFillAnswers = emptyMap()
+            _pendingAutoFillCompany = ""
+            _pendingAutoFillQuestions = emptyList()
+        }
+    }
+
+    // ── Direct follow-up via POST /followup/draft ──────────────────────────
+    private suspend fun handleDirectFollowUp(text: String) {
+        // Extract company name — look for company after "follow up with" or "followup"
+        val companyMatch = Regex("(?i)(?:follow up with|follow up on|followup with|followup on)\\s+(.+?)(?:\\s*$|\\s+(?:about|regarding|for))").find(text)
+        val company = companyMatch?.groupValues?.get(1)?.trim()?.removeSuffix(".") ?: ""
+
+        if (company.isEmpty()) {
+            removeProcessing()
+            isProcessing = false
+            messages.add(ChatMessage.System(
+                "Which company do you want to follow up with?\n" +
+                "Say **'follow up with {company name}'**."
+            ))
+            return
+        }
+
+        try {
+            updateProcessingCard(detail = "Drafting follow-up for $company...")
+
+            val draftResponse = withContext(Dispatchers.IO) {
+                api.draftReply(EmailReplyRequest(
+                    to = "",
+                    subject = "",
+                    body = "",
+                    replyType = "follow_up"
+                ))
+            }
+
+            removeProcessing()
+            isProcessing = false
+
+            messages.add(ChatMessage.System(
+                "\u23F0 **Follow-up Draft for $company**\n\n" +
+                "${draftResponse.replyBody}\n\n" +
+                "Say **'send follow-up to $company'** to send it. If we don't have the hiring email yet, add it: **'send follow-up to $company at hr@$company.com'**."
+            ))
+
+            _pendingFollowUpCompany = company
+            _pendingFollowUpBody = draftResponse.replyBody
+
+        } catch (e: Exception) {
+            removeProcessing()
+            isProcessing = false
+            messages.add(ChatMessage.System("\u274C Couldn't draft a follow-up for $company. Please try again."))
+        }
+    }
+
+    // ── Schedule status ──────────────────────────────────────────────────
+    private suspend fun handleDirectSchedule() {
+        try {
+            updateProcessingCard(detail = "Checking scheduler status...")
+            val baseUrl = prefs.bridgeServerUrl.trimEnd('/')
+            var schedulerInfo = "unknown"
+            try {
+                val client = okhttp3.OkHttpClient.Builder().connectTimeout(5, java.util.concurrent.TimeUnit.SECONDS).build()
+                val req = okhttp3.Request.Builder().url("$baseUrl/scheduler/status").get().build()
+                val resp = withContext(Dispatchers.IO) { client.newCall(req).execute() }
+                if (resp.isSuccessful) {
+                    val json = org.json.JSONObject(resp.body?.string() ?: "{}")
+                    schedulerInfo = json.optString("status", "running")
+                }
+            } catch (_: Exception) {
+                schedulerInfo = "running (bridge has it)"
+            }
+            removeProcessing(); isProcessing = false
+            messages.add(ChatMessage.System(
+                "\u23F0 **Automation Schedule**\n\n" +
+                "Bridge server scheduler: **$schedulerInfo**\n" +
+                "Auto-Apply: **${if (prefs.autoApply) "ON" else "OFF"}**\n" +
+                "Auto-Reply: **${if (prefs.autoReply) "ON" else "OFF"}**\n\n" +
+                "The bridge server runs daily at 6AM (scan, evaluate, follow-ups).\n" +
+                "Toggle automation in Settings \u2192 Automation."
+            ))
+            persistMessages()
+        } catch (e: Exception) {
+            removeProcessing(); isProcessing = false
+            messages.add(ChatMessage.System("Couldn't check scheduler status."))
+        }
+    }
+
+    // Pending follow-up state
+    private var _pendingFollowUpCompany: String = ""
+    private var _pendingFollowUpBody: String = ""
+    private var _pendingFollowUpTo: String = ""
+
+    // User supplied a recipient email for the pending follow-up — hold it for
+    // explicit confirmation via "send follow-up to {company}".
+    private suspend fun handleCaptureFollowUpTo(text: String) {
+        val email = extractEmail(text)
+        if (email == null) return
+        _pendingFollowUpTo = email
+        messages.add(ChatMessage.System(
+            "Got it — recipient for the follow-up is set to **$email**.\n" +
+            "Say **'send follow-up to ${_pendingFollowUpCompany}'** to send it."
+        ))
+    }
+
+    // Send the pending follow-up
+    private suspend fun handleSendFollowUp(text: String = "") {
+        if (_pendingFollowUpCompany.isEmpty() || _pendingFollowUpBody.isEmpty()) {
+            removeProcessing()
+            isProcessing = false
+            messages.add(ChatMessage.System(
+                "No pending follow-up draft. Say **'follow up with {company}'** to create one first."
+            ))
+            return
+        }
+        val company = _pendingFollowUpCompany
+
+        // Resolve the recipient: stored one > from the user's message > tracker notes.
+        var to = _pendingFollowUpTo.ifBlank { null } ?: extractEmail(text)
+        if (to == null) {
+            try {
+                val trackerResp = withContext(Dispatchers.IO) { api.getTracker() }
+                to = trackerResp.applications
+                    .filter { it.company.equals(company, ignoreCase = true) }
+                    .mapNotNull { extractEmail(it.notes) }
+                    .firstOrNull()
+            } catch (_: Exception) {}
+        }
+
+        if (to == null) {
+            removeProcessing()
+            isProcessing = false
+            messages.add(ChatMessage.System(
+                "\u26A0\uFE0F **Follow-up draft ready for $company**, but I couldn't find the hiring email.\n\n" +
+                _pendingFollowUpBody + "\n\n" +
+                "Tell me the recipient and I'll send it, e.g. **'send follow-up to $company at hr@$company.com'**."
+            ))
+            return
+        }
+
+        try {
+            updateProcessingCard(detail = "Sending follow-up to $company...")
+
+            val response = withContext(Dispatchers.IO) {
+                api.sendEmail(EmailSendRequest(
+                    to = to,
+                    subject = "Follow-up: Application at $company",
+                    body = _pendingFollowUpBody,
+                    company = company,
+                    role = ""
+                ))
+            }
+
+            removeProcessing()
+            isProcessing = false
+
+            if ((response["success"] as? Boolean) == true) {
+                messages.add(ChatMessage.System("\u2705 **Follow-up sent to $company** ($to)"))
+            } else {
+                val errorMsg = (response["error"] as? String) ?: "Unknown error"
+                messages.add(ChatMessage.System(
+                    "\u274C Failed to send follow-up to $company.\nError: $errorMsg"
+                ))
+            }
+            _pendingFollowUpCompany = ""
+            _pendingFollowUpBody = ""
+            _pendingFollowUpTo = ""
+        } catch (e: Exception) {
+            removeProcessing()
+            isProcessing = false
+            messages.add(ChatMessage.System("\u274C Couldn't send the follow-up: ${describeError(e)}"))
+        }
+    }
+
+    private fun extractEmail(text: String?): String? {
+        if (text.isNullOrBlank()) return null
+        return Regex("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}")
+            .find(text)?.value?.takeIf { !it.contains("@your") && !it.contains("example") }
     }
 
     // ── Direct tracker via GET /tracker ───────────────────────────────────
@@ -660,7 +1713,7 @@ class ChatViewModel @Inject constructor(
         } catch (e: Exception) {
             removeProcessing()
             isProcessing = false
-            messages.add(ChatMessage.System("Tracker failed: ${e.message}"))
+            messages.add(ChatMessage.System("Couldn't fetch your tracker data. Please try again."))
         }
     }
 
@@ -679,7 +1732,7 @@ class ChatViewModel @Inject constructor(
                     removeProcessing()
                     val errorMsg = "HTTP ${response.code()}: ${response.errorBody()?.string() ?: "unknown"}"
                     debugLog.add(DebugEntry("error", errorMsg))
-                    messages.add(ChatMessage.System("Error: ${truncateIfNeeded(errorMsg)}"))
+                    messages.add(ChatMessage.System("Couldn't complete that right now. Please try again."))
                     isProcessing = false
                     return
                 }
@@ -688,7 +1741,7 @@ class ChatViewModel @Inject constructor(
                 if (body == null) {
                     removeProcessing()
                     debugLog.add(DebugEntry("error", "Empty response body"))
-                    messages.add(ChatMessage.System("Error: Empty response from server"))
+                    messages.add(ChatMessage.System("The service didn't return a response. Please try again."))
                     isProcessing = false
                     return
                 }
@@ -705,7 +1758,7 @@ class ChatViewModel @Inject constructor(
                 // Parse SSE stream — updates progress in real-time
                 _streamingText.value = ""
                 val streamResult = withContext(Dispatchers.IO) {
-                    parseSSEStreamIncremental(body)
+                    withTimeout(180_000) { parseSSEStreamIncremental(body) }
                 }
 
                 timerJob.cancel()
@@ -775,7 +1828,8 @@ class ChatViewModel @Inject constructor(
                                             viewModelScope.launch {
                                                 draftApplication(
                                                     job["company"] ?: "",
-                                                    job["role"] ?: ""
+                                                    job["role"] ?: "",
+                                                    job["url"] ?: ""
                                                 )
                                             }
                                         },
@@ -831,7 +1885,8 @@ class ChatViewModel @Inject constructor(
                                     viewModelScope.launch {
                                         draftApplication(
                                             action.data["company"] ?: "",
-                                            action.data["role"] ?: ""
+                                            action.data["role"] ?: "",
+                                            action.data["url"] ?: ""
                                         )
                                     }
                                 },
@@ -841,7 +1896,9 @@ class ChatViewModel @Inject constructor(
                             ))
                         }
                         "email_draft" -> {
+                            val draftId = ChatMessage.nextId()
                             messages.add(ChatMessage.EmailDraft(
+                                id = draftId,
                                 to = action.data["to"] ?: "",
                                 company = action.data["company"] ?: "",
                                 role = action.data["role"] ?: "",
@@ -860,29 +1917,34 @@ class ChatViewModel @Inject constructor(
                                     }
                                 },
                                 onEdit = {
-                                    messages.add(ChatMessage.System("Edit the draft above and send it back."))
+                                    openDraftEditor(draftId)
                                 }
                             ))
                         }
                         "evaluation" -> {
+                            val company = action.data["company"] ?: ""
+                            val role = action.data["role"] ?: ""
                             messages.add(ChatMessage.Evaluation(
-                                company = action.data["company"] ?: "",
-                                role = action.data["role"] ?: "",
+                                company = company,
+                                role = role,
                                 score = action.data["score"] ?: "",
                                 summary = action.data["summary"] ?: "",
-                                reportPath = action.data["reportPath"] ?: ""
+                                reportPath = action.data["reportPath"] ?: "",
+                                onApply = if (company.isNotEmpty()) {
+                                    { viewModelScope.launch { draftApplication(company, role, action.data["url"] ?: "") } }
+                                } else null
                             ))
                         }
                     }
                 }
 
                 if (streamResult.error != null) {
-                    messages.add(ChatMessage.System("Error: ${truncateIfNeeded(streamResult.error)}"))
+                    messages.add(ChatMessage.System("There was an issue processing your request. Please try again."))
                 }
 
                 if (displayText.isBlank() && actions.isEmpty() && streamResult.error == null) {
                     addDebug(DebugEntry("warn", "Empty stream — no text, no actions"))
-                    messages.add(ChatMessage.System("Empty response from server."))
+                    messages.add(ChatMessage.System("I couldn't generate a response. Could you rephrase your request?"))
                 }
             } catch (e: Exception) {
                 removeProcessing()
@@ -892,7 +1954,7 @@ class ChatViewModel @Inject constructor(
                 val errorMsg = "${e.javaClass.simpleName}: ${e.message}"
                 addDebug(DebugEntry("error", "$errorMsg (${elapsed}ms)"))
                 Log.e(TAG, "Chat stream error", e)
-                messages.add(ChatMessage.System("Error: ${truncateIfNeeded(errorMsg)}"))
+                messages.add(ChatMessage.System("Something went wrong. Please try again."))
 
                 addResponseTime(
                     ResponseTimeEntry(
@@ -938,10 +2000,114 @@ class ChatViewModel @Inject constructor(
 
     private fun removeProcessing() {
         val cardId = processingCardId ?: return
+        processingCardId = null
         val idx = messages.indexOfFirst { it.id == cardId }
         if (idx >= 0) {
             messages.removeAt(idx)
         }
+    }
+
+    // ── Persistent HITL quick actions: Stop / Retry / Edit ─────────────
+    // These buttons live above the input bar and are ALWAYS visible. They are
+    // the user's escape hatch for anything the agent is doing.
+
+    val canStop: Boolean get() = isProcessing
+    val canRetry: Boolean get() = lastUserMessage.isNotBlank() && !isProcessing
+    /** After a Stop, the Retry button relabels itself "Resume". */
+    val canResume: Boolean get() = wasInterrupted && canRetry
+    val hasLastDraft: Boolean
+        get() = messages.indexOfLast { it is ChatMessage.EmailDraft || it is ChatMessage.ReplyDraft } >= 0
+
+    fun stopProcessing() {
+        activeJob?.cancel()
+        activeJob = null
+        suppressDrain = true
+        removeProcessing()
+        isProcessing = false
+        suppressDrain = false
+        wasInterrupted = true
+        messages.add(ChatMessage.System("\u23F9\uFE0F **Stopped** \u2014 cancelled the current operation."))
+        persistMessages()
+    }
+
+    /** Re-run the last task. Acts as "Resume" right after an interruption. */
+    fun retryLast() {
+        if (canRetry) {
+            wasInterrupted = false
+            sendMessage(lastUserMessage)
+        }
+    }
+
+    private fun drainQueue() {
+        if (queuedMessages.isEmpty()) return
+        val next = queuedMessages.removeAt(0)
+        viewModelScope.launch {
+            messages.add(ChatMessage.System(
+                "\u25B6\uFE0F **Running queued task:** \"${next.take(60)}\""
+            ))
+            persistMessages()
+            sendMessage(next)
+        }
+    }
+
+    /** Open the draft editor for the most recent draft (used by the Edit quick action). */
+    fun editLastDraft() {
+        val idx = messages.indexOfLast { it is ChatMessage.EmailDraft || it is ChatMessage.ReplyDraft }
+        if (idx >= 0) openDraftEditor(messages[idx].id)
+    }
+
+    fun openDraftEditor(id: Long) {
+        val body = when (val m = messages.firstOrNull { it.id == id }) {
+            is ChatMessage.EmailDraft -> m.body
+            is ChatMessage.ReplyDraft -> m.body
+            else -> return
+        }
+        editingDraftId = id
+        editingDraftText = body
+    }
+
+    fun saveDraftEdit() {
+        val id = editingDraftId ?: return
+        val idx = messages.indexOfFirst { it.id == id }
+        if (idx >= 0) {
+            val updated = when (val cur = messages[idx]) {
+                is ChatMessage.EmailDraft -> cur.copy(body = editingDraftText)
+                is ChatMessage.ReplyDraft -> cur.copy(body = editingDraftText)
+                else -> null
+            }
+            if (updated != null) messages[idx] = updated
+        }
+        editingDraftId = null
+        editingDraftText = ""
+        persistMessages()
+    }
+
+    fun updateEditingDraftText(text: String) {
+        editingDraftText = text
+    }
+
+    fun closeDraftEditor() {
+        editingDraftId = null
+        editingDraftText = ""
+    }
+
+    /**
+     * Create a processing card only if none exists. Some entry points (sendMessage)
+     * already add one before routing; reusing it prevents a duplicate "stuck" card
+     * that never gets removed.
+     */
+    private fun ensureProcessingCard(detail: String = "Working..."): Long {
+        if (processingCardId != null) {
+            val idx = messages.indexOfFirst { it.id == processingCardId }
+            if (idx >= 0 && messages[idx] is ChatMessage.ProcessingCard) {
+                return processingCardId!!
+            }
+            processingCardId = null
+        }
+        val card = ChatMessage.ProcessingCard(steps = emptyList(), currentStep = 0, elapsed = "0s", detail = detail)
+        processingCardId = card.id
+        messages.add(card)
+        return card.id
     }
 
     private data class StreamResult(
@@ -952,11 +2118,11 @@ class ChatViewModel @Inject constructor(
     )
 
     /**
-     * Parse SSE stream incrementally — emits text deltas to _streamingText
-     * as they arrive, so the UI can render them in real-time.
+     * Parse SSE stream incrementally using raw InputStream + BufferedReader
+     * (bypasses OkHttp internal buffering) — emits text deltas and tool
+     * status events to _streamingText / _progressText as they arrive.
      */
     private fun parseSSEStreamIncremental(body: ResponseBody): StreamResult {
-        val source = body.source()
         val textBuilder = StringBuilder()
         var sessionId: String? = null
         var error: String? = null
@@ -965,87 +2131,85 @@ class ChatViewModel @Inject constructor(
         val dataBuffer = StringBuilder()
 
         try {
-            while (!source.exhausted()) {
-                val line = source.readUtf8Line() ?: break
-
-                when {
-                    line.startsWith("event: ") -> {
-                        currentEvent = line.removePrefix("event: ").trim()
-                    }
-                    line.startsWith("data: ") -> {
-                        dataBuffer.clear()
-                        dataBuffer.append(line.removePrefix("data: "))
-                    }
-                    line.isEmpty() && currentEvent.isNotEmpty() -> {
-                        // End of SSE message — process the event
-                        val dataStr = dataBuffer.toString()
-                        try {
-                            val json = org.json.JSONObject(dataStr)
-                            when (currentEvent) {
-                                "text_delta" -> {
-                                    val delta = json.optString("text", "")
-                                    if (delta.isNotEmpty()) {
-                                        textBuilder.append(delta)
-                                        // Cap streaming text to prevent UI crash on huge responses
-                                        val displayText = textBuilder.toString()
-                                        _streamingText.value = if (displayText.length > MAX_STREAMING_TEXT)
-                                            displayText.takeLast(MAX_STREAMING_TEXT) else displayText
-                                    }
-                                }
-                                "progress" -> {
-                                    val progressText = json.optString("text", "")
-                                    _progressText.value = progressText
-
-                                    // Parse structured step progress from bridge server
-                                    val workflowSteps = mutableListOf<WorkflowStep>()
-                                    val stepsArr = json.optJSONArray("steps")
-                                    if (stepsArr != null) {
-                                        for (i in 0 until stepsArr.length()) {
-                                            val stepObj = stepsArr.optJSONObject(i) ?: continue
-                                            workflowSteps.add(WorkflowStep(
-                                                label = stepObj.optString("label", ""),
-                                                done = stepObj.optBoolean("done", false)
-                                            ))
+            body.byteStream().bufferedReader().use { reader ->
+                var line = reader.readLine()
+                while (line != null) {
+                    when {
+                        line.startsWith("event: ") -> {
+                            currentEvent = line.removePrefix("event: ").trim()
+                        }
+                        line.startsWith("data: ") -> {
+                            dataBuffer.clear()
+                            dataBuffer.append(line.removePrefix("data: "))
+                        }
+                        line.isEmpty() && currentEvent.isNotEmpty() -> {
+                            val dataStr = dataBuffer.toString()
+                            try {
+                                val json = org.json.JSONObject(dataStr)
+                                when (currentEvent) {
+                                    "text_delta" -> {
+                                        val delta = json.optString("text", "")
+                                        if (delta.isNotEmpty()) {
+                                            textBuilder.append(delta)
+                                            val displayText = textBuilder.toString()
+                                            _streamingText.value = if (displayText.length > MAX_STREAMING_TEXT)
+                                                displayText.takeLast(MAX_STREAMING_TEXT) else displayText
                                         }
                                     }
-                                    val progressVal = json.optDouble("progress", -1.0).toFloat()
-                                    val currentTool = json.optString("currentTool", "")
+                                    "progress" -> {
+                                        val progressText = json.optString("text", "")
+                                        _progressText.value = progressText
 
-                                    // Extract portal-specific info
-                                    val portal = json.optString("portal", "")
-                                    val scanCurrent = json.optInt("current", 0)
-                                    val scanTotal = json.optInt("total", 0)
-                                    val phase = json.optString("phase", "")
+                                        val workflowSteps = mutableListOf<WorkflowStep>()
+                                        val stepsArr = json.optJSONArray("steps")
+                                        if (stepsArr != null) {
+                                            for (i in 0 until stepsArr.length()) {
+                                                val stepObj = stepsArr.optJSONObject(i) ?: continue
+                                                workflowSteps.add(WorkflowStep(
+                                                    label = stepObj.optString("label", ""),
+                                                    done = stepObj.optBoolean("done", false)
+                                                ))
+                                            }
+                                        }
+                                        val progressVal = json.optDouble("progress", -1.0).toFloat()
+                                        val currentTool = json.optString("currentTool", "")
 
-                                    val portalDisplay = when {
-                                        portal.isNotEmpty() && scanTotal > 0 -> "$portal ($scanCurrent/$scanTotal)"
-                                        portal.isNotEmpty() -> portal
-                                        else -> ""
+                                        val portal = json.optString("portal", "")
+                                        val scanCurrent = json.optInt("current", 0)
+                                        val scanTotal = json.optInt("total", 0)
+                                        val phase = json.optString("phase", "")
+
+                                        val portalDisplay = when {
+                                            portal.isNotEmpty() && scanTotal > 0 -> "$portal ($scanCurrent/$scanTotal)"
+                                            portal.isNotEmpty() -> portal
+                                            else -> ""
+                                        }
+                                        updateProcessingCard(
+                                            detail = progressText,
+                                            workflowSteps = if (workflowSteps.isNotEmpty()) workflowSteps.toList() else null,
+                                            progress = progressVal,
+                                            currentTool = currentTool,
+                                            portalName = portalDisplay
+                                        )
                                     }
-                                    updateProcessingCard(
-                                        detail = progressText,
-                                        workflowSteps = if (workflowSteps.isNotEmpty()) workflowSteps.toList() else null,
-                                        progress = progressVal,
-                                        currentTool = currentTool,
-                                        portalName = portalDisplay
-                                    )
+                                    "connected" -> {
+                                        _progressText.value = "Connected..."
+                                    }
+                                    "done" -> {
+                                        _progressText.value = ""
+                                        sessionId = json.optString("sessionId", sessionId ?: "")
+                                    }
+                                    "error" -> {
+                                        _progressText.value = ""
+                                        error = json.optString("error", "Unknown error")
+                                    }
                                 }
-                                "connected" -> {
-                                    _progressText.value = "Connected..."
-                                }
-                                "done" -> {
-                                    _progressText.value = ""
-                                    sessionId = json.optString("sessionId", sessionId)
-                                }
-                                "error" -> {
-                                    _progressText.value = ""
-                                    error = json.optString("error", "Unknown error")
-                                }
-                            }
-                        } catch (_: Exception) { }
-                        currentEvent = ""
-                        dataBuffer.clear()
+                            } catch (_: Exception) { }
+                            currentEvent = ""
+                            dataBuffer.clear()
+                        }
                     }
+                    line = reader.readLine()
                 }
             }
         } catch (e: Exception) {
@@ -1054,7 +2218,6 @@ class ChatViewModel @Inject constructor(
             }
         }
 
-                // Parse action blocks from accumulated text — cap first to avoid regex overhead on huge responses
         val fullTextForParse = if (textBuilder.length > MAX_STREAMING_TEXT) textBuilder.toString().takeLast(MAX_STREAMING_TEXT) else textBuilder.toString()
         val parsed = parseActionBlocks(fullTextForParse)
         actions.addAll(parsed.actions)
@@ -1228,20 +2391,43 @@ class ChatViewModel @Inject constructor(
         }
     }
 
-    private fun persistMessages() {
+    fun persistMessages() {
         try {
             val arr = JSONArray()
             for (msg in messages) {
-                when (msg) {
-                    is ChatMessage.User -> arr.put(JSONObject().put("type", "user").put("text", msg.text))
-                    is ChatMessage.System -> arr.put(JSONObject().put("type", "system").put("text", msg.text))
-                    else -> {} // Only persist user + system messages
+                val entry = when (msg) {
+                    is ChatMessage.User -> JSONObject().put("type", "user").put("text", msg.text)
+                    is ChatMessage.System -> JSONObject().put("type", "system").put("text", msg.text)
+                    is ChatMessage.JobCard -> JSONObject().put("type", "job_card")
+                        .put("text", "${msg.company} — ${msg.role}${if (msg.score.isNotEmpty()) " (${msg.score})" else ""}${if (msg.location.isNotEmpty()) " · ${msg.location}" else ""}")
+                    is ChatMessage.Evaluation -> JSONObject().put("type", "eval")
+                        .put("text", "${msg.company} — ${msg.role}: ${msg.score}\n${msg.summary.take(200)}")
+                    is ChatMessage.ScanActions -> {
+                        val parts = mutableListOf<String>()
+                        if (msg.expandLocationLabel.isNotEmpty()) parts.add(msg.expandLocationLabel)
+                        if (msg.tryKeywordsLabel.isNotEmpty()) parts.add(msg.tryKeywordsLabel)
+                        if (msg.deepScanLabel.isNotEmpty()) parts.add(msg.deepScanLabel)
+                        JSONObject().put("type", "scan_actions").put("text", parts.joinToString(" | "))
+                    }
+                    is ChatMessage.ScanResultsCard -> JSONObject().put("type", "scan_results")
+                        .put("text", "${msg.summary} (${msg.results.size} shown in app)")
+                    is ChatMessage.EmailDraft -> JSONObject().put("type", "email_draft")
+                        .put("text", "Draft for ${msg.company} — ${msg.role}")
+                    is ChatMessage.ReplyDraft -> JSONObject().put("type", "reply_draft")
+                        .put("text", "Reply to ${msg.to}: ${msg.subject}")
+                    is ChatMessage.ActivityLog -> JSONObject().put("type", "activity")
+                        .put("text", msg.title)
+                    is ChatMessage.ProcessingCard -> null // ephemeral, skip
+                    is ChatMessage.ToolStatus -> null // ephemeral, skip
+                    is ChatMessage.Typing -> null // ephemeral, skip
+                    else -> null
                 }
+                if (entry != null) arr.put(entry)
             }
-            // Keep last 50 messages max
-            val trimmed = if (arr.length() > 50) {
+            // Keep last 80 messages max
+            val trimmed = if (arr.length() > 80) {
                 val t = JSONArray()
-                for (i in arr.length() - 50 until arr.length()) t.put(arr.get(i))
+                for (i in arr.length() - 80 until arr.length()) t.put(arr.get(i))
                 t
             } else arr
             prefs.saveChatHistory(trimmed.toString(), app.applicationContext)
@@ -1261,6 +2447,19 @@ class ChatViewModel @Inject constructor(
                 if (text.isEmpty()) continue
                 when (type) {
                     "user" -> result.add(ChatMessage.User(text))
+                    "job_card", "eval", "scan_actions", "scan_results", "email_draft", "reply_draft", "activity" -> {
+                        val prefix = when (type) {
+                            "job_card" -> "\uD83D\uDD0D "
+                            "eval" -> "\uD83D\uDCC4 "
+                            "scan_actions" -> "\uD83D\uDD04 "
+                            "scan_results" -> "\uD83D\uDD0D "
+                            "email_draft" -> "\uD83D\uDCE8 "
+                            "reply_draft" -> "\u2709\uFE0F "
+                            "activity" -> "\uD83D\uDCCA "
+                            else -> ""
+                        }
+                        result.add(ChatMessage.System("$prefix$text"))
+                    }
                     "system" -> result.add(ChatMessage.System(text))
                 }
             }
@@ -1268,61 +2467,134 @@ class ChatViewModel @Inject constructor(
         return result
     }
 
-    private suspend fun draftApplication(company: String, role: String) {
+    private fun isSpammed(company: String, entries: List<TrackerEntry>): Boolean {
+        val cLower = company.lowercase()
+        return entries.any { e ->
+            e.company.lowercase() == cLower && e.status in setOf("Applied", "Interview", "Offer", "Responded")
+        }
+    }
+
+    private suspend fun draftApplication(company: String, role: String, url: String = "") {
+        if (processingCardId == null) {
+            val card = ChatMessage.ProcessingCard(steps = emptyList(), currentStep = 0, elapsed = "0s")
+            processingCardId = card.id
+            messages.add(card)
+        }
         try {
-            val response = api.draftEmail(EmailDraftRequest(
-                company = company,
-                role = role,
-                type = "application"
-            ))
-            
-            if (response.success) {
-                messages.add(ChatMessage.EmailDraft(
-                    to = response.draft.to,
-                    company = company,
-                    role = role,
-                    body = response.draft.body,
-                    subject = response.draft.subject,
-                    contactBlock = response.draft.contactBlock,
-                    onSend = {
-                        viewModelScope.launch {
-                            sendEmail(
-                                to = response.draft.to,
-                                subject = response.draft.subject,
-                                body = response.draft.body,
-                                company = company,
-                                role = role
-                            )
-                        }
-                    },
-                    onEdit = {
-                        messages.add(ChatMessage.System("Edit the draft above and send it back."))
+            // Step 1: Check tracker for duplicates (anti-spam)
+            updateProcessingCard(detail = "Checking tracker for $company...")
+            val tracker = withContext(Dispatchers.IO) { api.getTracker() }
+            if (isSpammed(company, tracker.applications)) {
+                removeProcessing(); isProcessing = false
+                messages.add(ChatMessage.System(
+                    "\u26A0\uFE0F Already applied to **$company** \u2014 skipping to avoid duplicate."
+                ))
+                persistMessages(); return
+            }
+
+            // Step 2: Route apply based on the job URL. Portal listings
+            // (LinkedIn/Shine/Internshala/etc.) never expose a contact email, so an
+            // email draft is pointless and can hallucinate details — go straight to
+            // the Playwright auto-fill flow instead.
+            if (url.isNotBlank() && isPortalListingUrl(url)) {
+                messages.add(ChatMessage.System(
+                    "\uD83D\uDCC6 **$company** \u2014 **$role** is a portal listing without a direct contact email.\n" +
+                    "I'll try auto-filling the application form on the job page instead."
+                ))
+                startAutoFill(url, company)
+                return
+            }
+
+            // Step 3: Draft the email
+            updateProcessingCard(detail = "Drafting application for $company — $role...")
+            val response = withContext(Dispatchers.IO) {
+                api.draftEmail(EmailDraftRequest(company = company, role = role, type = "application", jd = url.ifEmpty { null }))
+            }
+            removeProcessing(); isProcessing = false
+
+            if (response.body.isNotEmpty()) {
+                if (response.to.isBlank()) {
+                    val phoneHint = if (response.phone.isNotBlank()) {
+                        "\n\uD83D\uDCDE **Recruiter contact found:** ${response.phone} — call/WhatsApp them directly to apply manually."
+                    } else ""
+                    if (url.isNotBlank()) {
+                        messages.add(ChatMessage.System(
+                            "\u26A0\uFE0F **Draft ready** for **$company** \u2014 **$role**, but no contact email was found.$phoneHint\n" +
+                            "I'll try auto-filling the application form on the job page instead."
+                        ))
+                        startAutoFill(url, company)
+                    } else {
+                        messages.add(ChatMessage.System(
+                            "\u26A0\uFE0F **Draft ready** for **$company** \u2014 **$role**, but no contact email was found.$phoneHint\n" +
+                            "Apply via the portal directly, or paste a URL with the contact details and I'll draft again."
+                        ))
                     }
+                } else {
+                    messages.add(ChatMessage.System(
+                        "\uD83D\uDCE8 **Draft ready** for **$company** \u2014 **$role**"
+                    ))
+                    val draftId = ChatMessage.nextId()
+                    messages.add(ChatMessage.EmailDraft(
+                        id = draftId,
+                        to = response.to, company = company, role = role,
+                        body = response.body, subject = response.subject,
+                        contactBlock = response.contactBlock,
+                        onSend = { viewModelScope.launch { sendEmail(response.to, response.subject, response.body, company, role) } },
+                        onEdit = { openDraftEditor(draftId) }
+                    ))
+                }
+            } else {
+                messages.add(ChatMessage.System(
+                    "\u26A0\uFE0F Could not generate an email draft for **$company**.\n" +
+                    (response.error?.let { "Server error: $it" }
+                        ?: "The draft came back empty. Check the bridge server and try again.")
                 ))
             }
         } catch (e: Exception) {
-            messages.add(ChatMessage.System("Failed to generate draft: ${e.message}"))
+            removeProcessing(); isProcessing = false
+            messages.add(ChatMessage.System(
+                "\u274C Couldn't prepare the application for **$company**: ${describeError(e)}"
+            ))
         }
+        persistMessages()
     }
 
     private suspend fun sendEmail(to: String, subject: String, body: String, company: String, role: String) {
         try {
-            val response = api.sendEmail(EmailSendRequest(
-                to = to,
-                subject = subject,
-                body = body,
-                company = company,
-                role = role
-            ))
-            
+            removeProcessing()
+
+            val response = withContext(Dispatchers.IO) {
+                api.sendEmail(EmailSendRequest(
+                    to = to, subject = subject, body = body, company = company, role = role
+                ))
+            }
+
             if ((response["success"] as? Boolean) == true) {
-                messages.add(ChatMessage.System("Email sent to $to"))
+                try {
+                    withContext(Dispatchers.IO) {
+                        api.addTrackerEntry(TrackerAddRequest(company = company, role = role, notes = "Applied via career-ops app"))
+                    }
+                } catch (_: Exception) {}
+
+                messages.add(ChatMessage.System(
+                    "\u2705 **Step 3/3** — Application sent to **$company**!\n" +
+                    "Role: **$role**\n" +
+                    "I'll watch your inbox for their reply."
+                ))
             } else {
-                messages.add(ChatMessage.System("Failed to send email"))
+                val errorMsg = (response["error"] as? String) ?: "Unknown error"
+                messages.add(ChatMessage.System(
+                    "\u274C Failed to send application to **$company**.\n" +
+                    "Error: $errorMsg\n" +
+                    "You can try again or apply manually."
+                ))
             }
         } catch (e: Exception) {
-            messages.add(ChatMessage.System("Error sending email: ${e.message}"))
+            messages.add(ChatMessage.System(
+                "\u274C Couldn't send the application to **$company**. Please check your connection and try again."
+            ))
         }
+        isProcessing = false
     }
 
     fun resetSession() {
@@ -1336,7 +2608,7 @@ class ChatViewModel @Inject constructor(
                 responseTimes.clear()
                 messages.add(ChatMessage.System("Session reset. How can I help you?"))
             } catch (e: Exception) {
-                messages.add(ChatMessage.System("Error: ${e.message}"))
+                messages.add(ChatMessage.System("Couldn't reset the session. Please try again."))
             }
         }
     }
@@ -1349,8 +2621,9 @@ class ChatViewModel @Inject constructor(
     }
 
     override fun onCleared() {
-        super.onCleared()
+        persistMessages()
         inboxPollJob?.cancel()
+        super.onCleared()
     }
 
     private fun cleanContent(raw: String): String {
@@ -1370,6 +2643,57 @@ class ChatViewModel @Inject constructor(
     private fun truncateIfNeeded(text: String): String {
         if (text.length <= MAX_SYSTEM_TEXT) return text
         return text.take(MAX_SYSTEM_TEXT) + "\n\n... (truncated — ${text.length} chars total)"
+    }
+
+    /** Extract a readable message from any exception, including HTTP error bodies. */
+    private fun describeError(e: Exception): String {
+        val http = e as? HttpException
+        if (http != null) {
+            return try {
+                http.response()?.errorBody()?.string()?.let { body ->
+                    org.json.JSONObject(body).optString("error", body.take(200))
+                } ?: http.message()
+            } catch (_: Exception) {
+                http.message()
+            }
+        }
+        return e.message ?: e.javaClass.simpleName
+    }
+
+    /**
+     * Conservative filter for "recruiter replied to my application" emails.
+     * Requires a strong interview/offer signal OR a reply thread (Re:) that
+     * mentions application/profile/recruiter content, so newsletters and
+     * random posts (Quora digests, marketing) never match. Even when this
+     * matches, nothing is sent until the user approves the draft.
+     */
+    private fun isDigestSender(from: String): Boolean {
+        val f = from.lowercase()
+        val digestDomains = listOf(
+            "quora.com", "indeed.com", "hirist", "linkedin.com", "naukri", "monster.com",
+            "glassdoor", "simplyhired", "jobrapido", "buzzfeed", "medium.com", "substack",
+            "youtube.com", "internshala", "timesjobs", "shine.com", "foundit.com",
+            "freshersworld", "apna.co", "teamlease", "zoho", "newsletter", "digest",
+            "mailer", "notifications", "updates@", "no-reply", "noreply"
+        )
+        return digestDomains.any { f.contains(it) }
+    }
+
+    private fun looksLikeRecruiterReply(email: InboxEmail): Boolean {
+        if (isDigestSender(email.from)) return false
+        val subj = email.subject.lowercase()
+        val body = email.body.lowercase()
+        val isReplyThread = Regex("(^|\\s)re\\s*:\\s*").containsMatchIn(email.subject)
+        val strongInterview =
+            subj.contains(Regex("(?i)(interview|phone screen|next round|screening)")) ||
+            body.contains(Regex("(?i)(interview|phone screen|next round)"))
+        val strongOffer =
+            subj.contains(Regex("(?i)(offer|offer letter)")) ||
+            body.contains(Regex("(?i)(offer letter|pleased to inform|start date|joining date|selected for)"))
+        val replyToApplication = isReplyThread && body.contains(
+            Regex("(?i)(your application|your resume|your cv|recruiter|hiring manager|interview|opportunity|profile|role)")
+        )
+        return strongInterview || strongOffer || replyToApplication
     }
 
     /**

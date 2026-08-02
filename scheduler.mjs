@@ -26,8 +26,13 @@ import { spawnSync } from 'child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const USERS_ROOT = join(__dirname, 'data', 'users');
-const CHECKPOINT_PATH = join(__dirname, '.scheduler-checkpoint.json');
 const ADAPT_LOG_PATH = join(__dirname, 'data', 'adapt-log.md');
+
+function checkpointPathForUser(userDir) {
+  const d = join(userDir, 'data');
+  if (!existsSync(d)) mkdirSync(d, { recursive: true });
+  return join(d, '.scheduler-checkpoint.json');
+}
 
 const POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const STAGGER_DELAY_MS = 30 * 1000;     // 30s between users
@@ -42,19 +47,33 @@ let running = false;
 
 // ── Checkpoint ──────────────────────────────────────────────────────
 
-function loadCheckpoint() {
+function loadCheckpoint(userDir) {
+  const path = checkpointPathForUser(userDir);
   try {
-    if (existsSync(CHECKPOINT_PATH)) {
-      return JSON.parse(readFileSync(CHECKPOINT_PATH, 'utf-8'));
+    if (existsSync(path)) {
+      return JSON.parse(readFileSync(path, 'utf-8'));
     }
   } catch { /* ignore corrupt checkpoint */ }
   return {};
 }
 
-function saveCheckpoint(cp) {
+function saveCheckpoint(userDir, cp) {
+  const path = checkpointPathForUser(userDir);
   try {
-    writeFileSync(CHECKPOINT_PATH, JSON.stringify(cp, null, 2), 'utf-8');
+    writeFileSync(path, JSON.stringify(cp, null, 2), 'utf-8');
   } catch { /* non-fatal */ }
+}
+
+function resetDailyFlags(cp, today) {
+  cp._date = today;
+  cp.scanDone = false;
+  cp.triageDone = false;
+  cp.evaluateDone = false;
+  cp.followupDone = false;
+  cp.adaptDone = false;
+  cp.dailyApps = cp.dailyApps || {};
+  cp.dailyApps[today] = 0;
+  cp.repliesDrafted = 0;
 }
 
 function todayKey() {
@@ -285,22 +304,8 @@ function tick() {
   running = true;
 
   try {
-    const cp = loadCheckpoint();
     const today = todayKey();
     const hour = hourNow();
-
-    // Reset daily flags at midnight
-    if (cp._date !== today) {
-      cp._date = today;
-      cp.scanDone = false;
-      cp.triageDone = false;
-      cp.evaluateDone = false;
-      cp.followupDone = false;
-      cp.adaptDone = false;
-      cp.dailyApps = cp.dailyApps || {};
-      cp.dailyApps[today] = 0;
-      cp.repliesDrafted = 0;
-    }
 
     const userDirs = listUserDirs();
     if (userDirs.length === 0) {
@@ -309,67 +314,81 @@ function tick() {
     }
 
     // Task 1: Daily scan at 6 AM
-    if (hour === SCAN_HOUR && !cp.scanDone) {
+    if (hour === SCAN_HOUR) {
       console.log(`[scheduler] Running daily scan for ${userDirs.length} users...`);
       for (let i = 0; i < userDirs.length; i++) {
-        if (i > 0) {
+        const dir = userDirs[i];
+        const cp = loadCheckpoint(dir);
+        if (cp._date !== today) resetDailyFlags(cp, today);
+        if (cp.scanDone) { console.log(`[scheduler] Scan already done for ${dir} — skipping`); continue; }
+        runScan(dir);
+        cp.scanDone = true;
+        cp.lastScan = new Date().toISOString();
+        saveCheckpoint(dir, cp);
+        if (i < userDirs.length - 1) {
           const wait = STAGGER_DELAY_MS;
-          console.log(`[scheduler] Waiting ${wait / 1000}s before next user...`);
           const start = Date.now();
           while (Date.now() - start < wait) { /* busy wait */ }
         }
-        runScan(userDirs[i]);
       }
-      cp.scanDone = true;
-      cp.lastScan = new Date().toISOString();
-      saveCheckpoint(cp);
     }
 
     // Task 2: Inbox triage at 6 AM
-    if (hour === TRIAGE_HOUR && !cp.triageDone) {
+    if (hour === TRIAGE_HOUR) {
       console.log(`[scheduler] Running inbox triage for ${userDirs.length} users...`);
       for (const dir of userDirs) {
+        const cp = loadCheckpoint(dir);
+        if (cp._date !== today) resetDailyFlags(cp, today);
+        if (cp.triageDone) continue;
         runTriage(dir);
+        cp.triageDone = true;
+        cp.lastTriage = new Date().toISOString();
+        saveCheckpoint(dir, cp);
       }
-      cp.triageDone = true;
-      cp.lastTriage = new Date().toISOString();
-      saveCheckpoint(cp);
     }
 
     // Task 3: Auto-evaluate at 6 AM (after scan)
-    if (hour === EVALUATE_HOUR && !cp.evaluateDone && cp.scanDone) {
+    if (hour === EVALUATE_HOUR) {
       console.log(`[scheduler] Running auto-evaluate for ${userDirs.length} users...`);
       for (const dir of userDirs) {
+        const cp = loadCheckpoint(dir);
+        if (cp._date !== today) resetDailyFlags(cp, today);
+        if (cp.evaluateDone) continue;
+        if (!cp.scanDone) { console.log(`[scheduler] Scan not done for ${dir} — skipping eval`); continue; }
         runAutoEvaluate(dir);
+        cp.evaluateDone = true;
+        cp.lastEvaluate = new Date().toISOString();
+        saveCheckpoint(dir, cp);
       }
-      cp.evaluateDone = true;
-      cp.lastEvaluate = new Date().toISOString();
-      saveCheckpoint(cp);
     }
 
     // Task 4: Follow-up cadence at 8 AM
-    if (hour === FOLLOWUP_HOUR && !cp.followupDone) {
+    if (hour === FOLLOWUP_HOUR) {
       console.log(`[scheduler] Running followup-cadence for ${userDirs.length} users...`);
       for (const dir of userDirs) {
+        const cp = loadCheckpoint(dir);
+        if (cp._date !== today) resetDailyFlags(cp, today);
+        if (cp.followupDone) continue;
         runFollowupCadence(dir);
+        cp.followupDone = true;
+        cp.lastFollowup = new Date().toISOString();
+        saveCheckpoint(dir, cp);
       }
-      cp.followupDone = true;
-      cp.lastFollowup = new Date().toISOString();
-      saveCheckpoint(cp);
     }
 
     // Task 5: Daily adaptation at 8 PM
-    if (hour === ADAPT_HOUR && !cp.adaptDone) {
+    if (hour === ADAPT_HOUR) {
       console.log(`[scheduler] Running daily adaptation for ${userDirs.length} users...`);
       for (const dir of userDirs) {
+        const cp = loadCheckpoint(dir);
+        if (cp._date !== today) resetDailyFlags(cp, today);
+        if (cp.adaptDone) continue;
         runDailyAdapt(dir);
+        cp.adaptDone = true;
+        cp.lastAdapt = new Date().toISOString();
+        saveCheckpoint(dir, cp);
       }
-      cp.adaptDone = true;
-      cp.lastAdapt = new Date().toISOString();
-      saveCheckpoint(cp);
     }
-
-    saveCheckpoint(cp);
   } catch (e) {
     console.error(`[scheduler] Tick error: ${e.message}`);
   } finally {

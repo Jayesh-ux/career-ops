@@ -34,28 +34,34 @@ fun ConfirmStartScreen(
 
     LaunchedEffect(Unit) {
         scope.launch {
+            var profileComplete = false
             try {
-                // Verify resume exists
-                val files = api.getUserFiles(email)
-                hasResume = files.files.any { it.path.contains("cv.md", ignoreCase = true) }
-
-                // Verify profile is complete
                 val profile = api.getProfile()
-                hasProfile = profile.name.isNotEmpty() &&
+                profileComplete = profile.name.isNotEmpty() &&
                             profile.targetRoles.isNotEmpty() &&
                             profile.location.isNotEmpty()
-
+                hasProfile = profileComplete
+            } catch (e: Exception) {
+                hasProfile = false
+            }
+            // Resume is considered uploaded if profile exists (setupUser creates a skeleton cv.md)
+            try {
+                val files = api.getUserFiles(email)
+                hasResume = profileComplete || files.files.any { it.path.contains("cv.md", ignoreCase = true) }
+            } catch (e: Exception) {
+                hasResume = profileComplete
+            }
+            try {
                 val doctor = api.doctor()
                 doctorResult = mapOf(
                     "onboardingNeeded" to doctor.onboardingNeeded,
                     "missing" to doctor.missing,
                     "warnings" to doctor.warnings
                 )
-                isChecking = false
             } catch (e: Exception) {
-                error = "Health check failed: ${e.message}"
-                isChecking = false
+                // doctor is non-essential
             }
+            isChecking = false
         }
     }
 
