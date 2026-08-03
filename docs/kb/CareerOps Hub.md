@@ -26,9 +26,11 @@ brain (prompt modes) and one data contract (files over DB):
 ```mermaid
 graph TD
   App[Android App] -->|HTTP| Bridge[Bridge Server]
-  Bridge -->|spawn| LS[login-session.mjs]
+  Wv[App WebView login] -->|auth code + cookies| Bridge
+  Bridge -->|seed| GC[google-cookies.json]
   Bridge -->|spawn| AJ[apply-job.mjs]
-  LS -->|persistent profile| PW[.pwprofile]
+  Bridge -->|spawn| LS[login-session.mjs fallback]
+  GC -->|seedGoogleCookies| PW[.pwprofile]
   AJ -->|reuses session| PW
   Bridge -->|IMAP| IMAP[Email]
   Bridge -->|read| Tracker[data/applications.md]

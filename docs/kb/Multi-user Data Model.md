@@ -15,6 +15,7 @@ users without cross-contamination.
 ```
 data/users/<email>/
   .pwprofile/        Playwright persistent browser profile + cookie DB
+  google-cookies.json  seeded WebView Google session (from /login/session/seed)
   data/              cv.md, tracker data
   reports/           evaluation reports
   config/            profile.yml
@@ -30,10 +31,11 @@ header; scripts receive `--user-dir`.
 
 ## Why it matters for login
 
-The portal session ([[Portal Session]]) is saved inside
-`data/users/<email>/.pwprofile/` — so "one-time login" is **per user**. User A's
-Google session never leaks into user B's auto-fill. `GET /portal/session/status`
-reads *that user's* cookie DB.
+The portal session ([[Portal Session]]) lives in **two per-user places**: the
+seeded `google-cookies.json` (captured from the app's WebView login) and the
+`.pwprofile/` cookie DB it gets injected into. So "one-time login" is **per
+user** — User A's Google session never leaks into user B's auto-fill. `GET
+/portal/session/status` reads *that user's* seed file + cookie DB.
 
 ## Related files
 

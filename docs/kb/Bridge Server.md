@@ -14,14 +14,17 @@ header.
 ## Responsibilities
 
 - Expose REST endpoints: `/health`, `/profile`, `/tracker`, `/email/*`,
-  `/login/session/*`, `/portal/session/status`, `/apply/open|fill`, `/cv`,
-  `/resume/upload`, `/scan`, `/auto-pipeline`.
+  `/login/session/*`, `/login/session/seed`, `/portal/session/status`,
+  `/apply/open|fill`, `/cv`, `/resume/upload`, `/scan`, `/auto-pipeline`.
 - Spawn the Node automation scripts (`apply-job.mjs`, `login-session.mjs`,
   `scan.mjs`, etc.) as child processes, passing `--user-dir` for the
   requesting user.
 - Own Google OAuth tokens for **IMAP email** (`getUserOAuth`/`setUserOAuth`).
-- Read the **persisted Playwright cookie DB** for portal session status
-  (`GET /portal/session/status`) — no browser launch needed.
+- Own the **seeded portal session**: `POST /login/session/seed` stores the
+  WebView session cookies per-user at `<userDir>/google-cookies.json`, which
+  `seed-cookies.mjs` injects into every Playwright spawn.
+- Read the **seeded cookie file + persisted Playwright cookie DB** for portal
+  session status (`GET /portal/session/status`) — no browser launch needed.
 - Serve the user session for end-user agent chats via the `opencode serve`
   instance started by [[Start Bridge]].
 
@@ -39,6 +42,7 @@ header.
 ## Related files
 
 - `bridge-server.mjs`
+- `seed-cookies.mjs` (`seedGoogleCookies`, `loadGoogleCookies`)
 - `start-bridge.mjs` ([[Start Bridge]])
 - `.bridge.env` (runtime env)
 

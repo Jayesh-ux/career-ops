@@ -15,11 +15,12 @@ renders results; almost no logic lives on-device.
 The whole app is one `NavHost` (`Navigation.kt`) keyed off the
 [[Onboarding Flow]]:
 
-- `ONBOARDING_GOOGLE` → Google sign-in (Gmail OAuth)
+- `ONBOARDING_GOOGLE` → Google sign-in (**one** WebView login via
+  `GoogleOAuthActivity`; mints the IMAP token + captures portal cookies)
 - `ONBOARDING_RESUME` → upload resume
 - `ONBOARDING_PROFILE` → profile form
 - `ONBOARDING_PORTAL` → "Connect your job portals" ([[Portal Session]])
-- `ONBOARDING_CONFIRM` → done
+- `ONBOARDING_CONFIRM` → done (gated on the portal session)
 - `CHAT` / `DASHBOARD` / `APPLICATIONS` / `SETTINGS` → post-onboarding
 - `PORTAL_LOGIN` → the same portal login screen reachable from Settings
 
@@ -27,14 +28,22 @@ The whole app is one `NavHost` (`Navigation.kt`) keyed off the
 
 For existing users (name already on the bridge profile), onboarding is skipped.
 `nextRouteAfterAuth` decides where a signed-in user lands: straight to `CHAT`,
-**or** through the skipable portal step when `GET /portal/session/status`
-reports `googleSession == false`. The check **fails open** — if the bridge is
-down it goes to `CHAT` rather than blocking.
+**or** through the (non-skipable) portal step when `GET /portal/session/status`
+reports `googleSession == false`. The check **fails closed** — if the bridge is
+down it routes to `ONBOARDING_PORTAL` rather than straight to Chat.
+
+`MainActivity.resolveStartDestination()` repeats the portal-session check on
+every cold start (splash + retry while it resolves) and cache-busts the saved
+start destination, so reopening from Recents never silently skips an un-resolved
+portal dependency.
 
 ## Related files
 
 - `career-ops-app/app/src/main/java/com/careerops/app/ui/navigation/Navigation.kt`
+- `career-ops-app/app/src/main/java/com/careerops/app/MainActivity.kt`
+- `career-ops-app/app/src/main/java/com/careerops/app/GoogleOAuthActivity.kt`
 - `career-ops-app/app/src/main/java/com/careerops/app/ui/screens/settings/PortalLoginScreen.kt`
+- `career-ops-app/app/src/main/java/com/careerops/app/ui/onboarding/GoogleSignInScreen.kt`
 - `career-ops-app/app/src/main/java/com/careerops/app/data/remote/CareerOpsApi.kt`
 - Build → `./gradlew :app:assembleDebug` → deploy to `/sdcard/Download`
 

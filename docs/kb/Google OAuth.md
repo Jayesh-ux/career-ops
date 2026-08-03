@@ -12,7 +12,26 @@ credentials**, and the architecture must respect the split:
 | Kind | Purpose | Lives where | How obtained |
 |------|---------|-------------|--------------|
 | OAuth **API token** | Gmail/IMAP access | bridge user store (`getUserOAuth`) | Android Google sign-in consent |
-| **Browser session** (cookies) | Web logins on portals | Playwright `.pwprofile` cookie DB | one manual Google sign-in in a browser |
+| **Browser session** (cookies) | Web logins on portals | Playwright `.pwprofile` cookie DB | captured from the app's WebView login, seeded via `seed-cookies.mjs` |
+
+## One login for both (current path)
+
+The Android app runs a **WebView** (in `GoogleOAuthActivity`) to do the Google
+sign-in. That single interaction mints **both** credential families:
+
+1. `GoogleOAuthActivity` intercepts the redirect to `https://career-ops.app`,
+   captures the OAuth `code`, and — after ~1 s — pulls the Google **session
+   cookies** straight out of `CookieManager` (`SID`, `HSID`, `SAPISID`,
+   `__Secure-1PSID`, `__Host-GAPS`, `NID`).
+2. The auth code goes to the bridge → `getUserOAuth` → Gmail/IMAP
+   ([[IMAP Email]]).
+3. The cookies go to `POST /login/session/seed` → stored per-user as
+   `google-cookies.json` ([[Multi-user Data Model]]).
+4. Every Playwright spawn (`login-session.mjs`, `apply-job.mjs`) calls
+   `seedGoogleCookies(context, userDir)` to inject those cookies into the
+   persistent profile before any page loads.
+
+So one WebView sign-in produces both the API token **and** the browser session.
 
 ## The rule
 
@@ -22,15 +41,13 @@ requires a real user interaction (password, 2FA, consent). There is no way to
 convert the IMAP grant into browser cookies. This is a Google platform
 constraint, not an implementation detail.
 
-## What the design does instead
+## Fallback: manual browser login
 
-The closest Google allows:
-
-1. Gmail/IMAP → OAuth token from onboarding sign-in ([[IMAP Email]]).
-2. Portals → **one-time** manual Google sign-in in the persistent browser
-   profile, where `login-session.mjs` **auto-fills the email and auto-approves
-   consent**, leaving only the password to type. Session cookies are saved once
-   and reused by every portal auto-fill (see [[Portal Session]]).
+The `login-session.mjs` interactive path is still there for troubleshooting and
+power users (the "Advanced / in-app browser" toggle in `PortalLoginScreen.kt`).
+It launches the persistent profile, serves a live screenshot/tap/type surface,
+and `autoDrive()` **pre-fills the email and auto-approves consent**, leaving
+only the password/2FA to type. This is the *fallback*, not the primary path.
 
 ## False-success trap
 
@@ -42,9 +59,11 @@ form. See [[Auto-fill Pipeline]].
 
 ## Related files
 
-- `login-session.mjs` (`autoDrive()`)
+- `career-ops-app/.../GoogleOAuthActivity.kt` (cookie capture after OAuth)
+- `seed-cookies.mjs` (`seedGoogleCookies`, `stealthInitScript`)
+- `login-session.mjs` (`autoDrive()` fallback)
 - `apply-job.mjs` (`isGoogleAuthPage()`)
-- `bridge-server.mjs` (`getUserOAuth` / `setUserOAuth`)
+- `bridge-server.mjs` (`getUserOAuth` / `setUserOAuth`, `/login/session/seed`)
 
 ## Links
 
