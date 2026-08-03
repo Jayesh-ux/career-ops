@@ -28,6 +28,7 @@ import com.careerops.app.ui.screens.settings.PortalLoginScreen
 import com.careerops.app.ui.screens.settings.SettingsScreen
 import com.careerops.app.util.UserPrefs
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private const val TAG = "CareerOpsNav"
@@ -73,9 +74,16 @@ private suspend fun hasOnboardedProfile(api: CareerOpsApi, userPrefs: UserPrefs)
  */
 private suspend fun nextRouteAfterAuth(api: CareerOpsApi, userPrefs: UserPrefs): String {
     if (!hasOnboardedProfile(api, userPrefs)) return Routes.ONBOARDING_RESUME
+    // The WebView cookie seed is fire-and-forget; give it a moment to land so
+    // the user isn't asked to sign in again right after signing in.
     val googleSessionReady = try {
-        val st = api.getPortalSessionStatus()
-        (st["googleSession"] as? Boolean) == true
+        var ready = false
+        repeat(5) {
+            val st = api.getPortalSessionStatus()
+            if ((st["googleSession"] as? Boolean) == true) { ready = true; return@repeat }
+            delay(600)
+        }
+        ready
     } catch (_: Exception) {
         false // bridge unreachable — route through portal step, never straight to Chat
     }
