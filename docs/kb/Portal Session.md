@@ -25,7 +25,11 @@ cookies are saved and reused by every future portal auto-fill.
    without it. `PortalLoginScreen` exchanges **its own fresh OAuth code**
    (every WebView launch mints one) to resolve `userPrefs.userEmail` before
    seeding, so the portal step also works when cold-started / re-logging in
-   without a prior Gmail sign-in in the session.
+   without a prior Gmail sign-in in the session. The captured cookies are sent
+   **inside the exchange request** (`cookies` field) and persisted by the
+   bridge on the same code path that stores the OAuth creds — the separate seed
+   POST is only a fallback, since a standalone app-side seed call was observed
+   failing to reach the bridge while the exchange reliably did.
 4. Every later Playwright spawn (`login-session.mjs`, `apply-job.mjs`) calls
    `seedGoogleCookies(context, userDir)` to inject those cookies into the
    persistent profile at `data/users/<email>/.pwprofile/` before loading any

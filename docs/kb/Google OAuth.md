@@ -31,9 +31,12 @@ sign-in. That single interaction mints **both** credential families:
    result (`google_cookies_count`, `google_cookies_names`) so the UI can show
    exactly what the browser minted (see [[Portal Session]] diagnostics).
 2. The auth code goes to the bridge → `getUserOAuth` → Gmail/IMAP
-   ([[IMAP Email]]).
-3. The cookies go to `POST /login/session/seed` → stored per-user as
-   `google-cookies.json` ([[Multi-user Data Model]]).
+   ([[IMAP Email]]). The **cookies ride on the same exchange request** body
+   (`cookies` field on `OAuthExchangeRequest`); the exchange handler writes
+   them per-user as `google-cookies.json` (`[seed] via-exchange` log). This is
+   the reliable path — a separate client-side seed POST proved flaky on the app
+   side (see [[Portal Session]]), so the exchange is the source of truth.
+3. `POST /login/session/seed` remains as a fallback/belt-and-suspenders store.
 4. Every Playwright spawn (`login-session.mjs`, `apply-job.mjs`) calls
    `seedGoogleCookies(context, userDir)` to inject those cookies into the
    persistent profile before any page loads.

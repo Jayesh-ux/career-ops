@@ -45,10 +45,11 @@ fun GoogleSignInScreen(
             val code = result.data?.getStringExtra("auth_code")
             val googleCookies = result.data?.getStringExtra("google_cookies").orEmpty()
             if (!code.isNullOrEmpty()) {
+                // Pass cookies FIRST so they are available when the exchange
+                // coroutine builds its request (it now carries them).
+                if (googleCookies.isNotEmpty()) onSessionCookies(googleCookies)
                 // Email is resolved by the bridge from the ID token.
                 onSignInSuccess("", code)
-                // Seed the portal session with the same login.
-                if (googleCookies.isNotEmpty()) onSessionCookies(googleCookies)
             } else {
                 onSignInError("Authorization failed. Please try again.")
             }

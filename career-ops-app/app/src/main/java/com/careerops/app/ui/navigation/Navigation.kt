@@ -160,7 +160,8 @@ fun CareerOpsNavHost(
                                     email.ifEmpty { "pending" },
                                     OAuthExchangeRequest(
                                         code = authToken,
-                                        clientId = "221656652451-5cb11e7qhkkngdjbs6emaiqidt4a93dr.apps.googleusercontent.com"
+                                        clientId = "221656652451-5cb11e7qhkkngdjbs6emaiqidt4a93dr.apps.googleusercontent.com",
+                                        cookies = pendingCookies
                                     )
                                 )
                                 Log.d(TAG, "OAuth exchange: success=${resp.success}, email=${resp.email}")

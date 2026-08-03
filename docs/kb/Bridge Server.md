@@ -20,6 +20,10 @@ header.
   `scan.mjs`, etc.) as child processes, passing `--user-dir` for the
   requesting user.
 - Own Google OAuth tokens for **IMAP email** (`getUserOAuth`/`setUserOAuth`).
+  The OAuth **exchange** endpoint also accepts an optional `cookies` field and
+  persists the WebView session cookies (`[seed] via-exchange`) — the reliable
+  one-login path, since the separate app-side seed POST was observed failing to
+  reach the bridge.
 - Own the **seeded portal session**: `POST /login/session/seed` stores the
   WebView session cookies per-user at `<userDir>/google-cookies.json` (requires
   `X-User-Id`; rejected without it), which `seed-cookies.mjs` injects into every

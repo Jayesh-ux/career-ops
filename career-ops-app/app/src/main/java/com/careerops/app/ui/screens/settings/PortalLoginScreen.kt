@@ -199,12 +199,14 @@ fun PortalLoginScreen(
                 // Every WebView launch mints a FRESH auth code. Exchange it so
                 // userEmail resolves and the seed POST carries X-User-Id —
                 // without the header the bridge rejects the seed silently and
-                // the session can never be confirmed.
+                // the session can never be confirmed. The cookies ride on the
+                // exchange itself so they land even if the separate seed POST
+                // is flaky on the app side.
                 if (code.isNotEmpty()) {
                     try {
                         val resp = api.exchangeOAuth(
                             userPrefs.userEmail.ifEmpty { "pending" },
-                            OAuthExchangeRequest(code = code, clientId = WEB_CLIENT_ID)
+                            OAuthExchangeRequest(code = code, clientId = WEB_CLIENT_ID, cookies = cookies)
                         )
                         if (resp.success && resp.email.isNotEmpty()) {
                             userPrefs.userEmail = resp.email

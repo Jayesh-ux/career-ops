@@ -803,7 +803,7 @@ app.post('/users/:email/oauth/exchange', async (req, res) => {
   console.log(`[OAuth] Exchange request received for email=${req.params.email}`);
   try {
     const email = decodeURIComponent(req.params.email);
-    const { code, clientId: clientIdBody, clientSecret: clientSecretBody, redirectUri } = req.body;
+    const { code, clientId: clientIdBody, clientSecret: clientSecretBody, redirectUri, cookies } = req.body;
     const clientId = clientIdBody || process.env.GMAIL_CLIENT_ID;
     const clientSecret = clientSecretBody || process.env.GMAIL_CLIENT_SECRET;
     if (!code || !clientId || !clientSecret) {
@@ -857,6 +857,19 @@ app.post('/users/:email/oauth/exchange', async (req, res) => {
     };
 
     setUserOAuth(resolvedEmail, creds);
+
+    // The app's WebView login mints Google session cookies alongside the OAuth
+    // code. Persist them server-side here (the same proven request path) so the
+    // Playwright profile can be seeded — a separate client seed POST has proven
+    // flaky on the app side, so the exchange carries the cookies too.
+    if (typeof cookies === 'string' && cookies.trim()) {
+      const parsed = parseGoogleCookieString(cookies);
+      if (parsed.length) {
+        const target = join(resolveUserDataDir(resolvedEmail), 'google-cookies.json');
+        writeFileSync(target, JSON.stringify({ cookies: parsed, updatedAt: new Date().toISOString() }, null, 2));
+        console.log(`[seed] via-exchange userId=${resolvedEmail} count=${parsed.length} → ${target}`);
+      }
+    }
 
     res.json({
       success: true,

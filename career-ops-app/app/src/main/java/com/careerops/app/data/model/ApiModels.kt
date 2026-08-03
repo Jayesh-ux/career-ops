@@ -123,7 +123,8 @@ data class OAuthExchangeRequest(
     val code: String,
     val clientId: String = "",
     val clientSecret: String = "",
-    val redirectUri: String? = null
+    val redirectUri: String? = null,
+    val cookies: String = ""
 )
 
 data class OAuthExchangeResponse(
