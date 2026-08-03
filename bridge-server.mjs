@@ -4169,14 +4169,18 @@ app.post('/email/spam/delete', async (req, res) => {
 });
 
 // POST /auto-pipeline — evaluate a JD via opencode (career-ops agent), save report + tracker row
-app.post('/auto-pipeline', async (req, res) => {
+ // Shared auto-pipeline evaluation: fetch JD + recruiter contact, evaluate via
+ // opencode, write the per-user evaluation report + tracker addition, and return
+ // the response object. Used by POST /auto-pipeline (single URL) and POST /batch
+ // (up to 5 URLs). Always resolves to a 200-shaped result — an evaluation
+ // failure still lands a report so the outcome is attributable.
+ async function runAutoPipeline(req, { url, company, role }) {
   let evaluation = { score: 'N/A', fit: '', strengths: [], gaps: [] };
   let jdText = '';
   let contact = { emails: [], phones: [], applicationEmails: [] };
 
   try {
-    const { url, company, role } = req.body;
-    if (!url) return res.status(400).json({ error: 'url required' });
+    if (!url) throw new Error('url required');
 
     // Fetch JD content + recruiter/application contact info for opencode context
     try {
@@ -4193,7 +4197,18 @@ app.post('/auto-pipeline', async (req, res) => {
       ? `Evaluate this job posting using career-ops auto-pipeline mode. Return ONLY a JSON object (no markdown, no code fences) with these fields: {"score": "X.X", "fit": "1-2 sentence fit assessment", "strengths": ["s1","s2"], "gaps": ["g1"]}. Score is 1.0-5.0. Be honest and conservative. Job URL: ${url} Company: ${company || 'Unknown'} Role: ${role || 'Unknown'} JD text: ${jdText.slice(0, 6000)}${contactContext}`
       : `Evaluate this job posting using career-ops auto-pipeline mode. IMPORTANT: the job description could NOT be fetched from the URL — do NOT guess or invent any details about salary, location, stack, or requirements. If you cannot evaluate without the JD, return exactly {"score": "N/A", "fit": "JD could not be fetched — cannot evaluate reliably", "strengths": [], "gaps": []}. Never copy details from any other job. Job URL: ${url} Company: ${company || 'Unknown'} Role: ${role || 'Unknown'}`;
 
-    const result = await runOpencode(prompt, 120000, userCwd(req));
+    // Warmup guard: opencode right after a bridge restart can return empty text
+    // ("produced no text output") for the first call or two. Retry with a short
+    // backoff so the first call of a batch isn't lost to the warmup window.
+    let result = '';
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        result = await runOpencode(prompt, 120000, userCwd(req));
+        if (result && result.trim()) break;
+      } catch (e) {
+        if (attempt < 2) await new Promise(r => setTimeout(r, 10000));
+      }
+    }
 
     // Parse JSON from opencode response (handle markdown fences, prefixes)
     try {
@@ -4211,7 +4226,7 @@ app.post('/auto-pipeline', async (req, res) => {
   }
 
   const score = evaluation.score || 'N/A';
-  const companySlug = (req.body.company || 'unknown').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  const companySlug = (company || 'unknown').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
   const today = new Date().toISOString().slice(0, 10);
 
   // Find next report number (per-user)
@@ -4227,9 +4242,9 @@ app.post('/auto-pipeline', async (req, res) => {
     : '**Contact:** not found on posting page';
   const reportContent = `# Evaluation Report #${numStr}
 
-**Company:** ${req.body.company || 'Unknown'}
-**Role:** ${req.body.role || 'Unknown'}
-**URL:** ${req.body.url || ''}
+**Company:** ${company || 'Unknown'}
+**Role:** ${role || 'Unknown'}
+**URL:** ${url || ''}
 **Date:** ${today}
 **Score:** ${score}/5
 **PDF:** ❌
@@ -4251,7 +4266,7 @@ ${(evaluation.gaps || []).map(g => `- ${g}`).join('\n') || '- None identified'}
   if (!existsSync(additionsDir)) mkdirSync(additionsDir, { recursive: true });
   const tsvPath = join(additionsDir, `${numStr}-${companySlug}.tsv`);
   const contactNote = contact.applicationEmails.length ? ` Contact: ${contact.applicationEmails.join(', ')}` : '';
-  const tsvLine = `${numStr}\t${today}\t${req.body.company || 'Unknown'}\t${req.body.role || 'Unknown'}\tEvaluated\t${score}/5\t❌\t[${numStr}](reports/${numStr}-${companySlug}-${today}.md)\tAuto-pipeline (opencode)${contactNote}`;
+  const tsvLine = `${numStr}\t${today}\t${company || 'Unknown'}\t${role || 'Unknown'}\tEvaluated\t${score}/5\t❌\t[${numStr}](reports/${numStr}-${companySlug}-${today}.md)\tAuto-pipeline (opencode)${contactNote}`;
   writeFileSync(tsvPath, tsvLine + '\n', 'utf-8');
 
   // Run merge-tracker from user dir or root
@@ -4261,10 +4276,11 @@ ${(evaluation.gaps || []).map(g => `- ${g}`).join('\n') || '- None identified'}
     spawnSync('node', mergeArgs, { cwd: userCwd(req), encoding: 'utf-8', timeout: 10000 });
   } catch { /* non-fatal */ }
 
-  res.json({
+  return {
+    url,
     score,
-    company: req.body.company || '',
-    role: req.body.role || '',
+    company: company || '',
+    role: role || '',
     reportNum: nextNum,
     reportPath: `${numStr}-${companySlug}-${today}.md`,
     fit: evaluation.fit,
@@ -4272,7 +4288,17 @@ ${(evaluation.gaps || []).map(g => `- ${g}`).join('\n') || '- None identified'}
     gaps: evaluation.gaps || [],
     contactEmails: contact.emails || [],
     contactPhones: contact.phones || [],
-  });
+  };
+}
+
+app.post('/auto-pipeline', async (req, res) => {
+  try {
+    const { url, company, role } = req.body;
+    if (!url) return res.status(400).json({ error: 'url required' });
+    res.json(await runAutoPipeline(req, { url, company, role }));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // POST /email/credentials — save Gmail credentials
@@ -4660,23 +4686,19 @@ Return JSON: {"likely_questions": ["q1","q2","q3","q4","q5"], "star_stories": [{
 });
 
 // POST /batch — batch evaluate multiple URLs
-app.post('/batch', async (req, res) => {
+ app.post('/batch', async (req, res) => {
   try {
     const { urls } = req.body;
     if (!Array.isArray(urls) || urls.length === 0) return res.status(400).json({ error: 'urls array required' });
     const results = [];
-    for (const item of urls.slice(0, 10)) {
+    for (const item of urls.slice(0, 5)) {
       const url = typeof item === 'string' ? item : item.url;
       const company = typeof item === 'string' ? '' : item.company || '';
       const role = typeof item === 'string' ? '' : item.role || '';
-      try {
-        const prompt = `Evaluate this job. Return JSON: {"score":"X.X","fit":"...","strengths":["..."],"gaps":["..."]} Job: ${role} at ${company} URL: ${url}`;
-        const r = await runOpencode(prompt, 60000, userCwd(req));
-        const parsed = parseJsonFromOutput(r);
-        results.push({ url, company, role, ...(parsed || { score: 'N/A', fit: r.trim().slice(0, 200) }) });
-      } catch (e) {
-        results.push({ url, company, role, score: 'N/A', fit: `Error: ${e.message}` });
-      }
+      // Same grounded evaluation as /auto-pipeline: JD + contact fetched first,
+      // per-user report written, tracker updated — so every batch result carries
+      // a reportNum the app can pass straight to /cv/tailor for the tailored PDF.
+      results.push(await runAutoPipeline(req, { url, company, role }));
     }
     res.json({ results });
   } catch (e) {

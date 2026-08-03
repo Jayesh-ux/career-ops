@@ -16,7 +16,7 @@ header.
 - Expose REST endpoints: `/health`, `/profile`, `/tracker`, `/email/*`,
   `/login/session/*`, `/login/session/seed`, `/portal/session/status`,
   `/apply/open|fill`, `/cv`, `/resume/upload`, `/scan`, `/auto-pipeline`,
-  `/cv/tailor` (2026-08-03 — tailored ATS-optimized CV PDF per role).
+  `/batch`, `/cv/tailor` (2026-08-03 — tailored ATS-optimized CV PDF per role).
 - Spawn the Node automation scripts (`apply-job.mjs`, `login-session.mjs`,
   `scan.mjs`, etc.) as child processes, passing `--user-dir` for the
   requesting user.
@@ -63,6 +63,14 @@ header.
   ("REJECTED BY THE FACT GATE — remove every mention of these"). Paper format is
   `a4` unless the JD text clearly targets US/Canada. All artifacts land in the
   requesting user's tree (`jds/`, `output/`, `data/pdf-index.tsv`).
+- Own the **batch evaluation** path (`POST /batch`, 2026-08-03): caps input at 5
+  URLs and delegates each one to the shared `runAutoPipeline(req, {...})` helper
+  that also backs `/auto-pipeline` — so every batch result is a **grounded**
+  evaluation (JD + contact fetched first, per-user report written, tracker TSV
+  updated, contact fields captured, opencode warmup retried up to 3× with 10s
+  backoff) and returns `url, score, company, role, reportNum, reportPath, fit,
+  strengths, gaps, contactEmails, contactPhones`. The app renders one
+  `BatchReviewCard` per result and passes `reportNum` straight to `/cv/tailor`.
 
 ## Design notes
 

@@ -294,6 +294,7 @@ fun ChatScreen(
                                  is ChatMessage.EmailDraft -> EmailDraftBubble(message)
                                  is ChatMessage.ReplyDraft -> ReplyDraftBubble(message)
                                 is ChatMessage.Evaluation -> EvaluationCard(message)
+                                is ChatMessage.BatchReviewCard -> BatchReviewCard(message)
                                 is ChatMessage.ActivityLog -> ActivityLogCard(message)
                                  is ChatMessage.ProcessingCard -> ProcessingCard(message)
                                  is ChatMessage.ScanActions -> ScanActionsCard(message)
@@ -1183,6 +1184,158 @@ fun EvaluationCard(message: ChatMessage.Evaluation) {
                     lineHeight = 18.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+            }
+        }
+    }
+}
+
+@Composable
+fun BatchReviewCard(message: ChatMessage.BatchReviewCard) {
+    Card(
+        modifier = Modifier.fillMaxWidth(0.94f),
+        shape = RoundedCornerShape(12.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+        )
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Default.Star,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = message.company,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 16.sp
+                    )
+                    if (message.role.isNotEmpty()) {
+                        Text(
+                            text = message.role,
+                            fontSize = 14.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                if (message.reportNum > 0) {
+                    Text(
+                        text = "#${message.reportNum}",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            if (message.score.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.1f),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Score",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = message.score,
+                            fontSize = 20.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
+            }
+
+            if (message.fit.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = message.fit,
+                    fontSize = 13.sp,
+                    lineHeight = 18.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            if (message.strengths.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Text("Strengths", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                message.strengths.take(3).forEach { s ->
+                    Text(
+                        text = "\u2022 $s",
+                        fontSize = 12.sp,
+                        lineHeight = 16.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            if (message.gaps.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Text("Gaps", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                message.gaps.take(3).forEach { g ->
+                    Text(
+                        text = "\u2022 $g",
+                        fontSize = 12.sp,
+                        lineHeight = 16.sp,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+            }
+
+            if (message.contactPhones.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Text(
+                    text = "\uD83D\uDCDE Recruiter: ${message.contactPhones.joinToString(", ")}",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            if (message.onTailorCv != null || message.onApply != null || message.onDiscard != null) {
+                Spacer(modifier = Modifier.height(12.dp))
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    message.onTailorCv?.let { onTailor ->
+                        Button(
+                            onClick = onTailor,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Tailor CV", fontSize = 12.sp)
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                    }
+                    message.onApply?.let { onApply ->
+                        Button(
+                            onClick = onApply,
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.primary
+                            )
+                        ) {
+                            Text("Apply", fontSize = 12.sp)
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                    }
+                    message.onDiscard?.let { onDiscard ->
+                        OutlinedButton(
+                            onClick = onDiscard,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Discard", fontSize = 12.sp)
+                        }
+                    }
+                }
             }
         }
     }

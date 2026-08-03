@@ -129,6 +129,22 @@ sealed class ChatMessage {
         val onViewAll: (() -> Unit)? = null
     ) : ChatMessage()
 
+    data class BatchReviewCard(
+        override val id: Long = nextId(),
+        val company: String = "",
+        val role: String = "",
+        val score: String = "",
+        val fit: String = "",
+        val strengths: List<String> = emptyList(),
+        val gaps: List<String> = emptyList(),
+        val reportNum: Int = 0,
+        val url: String = "",
+        val contactPhones: List<String> = emptyList(),
+        val onTailorCv: (() -> Unit)? = null,
+        val onApply: (() -> Unit)? = null,
+        val onDiscard: (() -> Unit)? = null
+    ) : ChatMessage()
+
     companion object {
         private var counter = 0L
         fun nextId(): Long = ++counter
@@ -555,6 +571,11 @@ class ChatViewModel @Inject constructor(
         }
         if ((lower.startsWith("apply ") || lower.startsWith("evaluate ")) && (lower.contains("http") || lower.contains("www"))) {
             activeJob = viewModelScope.launch { handleDirectApply(text) }
+            return
+        }
+        // Batch: "batch <url1> <url2>" or any message carrying 2+ job URLs
+        if (lower.startsWith("batch") || Regex("https?://\\S+").findAll(text).count() >= 2) {
+            activeJob = viewModelScope.launch { handleDirectBatch(text) }
             return
         }
         if (lower.contains("tracker") || lower.contains("show my application")) {
@@ -1141,6 +1162,122 @@ class ChatViewModel @Inject constructor(
             messages.add(ChatMessage.System("Couldn't evaluate that posting. Please check the URL and try again."))
             persistMessages()
         }
+    }
+
+    // ── Batch evaluation: /batch evaluates 2-5 URLs, each grounded with JD +
+    // recruiter contact and a per-user report, so every result carries a reportNum
+    // ready for /cv/tailor. Renders one reviewable BatchReviewCard per job.
+    private suspend fun handleDirectBatch(text: String) {
+        try {
+            val urls = Regex("https?://\\S+")
+                .findAll(text)
+                .map { it.value.trimEnd(',', ';', ')', ']') }
+                .filter { it.startsWith("http") }
+                .distinct()
+                .toList()
+            if (urls.isEmpty()) {
+                removeProcessing(); isProcessing = false
+                messages.add(ChatMessage.System(
+                    "Paste **2 or more job URLs** (or say **'batch'** then the URLs) and I'll evaluate them all in one pass."
+                ))
+                persistMessages(); return
+            }
+            val picked = urls.take(5)
+            val batch = picked.map { u ->
+                val company = extractCompanyFromUrl(u)
+                BatchItem(url = u, company = company.ifEmpty { null }, role = null)
+            }
+            updateProcessingCard(
+                detail = "Evaluating ${batch.size} job${if (batch.size != 1) "s" else ""} — this takes a minute or two per job..."
+            )
+            val response = withContext(Dispatchers.IO) {
+                api.batchEvaluate(BatchRequest(urls = batch))
+            }
+            removeProcessing(); isProcessing = false
+
+            if (response.results.isEmpty()) {
+                messages.add(ChatMessage.System("Batch evaluation returned no results. Check the URLs and try again."))
+                persistMessages(); return
+            }
+            messages.add(ChatMessage.System(
+                "**Batch evaluation:** ${response.results.size} job(s) evaluated. Tap a card to **Tailor CV** or **Apply** (draft only, never auto-sent)."
+            ))
+            for (r in response.results) {
+                val scoreNum = r.score.replace("/5", "").toFloatOrNull() ?: 0f
+                val strong = scoreNum >= 4.0f
+                messages.add(ChatMessage.BatchReviewCard(
+                    company = r.company.orEmpty().ifBlank { "Unknown" },
+                    role = r.role.orEmpty(),
+                    score = if (scoreNum > 0) "${r.score}/5" else r.score,
+                    fit = r.fit,
+                    strengths = r.strengths,
+                    gaps = r.gaps,
+                    reportNum = r.reportNum,
+                    url = r.url,
+                    contactPhones = r.contactPhones,
+                    onTailorCv = { viewModelScope.launch { tailorCv(r) } },
+                    onApply = if (strong) { {
+                        viewModelScope.launch {
+                            isProcessing = true
+                            ensureProcessingCard("Preparing application for ${r.company}...")
+                            draftApplication(r.company.orEmpty(), r.role.orEmpty(), r.url)
+                        }
+                    } } else null,
+                    onDiscard = {
+                        messages.add(ChatMessage.System("Discarded: ${r.company} — ${r.role}"))
+                        persistMessages()
+                    }
+                ))
+            }
+            if (response.results.none { (it.score.replace("/5", "").toFloatOrNull() ?: 0f) >= 4.0f }) {
+                messages.add(ChatMessage.System(
+                    "\u26A0\uFE0F None of these scored 4.0/5 — all below the apply threshold. Review the gaps on each card before applying."
+                ))
+            }
+            persistMessages()
+        } catch (e: Exception) {
+            removeProcessing(); isProcessing = false
+            messages.add(ChatMessage.System("Couldn't run the batch evaluation: ${describeError(e)}"))
+            persistMessages()
+        }
+    }
+
+    // ── One-tap tailored CV: POST /cv/tailor anchored to the batch report. The
+    // bridge runs the fact gate internally (rejects fabricated claims, re-runs),
+    // so the PDF that lands in the user's output/ dir is grounded in cv.md.
+    private suspend fun tailorCv(result: AutoPipelineResponse) {
+        try {
+            isProcessing = true
+            ensureProcessingCard("Tailoring CV for ${result.company}...")
+            updateProcessingCard(
+                detail = "Tailoring CV for ${result.company} — this takes a couple of minutes (fact-checked)..."
+            )
+            val resp = withContext(Dispatchers.IO) {
+                api.tailorCv(TailorCvRequest(
+                    reportNum = result.reportNum.takeIf { it > 0 },
+                    company = result.company,
+                    role = result.role
+                ))
+            }
+            removeProcessing(); isProcessing = false
+            if (resp.success) {
+                messages.add(ChatMessage.System(
+                    "\uD83D\uDCC4 **Tailored CV ready for ${result.company}**${if (result.role.orEmpty().isNotEmpty()) " — ${result.role}" else ""}\n" +
+                    "PDF: ${resp.pdfPath}\n\n" +
+                    "It's ATS-optimized and fact-checked against your cv.md. To send it with an application, say **'apply ${result.company}'** or paste the job URL."
+                ))
+            } else {
+                messages.add(ChatMessage.System(
+                    "\u274C Couldn't tailor the CV for **${result.company}**: ${resp.error ?: "unknown error"}"
+                ))
+            }
+        } catch (e: Exception) {
+            removeProcessing(); isProcessing = false
+            messages.add(ChatMessage.System(
+                "\u274C Couldn't tailor the CV for **${result.company}**: ${describeError(e)}"
+            ))
+        }
+        persistMessages()
     }
 
     // ── Check interviews: detect + list upcoming with reminders ───────────
