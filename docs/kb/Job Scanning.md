@@ -18,10 +18,32 @@ possible, Playwright for auth-gated career pages.
    Playwright with the saved [[Portal Session]] so logged-in pages render
    real openings. Output lands in `data/pipeline.md`.
 
+## Known gaps (recorded 2026-08-03)
+
+- **Scan results were not aligned to the per-user profile.** `POST /scan`,
+  `GET /scan/stream`, and the rubric scoring read the **root**
+  `config/profile.yml` via `readProfile()` instead of the requesting user's
+  profile — so role keywords, location proximity, and scores came from a
+  stale/partial role set. Fixed in `bridge-server.mjs` (2026-08-03): all three
+  scan paths now read `readUserProfileRaw(req)`, so keywords, nearby-location
+  terms, and scoring follow each user's `data/users/<id>/config/profile.yml`.
+  See [[Bridge Server]].
+- **Shared `portals.yml` must not carry per-user filters.** The bridge is
+  multi-user; title/location/salary filters that belong to one user would
+  leak to everyone. Per-user alignment (target roles, cities, salary floor,
+  remote/hybrid flexibility) must live in each user's `profile.yml`, which
+  the bridge scan paths now read. CLI `scan.mjs` still honours only the
+  shared `portals.yml` filters (it has no per-keyword/location/salary flags).
+- **JD-scored output is on the probe path, not in `/scan`.** `/scan`/`/scan/stream`
+  score titles + notes + location proximity; full JD-text scoring (salary
+  parsing, skill gaps) needs the JD scraped via Playwright
+  (`probe-jd.mjs` in the runtime tree) and fed to the [[Evaluation Engine]].
+
 ## Related files
 
 - `scan.mjs`, `providers/`
 - `check-liveness.mjs` (skip dead postings)
+- `probe-jd.mjs` (runtime tree — Playwright JD scrape for full-text scoring)
 
 ## Links
 

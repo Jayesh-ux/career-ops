@@ -24,6 +24,19 @@ header.
   persists the WebView session cookies (`[seed] via-exchange`) — the reliable
   one-login path, since the separate app-side seed POST was observed failing to
   reach the bridge.
+- Own **Gmail send** (`POST /email/send`): per-user OAuth2 (Gmail REST) >
+  legacy OAuth2 > app-password SMTP. The sender is **derived from `X-User-Id`
+  when the body omits `email`** (2026-08-03 fix — the app's `EmailSendRequest`
+  never sends `email`, which used to hard-fail with `email and body are
+  required`), and the **user's CV PDF is attached by default**
+  (`<userDir>/output/generic-cv.pdf`) so application emails always carry the
+  resume.
+- Own the **scan paths** (`POST /scan`, `GET /scan/stream`): keywords,
+  location proximity (`buildNearbyTerms`), and the career-ops rubric scoring
+  (`scoreScanResult`) are all driven by the **per-user** profile via
+  `readUserProfileRaw(req)` (2026-08-03 multi-user fix — they previously read
+  the root profile with `readProfile()`, so results never matched a user's
+  actual roles/locations/salary floor).
 - Own the **seeded portal session**: `POST /login/session/seed` stores the
   WebView session cookies per-user at `<userDir>/google-cookies.json` (requires
   `X-User-Id`; rejected without it), which `seed-cookies.mjs` injects into every
