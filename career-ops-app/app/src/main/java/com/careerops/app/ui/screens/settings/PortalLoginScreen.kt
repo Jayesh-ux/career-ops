@@ -29,7 +29,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.careerops.app.GoogleOAuthActivity
+import com.careerops.app.data.model.OAuthExchangeRequest
 import com.careerops.app.data.remote.CareerOpsApi
+import com.careerops.app.util.UserPrefs
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -52,6 +54,7 @@ fun PortalLoginScreen(
     portalName: String,
     startUrl: String,
     api: CareerOpsApi,
+    userPrefs: UserPrefs,
     onDone: () -> Unit = {},
     onClose: () -> Unit = {},
     inOnboarding: Boolean = false
@@ -188,12 +191,34 @@ fun PortalLoginScreen(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
+            val code = result.data?.getStringExtra("auth_code").orEmpty()
             val cookies = result.data?.getStringExtra("google_cookies").orEmpty()
             val cookieCount = result.data?.getIntExtra("google_cookies_count", 0) ?: 0
             val cookieNames = result.data?.getStringExtra("google_cookies_names").orEmpty()
             scope.launch {
+                // Every WebView launch mints a FRESH auth code. Exchange it so
+                // userEmail resolves and the seed POST carries X-User-Id —
+                // without the header the bridge rejects the seed silently and
+                // the session can never be confirmed.
+                if (code.isNotEmpty()) {
+                    try {
+                        val resp = api.exchangeOAuth(
+                            userPrefs.userEmail.ifEmpty { "pending" },
+                            OAuthExchangeRequest(code = code, clientId = WEB_CLIENT_ID)
+                        )
+                        if (resp.success && resp.email.isNotEmpty()) {
+                            userPrefs.userEmail = resp.email
+                        }
+                    } catch (e: Exception) {
+                        error = "Account link failed: ${e.message}"
+                    }
+                }
                 if (cookies.isNotEmpty()) {
-                    try { api.seedLoginSession(mapOf("cookieString" to cookies)) } catch (_: Exception) {}
+                    try {
+                        api.seedLoginSession(mapOf("cookieString" to cookies))
+                    } catch (e: Exception) {
+                        error = "Cookie save failed: ${e.message}"
+                    }
                 }
                 try {
                     val st = api.getPortalSessionStatus()

@@ -23,7 +23,9 @@ header.
 - Own the **seeded portal session**: `POST /login/session/seed` stores the
   WebView session cookies per-user at `<userDir>/google-cookies.json` (requires
   `X-User-Id`; rejected without it), which `seed-cookies.mjs` injects into every
-  Playwright spawn.
+  Playwright spawn. Every seed request — and every rejection reason — is logged
+  as `[seed]` so a missed session is attributable (missing header vs. no
+  parseable cookies).
 - Read the **seeded cookie file + persisted Playwright cookie DB** for portal
   session status (`GET /portal/session/status`) — no browser launch needed.
 - Serve the user session for end-user agent chats via the `opencode serve`

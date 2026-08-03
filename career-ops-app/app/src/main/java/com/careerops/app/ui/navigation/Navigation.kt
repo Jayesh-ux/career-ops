@@ -233,6 +233,7 @@ fun CareerOpsNavHost(
                 portalName = "Google",
                 startUrl = "https://accounts.google.com/AccountChooser",
                 api = api,
+                userPrefs = userPrefs,
                 inOnboarding = true,
                 onDone = {
                     navController.navigate(next) {
@@ -315,6 +316,7 @@ fun CareerOpsNavHost(
                 portalName = portal,
                 startUrl = url,
                 api = api,
+                userPrefs = userPrefs,
                 onDone = { navController.popBackStack() },
                 onClose = { navController.popBackStack() }
             )

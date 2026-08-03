@@ -6578,15 +6578,19 @@ function parseGoogleCookieString(cookieString) {
 
 app.post('/login/session/seed', (req, res) => {
   try {
+    const body = req.body || {};
+    const raw = body.cookieString || body.cookies || '';
+    const rawLen = typeof raw === 'string' ? raw.length : (Array.isArray(raw) ? raw.length : -1);
+    console.log(`[seed] request userId=${req.userCtx?.userId || 'MISSING'} rawLen=${rawLen}`);
     // Cookies must land in the right user's dir — never fall back to root.
     if (!req.userCtx?.userId || !req.userCtx?.userDir) {
+      console.log(`[seed] REJECTED missing X-User-Id (rawLen=${rawLen})`);
       return res.status(400).json({ success: false, error: 'X-User-Id header required' });
     }
     const userDir = req.userCtx.userDir;
-    const body = req.body || {};
-    const raw = body.cookieString || body.cookies || '';
     const cookies = typeof raw === 'string' ? parseGoogleCookieString(raw) : raw;
     if (!Array.isArray(cookies) || cookies.length === 0) {
+      console.log(`[seed] REJECTED no parseable cookies (userId=${req.userCtx.userId} rawLen=${rawLen})`);
       return res.json({ success: false, error: 'no google cookies provided', count: 0 });
     }
     const target = join(userDir, 'google-cookies.json');
