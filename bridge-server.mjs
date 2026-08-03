@@ -6333,6 +6333,39 @@ app.delete('/portal-creds/:portal', (req, res) => {
   }
 });
 
+// ── Portal session status (persisted, no browser launch) ─────────────
+// Reports whether a Google session has already been captured in the user's
+// Playwright profile by reading the cookie DB directly — no browser needed,
+// so the app can gate the "Connect your job portals" step for existing users.
+app.get('/portal/session/status', (req, res) => {
+  try {
+    const userDir = req.userCtx?.userDir || __dirname;
+    const cookiesDb = join(userDir, '.pwprofile', 'Default', 'Cookies');
+    if (!existsSync(cookiesDb)) {
+      return res.json({ success: true, profileExists: false, googleSession: false, hasGaps: false, cookieCount: 0, signedInNames: [] });
+    }
+    const r = spawnSync('sqlite3', [
+      cookiesDb,
+      "SELECT name FROM cookies WHERE host_key LIKE '%google.com' AND name IN ('SID','HSID','SAPISID','__Secure-1PSID','__Host-GAPS','NID','OTZ');",
+    ], { encoding: 'utf-8', timeout: 10000 });
+    if (r.error || r.status !== 0) {
+      return res.json({ success: false, error: (r.error && r.error.message) || r.stderr || 'cookie db read failed' });
+    }
+    const names = (r.stdout || '').split('\n').map((s) => s.trim()).filter(Boolean);
+    const signedInNames = ['SID', 'HSID', 'SAPISID', '__Secure-1PSID'].filter((n) => names.includes(n));
+    res.json({
+      success: true,
+      profileExists: true,
+      googleSession: signedInNames.length > 0,
+      signedInNames,
+      hasGaps: names.includes('__Host-GAPS'),
+      cookieCount: names.length,
+    });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
 // ── One-time interactive login session (Google OAuth) ────────────────
 // The app renders a live remote view of the persistent browser profile so
 // the user can sign in with Google ONCE. The resulting session cookies are

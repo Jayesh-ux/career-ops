@@ -85,9 +85,19 @@ scan ──► data/pipeline.md ──► evaluate (oferta + cv) ──► repor
 - `updater-migration-tests.mjs` — enforces the system/user boundary and safe cross-version upgrades.
 - CI: `test` + CodeQL are required; CodeRabbit reviews every PR; Renovate keeps deps current.
 
+## Knowledge graph (Graphify/Obsidian)
+
+For a browsable, interconnected view of the same architecture — especially the
+newer bridge/Android/Playwright layers covered here only in passing — open the
+`docs/kb/` Obsidian vault and render it with the Graphify plugin. It maps every
+component, flow, and boundary as linked notes (`[[wikilinks]]`). Start at the
+`CareerOps Hub.md` note. See `docs/kb/README.md` for the graph legend and how to
+open it.
+
 ## Where to start reading
 
 - The boundary → `DATA_CONTRACT.md`
 - The scoring → `modes/_shared.md` + `modes/oferta.md`
 - Adding a job source → an existing module in `providers/` (mirror it)
 - The updater → `update-system.mjs`
+- The runtime stack → `docs/kb/` (Graphify vault) + `start-bridge.mjs`

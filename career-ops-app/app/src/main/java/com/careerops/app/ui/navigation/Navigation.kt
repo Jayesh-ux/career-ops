@@ -62,6 +62,24 @@ private suspend fun hasOnboardedProfile(api: CareerOpsApi, userPrefs: UserPrefs)
     }
 }
 
+/**
+ * Decide where a signed-in user goes next.
+ *
+ * Fresh users continue the onboarding chain (resume → profile → portal).
+ * Existing users with no saved Google portal session are routed through the
+ * skipable portal step until a session is captured; once saved (or if the
+ * status check fails), they go straight to Chat.
+ */
+private suspend fun nextRouteAfterAuth(api: CareerOpsApi, userPrefs: UserPrefs): String {
+    if (!hasOnboardedProfile(api, userPrefs)) return Routes.ONBOARDING_RESUME
+    return try {
+        val st = api.getPortalSessionStatus()
+        if ((st["googleSession"] as? Boolean) == true) Routes.CHAT else Routes.ONBOARDING_PORTAL
+    } catch (_: Exception) {
+        Routes.CHAT // fail-open: never block the user
+    }
+}
+
 @Composable
 fun CareerOpsNavHost(
     userPrefs: UserPrefs,
@@ -99,7 +117,7 @@ fun CareerOpsNavHost(
                                     if (resp.hasGmailAuth) {
                                         // Already has Gmail access — done
                                         scope.launch(Dispatchers.Main) {
-                                            val next = if (hasOnboardedProfile(api, userPrefs)) Routes.CHAT else Routes.ONBOARDING_RESUME
+                                            val next = nextRouteAfterAuth(api, userPrefs)
                                             navController.navigate(next) {
                                                 popUpTo(Routes.ONBOARDING_GOOGLE) { inclusive = true }
                                             }
@@ -128,7 +146,7 @@ fun CareerOpsNavHost(
                                         userPrefs.userEmail = resolvedEmail
                                     }
                                     scope.launch(Dispatchers.Main) {
-                                        val next = if (hasOnboardedProfile(api, userPrefs)) Routes.CHAT else Routes.ONBOARDING_RESUME
+                                        val next = nextRouteAfterAuth(api, userPrefs)
                                         navController.navigate(next) {
                                             popUpTo(Routes.ONBOARDING_GOOGLE) { inclusive = true }
                                         }
@@ -166,26 +184,32 @@ fun CareerOpsNavHost(
                 api = api,
                 userPrefs = userPrefs,
                 onComplete = {
-                    navController.navigate(Routes.ONBOARDING_PORTAL) {
+                    navController.navigate("${Routes.ONBOARDING_PORTAL}?next=${Routes.ONBOARDING_CONFIRM}") {
                         popUpTo(Routes.ONBOARDING_PROFILE) { inclusive = true }
                     }
                 }
             )
         }
 
-        composable(Routes.ONBOARDING_PORTAL) {
+        composable(
+            route = "${Routes.ONBOARDING_PORTAL}?next={next}",
+            arguments = listOf(
+                navArgument("next") { defaultValue = Routes.ONBOARDING_CONFIRM }
+            )
+        ) { entry ->
+            val next = entry.arguments?.getString("next") ?: Routes.ONBOARDING_CONFIRM
             PortalLoginScreen(
                 portalName = "Google",
                 startUrl = "https://accounts.google.com/signin",
                 api = api,
                 inOnboarding = true,
                 onDone = {
-                    navController.navigate(Routes.ONBOARDING_CONFIRM) {
+                    navController.navigate(next) {
                         popUpTo(Routes.ONBOARDING_PORTAL) { inclusive = true }
                     }
                 },
                 onClose = {
-                    navController.navigate(Routes.ONBOARDING_CONFIRM) {
+                    navController.navigate(next) {
                         popUpTo(Routes.ONBOARDING_PORTAL) { inclusive = true }
                     }
                 }
