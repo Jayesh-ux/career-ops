@@ -1,0 +1,141 @@
+_advisory: DO NOT overwrite portals.yml from this file. Applied at execution time per user.
+generated: '2026-08-03'
+summary:
+  audited_applications: 78
+  applied: 67
+  submission_breakdown:
+    email: 31
+    form: 4
+    unknown: 32
+  api_feed_share_of_scans: 69
+successful_portals:
+  - portal: websearch/boards
+    type: websearch/boards
+    jobs_scanned: 0
+    jobs_added: 0
+    applications: 69
+    applied: 61
+    success_rate: 88.4
+    submission_paths:
+      email: 30
+      form: 1
+      unknown: 30
+    avg_score: 3.8
+    pdfs: 8
+    replies: 1
+  - portal: greenhouse
+    type: ats-browser
+    jobs_scanned: 416
+    jobs_added: 0
+    applications: 3
+    applied: 2
+    success_rate: 66.7
+    submission_paths:
+      email: 0
+      form: 2
+      unknown: 0
+    avg_score: 3.9
+    pdfs: 2
+    replies: 0
+  - portal: amazon-api
+    type: api
+    jobs_scanned: 99
+    jobs_added: 99
+    applications: 1
+    applied: 1
+    success_rate: 100
+    submission_paths:
+      email: 1
+      form: 0
+      unknown: 0
+    avg_score: null
+    pdfs: 0
+    replies: 0
+  - portal: amazon
+    type: websearch/boards
+    jobs_scanned: 0
+    jobs_added: 0
+    applications: 1
+    applied: 1
+    success_rate: 100
+    submission_paths:
+      email: 0
+      form: 0
+      unknown: 1
+    avg_score: null
+    pdfs: 0
+    replies: 0
+  - portal: lever
+    type: ats-browser
+    jobs_scanned: 132
+    jobs_added: 0
+    applications: 1
+    applied: 1
+    success_rate: 100
+    submission_paths:
+      email: 0
+      form: 0
+      unknown: 1
+    avg_score: null
+    pdfs: 0
+    replies: 0
+  - portal: internshala
+    type: websearch/boards
+    jobs_scanned: 0
+    jobs_added: 0
+    applications: 1
+    applied: 1
+    success_rate: 100
+    submission_paths:
+      email: 0
+      form: 1
+      unknown: 0
+    avg_score: 4.1
+    pdfs: 1
+    replies: 0
+  - portal: linkedin
+    type: websearch/boards
+    jobs_scanned: 0
+    jobs_added: 0
+    applications: 1
+    applied: 0
+    success_rate: 0
+    submission_paths:
+      email: 0
+      form: 0
+      unknown: 0
+    avg_score: 3.8
+    pdfs: 1
+    replies: 0
+  - portal: workday
+    type: websearch/boards
+    jobs_scanned: 0
+    jobs_added: 0
+    applications: 1
+    applied: 0
+    success_rate: 0
+    submission_paths:
+      email: 0
+      form: 0
+      unknown: 0
+    avg_score: 4.4
+    pdfs: 1
+    replies: 0
+channel_notes:
+  - >-
+    The 78 historic applications were sourced almost entirely from websearch + Indian job boards + direct finds (small
+    companies with direct recruiter emails) — NOT from the ATS API feeds. ATS feeds are the high-VOLUME discovery
+    channel (69% of scans), not the high-CONVERSION apply channel.
+  - >-
+    Direct ATS API feeds (greenhouse-api, ashby-api, lever-api, amazon-api, solidjobs-api, workable-api) found the most
+    new matches with no login wall, but those roles (big-tech/enterprise) mostly scored low or were skipped for this
+    profile. Use them to monitor volume; expect low conversion.
+  - >-
+    ATS browser scans (greenhouse, ashby, lever) are the Playwright fallback for companies without an open API; they hit
+    bot-detection more often, so API feeds should run first.
+  - >-
+    Email was the dominant submission path (31 confirmed email vs 4 form fills): most applied companies listed a direct
+    recruiter/HR email, so capturing it reliably from the posting page is the highest-leverage parser fix.
+  - >-
+    Insights are ADVISORY per user. Shared portals.yml is never overwritten; per-user ranking is applied at execution
+    time from this file.
