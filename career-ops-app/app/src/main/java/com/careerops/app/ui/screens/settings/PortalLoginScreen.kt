@@ -55,6 +55,7 @@ fun PortalLoginScreen(
     var googleSignedIn by remember { mutableStateOf(false) }
     var hasGaps by remember { mutableStateOf(false) }
     var onGoogleAuth by remember { mutableStateOf(false) }
+    var accounts by remember { mutableStateOf<List<String>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
     var saving by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf("") }
@@ -108,6 +109,7 @@ fun PortalLoginScreen(
                     googleSignedIn = (st["googleSignedIn"] as? Boolean) == true
                     hasGaps = (st["hasGaps"] as? Boolean) == true
                     onGoogleAuth = (st["onGoogleAuth"] as? Boolean) == true
+                    accounts = (st["accounts"] as? List<*>)?.mapNotNull { it as? String } ?: emptyList()
                     error = ""
                 } else {
                     error = st["error"] as? String ?: error
@@ -157,12 +159,12 @@ fun PortalLoginScreen(
                     Text(
                         if (inOnboarding)
                             "Almost done — one Google sign-in unlocks every job portal (Internshala, Naukri, Shine, …). " +
-                            "Your email is pre-filled and the consent is auto-approved, so you only type your password. " +
+                            "Choose your account below or on the screen — no password needed for accounts already signed in. " +
                             "You can skip this for now and do it later from Settings → Portal Logins."
                         else
                             "Sign in once with Google here. Your session is saved to this device and " +
                             "reused automatically for every future auto-fill (Internshala, Naukri, Shine, ...). " +
-                            "Tap the screen to interact, type in the field below for passwords.",
+                            "Tap an account below to sign in instantly (like the Gmail account picker), or tap the screen to interact.",
                         fontSize = 13.sp, lineHeight = 18.sp
                     )
                     if (hasGoogle) {
@@ -180,7 +182,10 @@ fun PortalLoginScreen(
                         onGoogleAuth -> {
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                "⚠️ On Google's sign-in page — Google is NOT signed in yet. Tap the email field, type it, continue, type your password, and complete any verification, all the way to the end.",
+                                if (accounts.isNotEmpty())
+                                    "⚠️ Google is NOT signed in yet. Tap the account you want above, then complete any password/verification steps until the status turns green."
+                                else
+                                    "⚠️ On Google's sign-in page — Google is NOT signed in yet. Tap the email field, type it, continue, type your password, and complete any verification, all the way to the end.",
                                 fontSize = 12.sp, color = Color(0xFFB26A00)
                             )
                         }
@@ -202,6 +207,40 @@ fun PortalLoginScreen(
             if (error.isNotBlank()) {
                 Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
                     Text(error, modifier = Modifier.padding(12.dp), color = MaterialTheme.colorScheme.onErrorContainer, fontSize = 13.sp)
+                }
+            }
+
+            // Tap-to-sign-in account chips (Google account chooser)
+            if (accounts.isNotEmpty() && !googleSignedIn) {
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text("Choose an account", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                        accounts.forEach { acc ->
+                            OutlinedButton(
+                                onClick = {
+                                    scope.launch {
+                                        try {
+                                            val r = api.loginSessionAccount(mapOf("email" to acc))
+                                            screenshotB64 = r["screenshot"] as? String ?: screenshotB64
+                                        } catch (_: Exception) {}
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Icon(Icons.Default.Person, null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(acc, maxLines = 1)
+                            }
+                        }
+                        Text(
+                            "Tap an account to sign in — no password needed if its session is still valid. " +
+                            "Accounts not shown here need a one-time email + password login.",
+                            fontSize = 11.sp, lineHeight = 15.sp, color = MaterialTheme.colorScheme.outline
+                        )
+                    }
                 }
             }
 

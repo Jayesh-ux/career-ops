@@ -196,6 +196,9 @@ interface CareerOpsApi {
     @POST("login/session/back")
     suspend fun loginSessionBack(): Map<String, Any>
 
+    @POST("login/session/account")
+    suspend fun loginSessionAccount(@Body body: Map<String, String>): Map<String, Any>
+
     @POST("login/session/finish")
     suspend fun finishLoginSession(): Map<String, Any>
 

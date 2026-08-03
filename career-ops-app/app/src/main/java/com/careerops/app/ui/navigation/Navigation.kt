@@ -200,7 +200,7 @@ fun CareerOpsNavHost(
             val next = entry.arguments?.getString("next") ?: Routes.ONBOARDING_CONFIRM
             PortalLoginScreen(
                 portalName = "Google",
-                startUrl = "https://accounts.google.com/signin",
+                startUrl = "https://accounts.google.com/AccountChooser",
                 api = api,
                 inOnboarding = true,
                 onDone = {
@@ -274,11 +274,11 @@ fun CareerOpsNavHost(
         composable(
             route = "${Routes.PORTAL_LOGIN}?url={url}&portal={portal}",
             arguments = listOf(
-                navArgument("url") { defaultValue = "https://accounts.google.com/signin" },
+                navArgument("url") { defaultValue = "https://accounts.google.com/AccountChooser" },
                 navArgument("portal") { defaultValue = "Google" }
             )
         ) { entry ->
-            val url = entry.arguments?.getString("url") ?: "https://accounts.google.com/signin"
+            val url = entry.arguments?.getString("url") ?: "https://accounts.google.com/AccountChooser"
             val portal = entry.arguments?.getString("portal") ?: "Google"
             PortalLoginScreen(
                 portalName = portal,

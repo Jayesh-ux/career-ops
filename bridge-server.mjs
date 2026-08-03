@@ -6488,6 +6488,19 @@ app.post('/login/session/back', async (req, res) => {
   }
 });
 
+app.post('/login/session/account', async (req, res) => {
+  try {
+    if (!loginSession) return res.json({ success: false, error: 'No active session' });
+    const r = await fetch(`http://127.0.0.1:${loginSession.port}/account`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req.body || {}), signal: AbortSignal.timeout(20000),
+    });
+    res.json({ success: true, ...await r.json() });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
 app.post('/login/session/finish', async (req, res) => {
   try {
     if (!loginSession) return res.json({ success: false, error: 'No active session' });

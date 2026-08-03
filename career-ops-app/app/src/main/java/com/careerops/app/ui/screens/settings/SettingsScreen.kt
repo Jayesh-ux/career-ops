@@ -239,7 +239,7 @@ fun SettingsScreen(
                     Spacer(modifier = Modifier.height(12.dp))
 
                     Button(
-                        onClick = { onStartPortalLogin("Google", "https://accounts.google.com/signin") },
+                        onClick = { onStartPortalLogin("Google", "https://accounts.google.com/AccountChooser") },
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Icon(Icons.Default.Person, null, modifier = Modifier.size(18.dp))
@@ -288,7 +288,7 @@ fun SettingsScreen(
                                 TextButton(onClick = { editingPortal = null }) { Text("Close") }
                             } else {
                                 TextButton(onClick = {
-                                    onStartPortalLogin(p.portal, PORTAL_LOGIN_URLS[p.portal] ?: "https://accounts.google.com/signin")
+                                    onStartPortalLogin(p.portal, PORTAL_LOGIN_URLS[p.portal] ?: "https://accounts.google.com/AccountChooser")
                                 }) { Text("Login") }
                                 TextButton(onClick = {
                                     editingPortal = p.portal

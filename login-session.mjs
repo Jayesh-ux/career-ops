@@ -11,9 +11,10 @@
  *   node login-session.mjs --port <n> --user-dir <dir> [--url <url>]
  *
  * HTTP endpoints:
- *   GET  /state       → { url, title, width, height, screenshot(b64), hasGoogle, formVisible, ready }
+ *   GET  /state       → { url, title, width, height, screenshot(b64), hasGoogle, formVisible, accounts[], ready }
  *   POST /tap         → { x, y }
  *   POST /type        → { text }
+ *   POST /account     → { email }  (tap a specific account in the chooser)
  *   POST /navigate    → { url }
  *   POST /back
  *   POST /finish      → { success, googleSession, cookies }
@@ -89,10 +90,12 @@ let ready = false;
 let closing = false;
 let lastAutoAction = '';
 
-// Auto-drive Google's sign-in so the user only has to type their password:
-//   1. pre-fill the email and click Continue,
-//   2. pick the matching account from the account chooser,
-//   3. approve the portal's OAuth consent screen.
+// Auto-drive Google's sign-in:
+//   1. pre-fill the email and click Continue on the identifier page,
+//   2. approve the portal's OAuth consent screen.
+// The account chooser (when the profile already has accounts) is left for the
+// user to pick via the app's "tap to sign in" chips — we never auto-select an
+// account, mirroring the IMAP/Gmail account picker UX.
 // Guards each step so it never fights the user or repeats an action.
 async function autoDrive() {
   if (!page || closing || page.isClosed()) return;
@@ -133,19 +136,9 @@ async function autoDrive() {
     if (did) { lastAutoAction = sigForAction; return; }
   }
 
-  // 2) Account chooser → pick the matching account.
-  if (emailHint) {
-    const chose = await page.evaluate((email) => {
-      const el = Array.from(document.querySelectorAll('[data-identifier]')).find((e) =>
-        (e.getAttribute('data-identifier') || '').toLowerCase() === email.toLowerCase()
-      );
-      if (!el) return false;
-      try { el.scrollIntoViewIfNeeded(); } catch {}
-      el.click();
-      return true;
-    }, emailHint).catch(() => false);
-    if (chose) { lastAutoAction = sigForAction; return; }
-  }
+  // 2) Account chooser → do NOT auto-select; the user taps an account in the
+  //    app's chips. But if we land here with the email already in a password
+  //    field, do nothing and wait. (No action taken — user chooses.)
 
   // 3) OAuth consent → approve once.
   const bodyText = await page.evaluate(() => document.body ? document.body.innerText.slice(0, 2500) : '').catch(() => '');
@@ -207,6 +200,21 @@ async function snapshot() {
       }).length > 0;
     }).catch(() => false);
     state.onGoogleAuth = /accounts\.google\.com/.test(page.url());
+    // Accounts currently known to Google in this profile (account chooser rows).
+    // Lets the app render "tap to sign in as…" chips — no password needed when
+    // the session is still valid, mirroring the IMAP/Gmail account picker.
+    state.accounts = await page.evaluate(() => {
+      const seen = new Set();
+      const out = [];
+      for (const e of document.querySelectorAll('[data-identifier]')) {
+        const v = (e.getAttribute('data-identifier') || '').trim();
+        if (/^[^@\s]+@[^@\s]+\.[^@\s]{2,}$/.test(v) && !seen.has(v.toLowerCase())) {
+          seen.add(v.toLowerCase());
+          out.push(v);
+        }
+      }
+      return out;
+    }).catch(() => []);
   } catch {}
   try {
     const cookies = await context.cookies().catch(() => []);
@@ -234,20 +242,27 @@ async function attachPopupHandling() {
 async function tryGoogleButton() {
   if (!page) return false;
   try {
+    const url = page.url();
+    // Already on Google's own sign-in page — there is no "Login with Google"
+    // button to click, and blindly clicking an element whose id/class/href
+    // merely mentions "google" can follow a help link off the page.
+    if (/accounts\.google\.com/.test(url)) return false;
     const clicked = await page.evaluate(() => {
-      // Prefer the real anchor/button (href/id/class mention google), then
-      // fall back to text matching.
-      const byAttr = Array.from(document.querySelectorAll(
-        'a[href*="google" i], a[href*="get_google" i], a[href*="accounts.google" i], [id*="google" i], [class*="google" i]'
+      // Only real OAuth entry points: a get_google redirect, the Google
+      // accounts/consent URL, or a data-attribute that names the provider.
+      const strongAttr = Array.from(document.querySelectorAll(
+        'a[href*="get_google" i], a[href*="accounts.google" i], a[href*="google.com/o/oauth2" i], [data-provider*="google" i], [data-oauth*="google" i], [data-google*="true" i]'
       )).filter((a) => {
         const r = a.getBoundingClientRect();
         return r.width > 0 && r.height > 0;
       });
-      let target = byAttr[0];
+      let target = strongAttr[0];
       if (!target) {
-        target = Array.from(document.querySelectorAll('a, button, [role="button"]')).find((e) =>
-          /continue with google|sign ?in with google|log ?in with google|sign ?up with google|login with google|google login|google sign|google account/i.test((e.textContent || '').toLowerCase())
-        );
+        // Fall back to visible text that names the Google login action.
+        target = Array.from(document.querySelectorAll('a, button, [role="button"]')).find((e) => {
+          const r = e.getBoundingClientRect();
+          return r.width > 0 && r.height > 0 && /continue with google|sign ?in with google|log ?in with google|sign ?up with google|login with google|google login|google sign|google account/i.test((e.textContent || '').toLowerCase());
+        });
       }
       if (!target) return false;
       try { target.scrollIntoViewIfNeeded(); } catch {}
@@ -383,6 +398,21 @@ async function main() {
       if (req.method === 'POST' && parts === '/type') {
         if (page && body.text != null) {
           await page.keyboard.type(String(body.text), { delay: 30 });
+        }
+        return respond(res, 200, await snapshot());
+      }
+      if (req.method === 'POST' && parts === '/account') {
+        if (page && body.email) {
+          const clicked = await page.evaluate((email) => {
+            const el = Array.from(document.querySelectorAll('[data-identifier]')).find((e) =>
+              (e.getAttribute('data-identifier') || '').toLowerCase() === String(email).toLowerCase()
+            );
+            if (!el) return false;
+            try { el.scrollIntoViewIfNeeded(); } catch {}
+            el.click();
+            return true;
+          }, String(body.email)).catch(() => false);
+          await page.waitForTimeout(1500);
         }
         return respond(res, 200, await snapshot());
       }

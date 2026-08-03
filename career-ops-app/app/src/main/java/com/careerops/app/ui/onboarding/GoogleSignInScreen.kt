@@ -58,13 +58,13 @@ fun GoogleSignInScreen(
         if (result.resultCode == Activity.RESULT_OK) {
             val code = result.data?.getStringExtra("auth_code")
             if (!code.isNullOrEmpty()) {
-                pendingGmailEmail?.let { email ->
-                    onSignInSuccess(email, code)
-                }
-                pendingGmailEmail = null
+                // Email may be unknown (standalone "Use browser sign-in" flow).
+                // The bridge resolves the real email from the ID token.
+                onSignInSuccess(pendingGmailEmail.orEmpty(), code)
             } else {
                 onSignInError("Authorization failed.")
             }
+            pendingGmailEmail = null
         } else {
             pendingGmailEmail = null
             onSignInError("Gmail authorization was cancelled.")
@@ -264,6 +264,8 @@ fun GoogleSignInScreen(
                 onClick = {
                     isLoading = true
                     errorMessage = null
+                    // Email unknown in this flow; bridge resolves it from the ID token.
+                    pendingGmailEmail = ""
                     val authUri = "https://accounts.google.com/o/oauth2/v2/auth?" +
                         "client_id=$WEB_CLIENT_ID&" +
                         "redirect_uri=https://career-ops.app&" +
