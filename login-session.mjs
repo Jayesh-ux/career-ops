@@ -88,7 +88,7 @@ let context;
 let page;
 let ready = false;
 let closing = false;
-let lastAutoAction = '';
+let lastAutoAction = ''; // (unused after autoDrive rewrite; kept to avoid touching timer refs)
 
 // Auto-drive Google's sign-in:
 //   1. pre-fill the email and click Continue on the identifier page,
@@ -103,61 +103,90 @@ async function autoDrive() {
   try { url = page.url(); } catch { return; }
   if (!/accounts\.google\.com/.test(url)) return;
 
-  let sig = '';
-  try {
-    sig = await page.evaluate(() => {
-      const idEl = document.querySelector('input[name="identifier"]') || document.querySelector('#identifierId');
-      return `${location.pathname}|${!!idEl}|${idEl ? (idEl.value || '').length : 0}|${location.search}`;
-    }).catch(() => '');
-  } catch { return; }
-  if (!sig || sig === lastAutoAction) return;
-  const sigForAction = sig;
-
-  // 1) Email field → fill + Continue.
+  // 1) Email field → fill + Continue (retries every ~2.5s until the page
+  //    advances, so a too-early click self-heals).
   if (emailHint) {
-    const did = await page.evaluate((email) => {
+    await page.evaluate((email) => {
+      if (!window.__coIdTick) window.__coIdTick = 0;
       const idEl = document.querySelector('input[name="identifier"]') || document.querySelector('#identifierId');
-      if (!idEl) return false;
+      const pwEl = document.querySelector('input[type="password"]');
+      if (!idEl || pwEl) return;
       const r = idEl.getBoundingClientRect();
-      if (r.width === 0 || r.height === 0) return false;
-      if (!idEl.value) {
+      if (r.width === 0 || r.height === 0) return;
+      const needFill = !idEl.value;
+      if (needFill) {
         const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
         setter.call(idEl, email);
         idEl.dispatchEvent(new Event('input', { bubbles: true }));
         idEl.dispatchEvent(new Event('change', { bubbles: true }));
       }
       const next = document.querySelector('#identifierNext, button[jsname="LgbsSe"]');
-      if (next) {
+      if (next && (needFill || Date.now() - window.__coIdTick > 2500)) {
+        window.__coIdTick = Date.now();
         try { next.scrollIntoViewIfNeeded(); } catch {}
         next.click();
       }
-      return true;
-    }, emailHint).catch(() => false);
-    if (did) { lastAutoAction = sigForAction; return; }
+    }, emailHint).catch(() => {});
   }
 
-  // 2) Account chooser → do NOT auto-select; the user taps an account in the
-  //    app's chips. But if we land here with the email already in a password
-  //    field, do nothing and wait. (No action taken — user chooses.)
+  // 2) Password field → keep it focused so the app's type box works directly,
+  //    and auto-submit once the user has finished typing the password.
+  const pw = await page.evaluate(() => {
+    const el = document.querySelector('input[type="password"]');
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return false;
+    if (!window.__coPwTick) {
+      window.__coPwTick = 0;
+      el.addEventListener('input', () => { window.__coPwTick = Date.now(); });
+    }
+    if (document.activeElement !== el) { try { el.focus(); } catch {} }
+    if ((el.value || '').length > 0 && Date.now() - window.__coPwTick > 1200) {
+      const next = document.querySelector('#passwordNext, button[jsname="LgbsSe"]');
+      if (next) { try { next.scrollIntoViewIfNeeded(); } catch {}; next.click(); }
+    }
+    return true;
+  }).catch(() => false);
+  if (pw) return;
 
-  // 3) OAuth consent → approve once.
+  // 3) 2FA/OTP field → same treatment: focus + auto-submit once a code is in.
+  const otp = await page.evaluate(() => {
+    const el = document.querySelector('input[name="otp"], input#idvPin, input#totpPin, input[autocomplete="one-time-code"]');
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return false;
+    if (!window.__coOtpTick) {
+      window.__coOtpTick = 0;
+      el.addEventListener('input', () => { window.__coOtpTick = Date.now(); });
+    }
+    if (document.activeElement !== el) { try { el.focus(); } catch {} }
+    if ((el.value || '').length > 0 && Date.now() - window.__coOtpTick > 1200) {
+      const next = document.querySelector('#idvAnyChallengerSubmit, button[jsname="LgbsSe"]');
+      if (next) { try { next.scrollIntoViewIfNeeded(); } catch {}; next.click(); }
+    }
+    return true;
+  }).catch(() => false);
+  if (otp) return;
+
+  // 4) Account chooser → do NOT auto-select; the user taps an account in the
+  //    app's chips. (No action taken — user chooses.)
+
+  // 5) OAuth consent → approve once.
   const bodyText = await page.evaluate(() => document.body ? document.body.innerText.slice(0, 2500) : '').catch(() => '');
   if (/wants to access your google account|has access to your google account|allow .* to|permissions/i.test(bodyText)) {
-    const approved = await page.evaluate(() => {
+    await page.evaluate(() => {
       const direct = document.querySelector('#submit_approve_access');
-      if (direct) { try { direct.scrollIntoViewIfNeeded(); } catch {}; direct.click(); return true; }
+      if (direct) { try { direct.scrollIntoViewIfNeeded(); } catch {}; direct.click(); return; }
       const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
       const target = btns.find((b) => {
         const t = (b.textContent || '').trim().toLowerCase();
         const r = b.getBoundingClientRect();
         return r.width > 0 && r.height > 0 && (t === 'continue' || t === 'allow' || t === 'allow access');
       });
-      if (!target) return false;
+      if (!target) return;
       try { target.scrollIntoViewIfNeeded(); } catch {}
       target.click();
-      return true;
-    }).catch(() => false);
-    if (approved) lastAutoAction = sigForAction;
+    }).catch(() => {});
   }
 }
 
