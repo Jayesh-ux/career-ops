@@ -50,18 +50,44 @@ every later run.
   being filled counts as a block. This was the "apply via app was broken" cause.
 - `cvNote` — confirmation that the CV file was attached, included in fill output.
 
+## Stealth & anti-bot (2026-08-03)
+
+- `apply-job.mjs` now picks the **most-stealth engine available**:
+  1. **`patchright`** (preferred) — patched playwright-core that hides CDP
+     leaks (`Runtime.enable`, console assertions, ...) — this is what actually
+     gets headless Chromium past **Cloudflare**. Verified: `internshala.com` and
+     `shine.com` both load a real page in headless mode, no challenge
+     (`CF_BLOCKED: false`).
+  2. **`playwright-extra` + `puppeteer-extra-plugin-stealth`** (fallback for
+     `--stealth`) — JS-level stealth (`navigator.webdriver`, `chrome.runtime`),
+     helps in-house bot checks but NOT Cloudflare.
+  3. plain `playwright` — fine for company ATS pages with no bot wall.
+- The engine used is logged to stderr as `[stealth] engine=patchright` so runs
+  are diagnosable from bridge logs.
+- **Important:** the runtime `package.json` must include `patchright`,
+  `playwright-extra`, `puppeteer-extra-plugin-stealth` — the runtime
+  `node_modules` previously shipped only `playwright`, so the `--stealth` flag
+  the app always sends was silently no-oping on-device. Patchright's browser is
+  the same chromium-1228 revision; CDP fixes live in the JS core.
+- Browser resolution still honours `/opt/ms-playwright`
+  (`PLAYWRIGHT_BROWSERS_PATH`), so no extra browser copy is needed.
+
 ## Portal login reality (2026-08-03)
 
 - Company ATS career pages (Greenhouse, Ashby, Lever, Workable, ...) have no
   Cloudflare wall — `apply-job.mjs` extracts + auto-fills them cleanly with the
   per-user profile, attaching `output/generic-cv.pdf`. This is the reliable path.
-- Job boards behind Cloudflare (Internshala, Shine) load fine but hide the
-  application form behind a **portal login**. The seeded `google-cookies.json`
-  is Google-only, and the encrypted `.portal-creds.json` vault is **empty** for
-  `hsinghjayesh@gmail.com` — so the auto-login has nothing to use and the
-  headless Google consent cannot complete. Unblock: store the portal email +
-  password in the vault (`POST /portal-creds`, AES-256-GCM at rest), and
-  `loginWithPortalCreds()` will log in headlessly (no popup) before filling.
+- **Cloudflare is now cleared** (patchright) on Internshala and Shine — the
+  only remaining blocker is the **portal login**: Internshala bounces
+  unauthenticated visitors to `/registration/student` (Google button visible,
+  email/password fields hidden until that path is chosen). The seeded
+  `google-cookies.json` is Google-only, and the encrypted `.portal-creds.json`
+  vault is per-user (empty for `hsinghjayesh@gmail.com`), so the auto-login has
+  nothing to use and headless Google OAuth consent cannot complete. Unblock:
+  store the portal email + password in the vault (`POST /portal-creds`,
+  AES-256-GCM at rest, per-user), and `loginWithPortalCreds()` will log in
+  headlessly (no popup) before filling. Any app user can do this from
+  Settings → Portal Logins.
 
 ## Related files
 
@@ -70,6 +96,8 @@ every later run.
 - `login-session.mjs`
 - `smoke-pw.mjs`
 - `scan.mjs`
+- `package.json` (runtime deps: `patchright`, `playwright-extra`,
+  `puppeteer-extra-plugin-stealth`)
 
 ## Links
 

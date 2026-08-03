@@ -1244,21 +1244,37 @@ async function main() {
     process.exit(0);
   }
 
-  // Check if Playwright is available (optional stealth plugin)
+  // Choose the best available automation engine, most-stealth first:
+  //   1) patchright   — patched playwright-core that hides CDP leaks
+  //                     (Runtime.enable, console asserts, ...). This is what
+  //                     actually gets headless Chromium past Cloudflare.
+  //   2) playwright-extra + puppeteer-extra-plugin-stealth — JS-level stealth
+  //                     (navigator.webdriver, chrome.runtime, ...); helps
+  //                     against in-house bot checks but NOT Cloudflare.
+  //   3) plain playwright — fine for company ATS pages with no bot wall.
   let chromium;
-  let usedStealth = false;
+  let stealthEngine = null;
   try {
-    if (stealthMode) {
+    const pr = await import('patchright').catch(() => null);
+    if (pr && pr.chromium) {
+      chromium = pr.chromium;
+      stealthEngine = 'patchright';
+    }
+  } catch { /* fall through */ }
+  try {
+    if (!chromium && stealthMode) {
       const pwExtra = await import('playwright-extra').catch(() => null);
       if (pwExtra) {
         const StealthPlugin = (await import('puppeteer-extra-plugin-stealth').catch(() => null))?.default;
         if (StealthPlugin) {
           chromium = pwExtra.chromium;
           chromium.use(StealthPlugin());
-          usedStealth = true;
+          stealthEngine = 'playwright-extra';
         }
       }
     }
+  } catch { /* fall through */ }
+  try {
     if (!chromium) {
       const pw = await import('playwright');
       chromium = pw.chromium;
@@ -1277,6 +1293,7 @@ async function main() {
       process.exit(0);
     }
   }
+  if (stealthEngine) console.error(`[stealth] engine=${stealthEngine}`);
 
   // Load answers for fill mode
   let fillAnswers = {};
