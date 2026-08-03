@@ -6591,6 +6591,7 @@ app.post('/login/session/seed', (req, res) => {
     }
     const target = join(userDir, 'google-cookies.json');
     writeFileSync(target, JSON.stringify({ cookies, updatedAt: new Date().toISOString() }, null, 2));
+    console.log(`[seed] userId=${req.userCtx.userId} count=${cookies.length} → ${target}`);
     res.json({ success: true, count: cookies.length, file: target });
   } catch (e) {
     res.status(500).json({ error: e.message });

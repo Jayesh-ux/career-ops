@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.util.Log
 import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
@@ -16,6 +17,10 @@ class GoogleOAuthActivity : Activity() {
 
     companion object {
         private const val EXTRA_AUTH_URL = "auth_url"
+        private const val TAG = "GoogleOAuth"
+        // How long to keep polling for the session cookies after the redirect.
+        private const val COOKIE_POLL_MS = 400L
+        private const val COOKIE_POLL_ATTEMPTS = 15 // ~6s total
 
         fun createIntent(context: Context, authUrl: String): Intent {
             return Intent(context, GoogleOAuthActivity::class.java).apply {
@@ -62,6 +67,7 @@ class GoogleOAuthActivity : Activity() {
         val webView = WebView(this).apply {
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
+            CookieManager.getInstance().setAcceptCookie(true)
 
             webViewClient = object : WebViewClient() {
                 override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
@@ -79,19 +85,38 @@ class GoogleOAuthActivity : Activity() {
                         } else {
                             resultIntent.putExtra("auth_code", code)
                         }
-                        // Let the Google session cookies settle, then grab them
-                        // so the same login can seed the Playwright profile
-                        // (one login powers IMAP + portal auto-fill).
-                        view?.postDelayed({
-                            if (!code.isNullOrEmpty()) {
-                                val cookies = captureGoogleCookies()
-                                if (cookies.isNotEmpty()) {
-                                    resultIntent.putExtra("google_cookies", cookies)
-                                }
+                        // Poll for the Google session cookies so the same login
+                        // can seed the Playwright profile (one login powers IMAP
+                        // + portal auto-fill). Some flows (2FA, One Tap) commit
+                        // cookies a moment after the code redirect, so keep
+                        // trying briefly instead of a single-shot grab.
+                        val viewRef = view
+                        fun finishWithResult() {
+                            if (viewRef == null) {
+                                setResult(Activity.RESULT_OK, resultIntent)
+                                finish()
+                                return
                             }
-                            setResult(Activity.RESULT_OK, resultIntent)
-                            finish()
-                        }, 1500L)
+                            viewRef.postDelayed(object : Runnable {
+                                var attempts = 0
+                                override fun run() {
+                                    val cookies = captureGoogleCookies()
+                                    val names = cookies.split("; ")
+                                        .mapNotNull { it.substringBefore('=').takeIf { n -> n.isNotBlank() } }
+                                    Log.d(TAG, "cookie poll ${++attempts}: ${names.joinToString(",")}")
+                                    if (cookies.isNotEmpty() || attempts >= COOKIE_POLL_ATTEMPTS) {
+                                        resultIntent.putExtra("google_cookies", cookies)
+                                        resultIntent.putExtra("google_cookies_count", names.size)
+                                        resultIntent.putExtra("google_cookies_names", names.joinToString(","))
+                                        setResult(Activity.RESULT_OK, resultIntent)
+                                        finish()
+                                    } else {
+                                        viewRef.postDelayed(this, COOKIE_POLL_MS)
+                                    }
+                                }
+                            }, COOKIE_POLL_MS)
+                        }
+                        finishWithResult()
                         return true
                     }
 

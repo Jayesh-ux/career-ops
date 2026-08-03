@@ -32,6 +32,16 @@ If the cookie path fails, the user can fall back to the **Advanced** "in-app
 browser" (`login-session.mjs` live screenshot/tap/type surface with
 `autoDrive()`), which completes a manual sign-in in the persistent profile.
 
+## Seed diagnostics
+
+`GoogleOAuthActivity` returns the captured cookie **count and names** in its
+result extras (`google_cookies_count`, `google_cookies_names`); when a seed
+still can't be confirmed, `PortalLoginScreen` shows them in the error message
+("sign-in page gave us N cookies: ...") so a failure is attributable: `0`
+cookies means the WebView cookie store came back empty, while `>0` without
+`SID`/`HSID` means Google minted non-session cookies only. The bridge also logs
+`[seed] userId=... count=... → <file>` on every accepted seed.
+
 ## Persisted-session check (no browser launch)
 
 `GET /portal/session/status` reports whether the user is connected by checking

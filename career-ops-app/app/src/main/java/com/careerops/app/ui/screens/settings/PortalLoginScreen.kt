@@ -189,6 +189,8 @@ fun PortalLoginScreen(
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
             val cookies = result.data?.getStringExtra("google_cookies").orEmpty()
+            val cookieCount = result.data?.getIntExtra("google_cookies_count", 0) ?: 0
+            val cookieNames = result.data?.getStringExtra("google_cookies_names").orEmpty()
             scope.launch {
                 if (cookies.isNotEmpty()) {
                     try { api.seedLoginSession(mapOf("cookieString" to cookies)) } catch (_: Exception) {}
@@ -196,7 +198,9 @@ fun PortalLoginScreen(
                 try {
                     val st = api.getPortalSessionStatus()
                     alreadyConnected = (st["googleSession"] as? Boolean) == true
-                    error = if (alreadyConnected) "" else "Couldn't confirm the session yet. Tap “Sign in with Google” again, or use the in-app browser below."
+                    error = if (alreadyConnected) ""
+                        else "Couldn't confirm the session yet (sign-in page gave us $cookieCount cookies: $cookieNames). " +
+                             "Tap “Sign in with Google” again, or use the in-app browser below."
                 } catch (e: Exception) {
                     error = e.message ?: "Could not reach the server"
                 }

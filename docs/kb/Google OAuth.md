@@ -20,12 +20,16 @@ The Android app runs a **WebView** (in `GoogleOAuthActivity`) to do the Google
 sign-in. That single interaction mints **both** credential families:
 
 1. `GoogleOAuthActivity` intercepts the redirect to `https://career-ops.app`,
-   captures the OAuth `code`, and — after ~1.5 s — pulls the Google **session
-   cookies** out of `CookieManager`. It probes several hosts
+   captures the OAuth `code`, and then **polls** `CookieManager` for up to
+   ~6 s (400 ms × 15 attempts) to pull the Google **session cookies** — some
+   flows (2FA, One Tap) commit cookies a moment *after* the code redirect, so a
+   single-shot grab can miss them. It probes several hosts
    (`accounts.google.com`, `google.com`, `www.google.com`) and merges by name,
    because host-only cookies like `__Secure-1PSID` are invisible from other
    Google hosts (`SID`, `HSID`, `SAPISID`, `__Secure-1PSID`, `__Host-GAPS`,
-   `NID`).
+   `NID`). The captured count + cookie names are returned in the activity
+   result (`google_cookies_count`, `google_cookies_names`) so the UI can show
+   exactly what the browser minted (see [[Portal Session]] diagnostics).
 2. The auth code goes to the bridge → `getUserOAuth` → Gmail/IMAP
    ([[IMAP Email]]).
 3. The cookies go to `POST /login/session/seed` → stored per-user as
