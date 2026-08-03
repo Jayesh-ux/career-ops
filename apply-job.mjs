@@ -176,8 +176,20 @@ const BOT_DETECTION_PATTERNS = {
 
 async function checkBotCookies(page) {
   try {
+    // Bot cookies (cf_clearance, bm_sz, ...) are site-scoped. A stale cookie
+    // persisted from a DIFFERENT site — e.g. an Internshala challenge cookie
+    // left in the reusable Playwright profile — must not block filling an
+    // open company career page (Greenhouse/Ashby/Lever). Only flag a cookie
+    // whose domain belongs to the page we are actually on.
+    let host = '';
+    try { host = new URL(page.url()).hostname.toLowerCase().replace(/^www\./, ''); } catch { /* keep '' */ }
     const cookies = await page.context().cookies();
-    const found = cookies.filter(c => BOT_DETECTION_PATTERNS.cookies.includes(c.name));
+    const found = cookies.filter(c => {
+      if (!BOT_DETECTION_PATTERNS.cookies.includes(c.name)) return false;
+      const dom = String(c.domain || '').toLowerCase().replace(/^\./, '');
+      if (!dom || !host) return true; // host-only cookie for the current page
+      return host === dom || host.endsWith('.' + dom) || dom.endsWith('.' + host);
+    });
     return found.length > 0 ? found.map(c => c.name) : [];
   } catch {
     return [];
@@ -482,6 +494,37 @@ async function clickApplyButton(page, context) {
       return page;
     } catch { /* not found or not clickable */ }
   }
+
+  // Fallback: job boards (Internshala, Naukri, ...) render an "Apply now"
+  // anchor that Playwright's actionability check can't reach (sticky headers,
+  // invisible backdrops). A synthetic JS click navigates those reliably.
+  try {
+    const clicked = await page.evaluate(() => {
+      const vis = (el) => {
+        const r = el.getBoundingClientRect();
+        const s = window.getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+      };
+      const isApplyText = (t) => /^\s*(apply now|apply for|apply here|apply)\b/i.test((t || '').trim());
+      const all = Array.from(document.querySelectorAll('a, button, [role="button"]'));
+      const visEls = all.filter((e) => vis(e));
+      const link = visEls.find((e) => isApplyText(e.textContent || '') && /(interstitial|application|apply)/i.test(e.getAttribute('href') || ''));
+      const el = link || visEls.find((e) => isApplyText(e.textContent || ''));
+      if (!el) return false;
+      el.click();
+      return true;
+    });
+    if (clicked) {
+      const popupPromise = context.waitForEvent('page', { timeout: 5000 }).catch(() => null);
+      const newPage = await popupPromise;
+      if (newPage) {
+        await newPage.waitForLoadState('domcontentloaded').catch(() => {});
+        await newPage.waitForTimeout(2500);
+        return newPage;
+      }
+      await page.waitForTimeout(3000);
+    }
+  } catch { /* not found */ }
   return page;
 }
 
@@ -576,6 +619,15 @@ async function waitForFormFields(page, timeoutMs = 12000) {
 // often as a hidden modal pre-loaded with email/password/signup fields.
 // Returns a human-readable label or null when no auth wall is present.
 async function detectLoginWall(page) {
+  // Full-page auth redirects (Internshala /registration/student, Naukri
+  // /login, ...) bounce unauthenticated visitors off the job page — treat
+  // those as a login wall so the auto-login flow kicks in below.
+  try {
+    const u = new URL(page.url());
+    if (/^\/(?:registration|login|signin|sign-?up|auth|accounts?)(?:[/?]|$)/i.test(u.pathname)) {
+      return `auth-page redirect (${u.pathname})`;
+    }
+  } catch { /* fall through to DOM check */ }
   const label = await page.evaluate(() => {
     const hasText = (sel, re) => {
       for (const el of document.querySelectorAll(sel)) {
@@ -741,8 +793,21 @@ async function loginWithPortalCreds(page, creds) {
 // session is actually established and the login wall is gone. If the flow
 // lands on Google's own sign-in fields (session missing) it returns ok=false
 // so the caller reports an honest failure instead of filling Google's form.
-async function loginWithGoogleOAuth(page, context) {
+async function loginWithGoogleOAuth(page, context, profileEmail) {
   try {
+    // Stale Google cookies left in the persistent profile (rotated LSID/OSID
+    // remnants from earlier sessions) trigger accounts.google.com/CookieMismatch
+    // and abort the whole login. Clear them and re-seed a fresh, consistent
+    // set from the app's captured session before starting OAuth.
+    try {
+      const cdp = await context.newCDPSession(page);
+      const { cookies } = await cdp.send('Network.getAllCookies');
+      for (const c of cookies.filter((x) => (x.domain || '').endsWith('google.com'))) {
+        try { await cdp.send('Network.deleteCookies', { name: c.name, domain: c.domain, path: c.path }); } catch {}
+      }
+      await context.addCookies(loadGoogleCookies(userDir));
+    } catch {}
+
     const clicked = await page.evaluate(() => {
       // Prefer a real anchor/button that mentions google (href/id/class), then
       // fall back to text matching (e.g. Internshala's "Login with Google").
@@ -774,22 +839,50 @@ async function loginWithGoogleOAuth(page, context) {
     await target.waitForURL(/accounts\.google\.com|google\.com\/o\/oauth2/, { timeout: 20000 }).catch(() => {});
     await target.waitForTimeout(1500);
 
-    // Logged-in session → account chooser shows the user's account (data-identifier).
-    const clickedAccount = await target.evaluate(() => {
-      const row = document.querySelector('[data-identifier]');
-      if (!row) return false;
-      row.click();
-      return true;
-    }).catch(() => false);
+    // Account chooser: the modern v3 page renders each account as a BUTTON
+    // whose text contains the user's email, the legacy page uses a
+    // [data-identifier] row. Prefer a TRUSTED click (synthetic JS clicks are
+    // ignored by Google's handlers), falling back to JS for legacy markup.
+    let clickedAccount = false;
+    if (profileEmail) {
+      try {
+        const acct = target.locator('button, [role="button"], [data-identifier]')
+          .filter({ hasText: profileEmail }).first();
+        if (await acct.isVisible({ timeout: 3000 }).catch(() => false)) {
+          await acct.click({ timeout: 5000 });
+          clickedAccount = true;
+        }
+      } catch {}
+    }
+    if (!clickedAccount) {
+      clickedAccount = await target.evaluate((email) => {
+        const row = document.querySelector('[data-identifier]');
+        if (row) { row.click(); return true; }
+        if (email) {
+          const b = Array.from(document.querySelectorAll('button, [role="button"]'))
+            .find(e => (e.textContent || '').includes(email));
+          if (b) { b.click(); return true; }
+        }
+        return false;
+      }, profileEmail || '').catch(() => false);
+    }
 
     if (clickedAccount) {
-      // Approve the OAuth consent (this is the portal login the user opted into).
-      await target.waitForTimeout(1500);
-      await target.evaluate(() => {
-        const b = Array.from(document.querySelectorAll('button, [role="button"]'))
-          .find(x => /^(allow|continue|continue as)\b/i.test((x.textContent || '').toLowerCase()));
-        if (b) b.click();
-      }).catch(() => {});
+      // Approve the OAuth consent (this is the portal login the user opted
+      // into). Needs a TRUSTED click — Google's consent handler ignores
+      // synthetic page.evaluate clicks, leaving the page stuck on consent.
+      await target.waitForTimeout(1200);
+      for (let i = 0; i < 20; i++) {
+        try {
+          const allow = target.locator('button, [role="button"], input[type="submit"]')
+            .filter({ hasText: /^(allow|continue|continue as)$/i }).first();
+          if (await allow.isVisible({ timeout: 800 }).catch(() => false)) {
+            await allow.click({ timeout: 4000 });
+            break;
+          }
+        } catch {}
+        await target.waitForTimeout(500);
+      }
     } else {
       // No account chooser — Google is asking for credentials. Can't type a
       // password headless; the one-time login screen is required instead.
@@ -802,7 +895,7 @@ async function loginWithGoogleOAuth(page, context) {
     }
 
     // Wait for the OAuth round-trip back to the portal.
-    await page.waitForTimeout(6000);
+    await page.waitForTimeout(8000);
     if (/accounts\.google\.com/.test(page.url())) {
       return { ok: false, reason: 'google-still-on-auth' };
     }
@@ -819,6 +912,39 @@ function isGoogleAuthPage(page) {
     if (/accounts\.google\.com/.test(page.url())) return true;
   } catch {}
   return false;
+}
+
+// Resume-upload-first onboarding (Shine, apna.co, ...): some portals present
+// an "Upload your resume" step whose real file input is visually hidden, then
+// render the actual form after parsing the CV. When no visible fields exist
+// but a (hidden) file input does, upload the CV and poll for the parsed form.
+async function uploadResumeFirst(page, userDir, company) {
+  try {
+    const hasFileInput = await page.evaluate(() =>
+      !!document.querySelector('input[type="file"]')
+    );
+    if (!hasFileInput) return [];
+    const cvPath = resolveTailoredCv(company);
+    if (!cvPath) return [];
+    await page.locator('input[type="file"]').first().setInputFiles(cvPath);
+    // Poll for non-file, visible form controls (resume parsing takes seconds).
+    const start = Date.now();
+    while (Date.now() - start < 40000) {
+      const count = await page.evaluate(() => {
+        const vis = (el) => {
+          const r = el.getBoundingClientRect();
+          const s = window.getComputedStyle(el);
+          return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+        };
+        return Array.from(document.querySelectorAll('input:not([type="file"]), textarea, select')).filter(vis).length;
+      }).catch(() => 0);
+      if (count > 0) return await extractFields(page);
+      await page.waitForTimeout(2000);
+    }
+    return [];
+  } catch {
+    return [];
+  }
 }
 
 // ── Form field categorization ───────────────────────────────────────
@@ -1335,7 +1461,21 @@ async function main() {
       process.exit(0);
     }
 
-    if (/no longer available|position filled|expired|closed|not found/i.test(pageText)) {
+    // Expired/closed detection. Word-boundary the markers so Shine's
+    // "Not Disclosed" salary doesn't trip "closed", and only declare an
+    // expired posting when there is NO apply affordance on the page (a live
+    // job with "2 days ago" + an Apply button must never be skipped).
+    const hasApplyAffordance = await page.evaluate(() => {
+      const vis = (el) => {
+        const r = el.getBoundingClientRect();
+        const s = window.getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+      };
+      return Array.from(document.querySelectorAll('a, button, [role="button"]'))
+        .some((e) => vis(e) && /^\s*(apply|apply now|apply for|login to apply)\b/i.test((e.textContent || '').trim()));
+    }).catch(() => false);
+    const expiredRe = /no longer available|position filled|job (has been|is) (removed|filled|closed)|\bexpired\b|not found|\bclosed\b/i;
+    if (!hasApplyAffordance && expiredRe.test(pageText)) {
       console.log(JSON.stringify({
         error: 'Posting expired',
         atsType,
@@ -1369,6 +1509,11 @@ async function main() {
       let loginVia = null;
       let authState = null;
       if (fields.length === 0) {
+        // 0) Resume-upload-first onboarding (Shine, apna.co) — needs no login.
+        fields = await uploadResumeFirst(formPage, userDir, company);
+        if (fields.length > 0) loginVia = 'resume-upload';
+      }
+      if (fields.length === 0) {
         const wall = await detectLoginWall(formPage);
         const entry = await findAuthEntry(formPage);
         authState = await describeAuthState(formPage);
@@ -1385,7 +1530,7 @@ async function main() {
           }
           // 2) Google OAuth (preferred) — reuse the Gmail OAuth session
           if (fields.length === 0) {
-            const g = await loginWithGoogleOAuth(formPage, context);
+            const g = await loginWithGoogleOAuth(formPage, context, profile.candidate?.email || profile.email || '');
             if (g.ok) {
               await waitForFormFields(formPage);
               const after = await extractFields(formPage);

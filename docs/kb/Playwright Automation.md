@@ -38,7 +38,30 @@ every later run.
   the false-success bug ([[Google OAuth]]).
 - `findAuthEntry()` / `describeAuthState()` — figure out whether a job page
   needs login and how to enter it (Google button, email field, password).
+- `detectLoginWall()` — **2026-08-03 fix:** also treats full-page auth redirects
+  (`/registration`, `/login`, `/signin`, `/signup`, `/auth`) as a login wall, so
+  portals that bounce unauthenticated visitors (Internshala → `/registration/student`)
+  now trigger the auto-login flow instead of reporting "no form fields".
+- `checkBotCookies()` — **2026-08-03 fix:** bot cookies (`cf_clearance`, `bm_sz`,
+  ...) are **site-scoped**. Previously ANY such cookie in the reusable persistent
+  profile — including a stale Internshala challenge cookie left from an earlier
+  run — aborted every later fill, even Cloudflare-free company ATS pages
+  (Greenhouse/Ashby/Lever). Now only a bot cookie whose domain matches the page
+  being filled counts as a block. This was the "apply via app was broken" cause.
 - `cvNote` — confirmation that the CV file was attached, included in fill output.
+
+## Portal login reality (2026-08-03)
+
+- Company ATS career pages (Greenhouse, Ashby, Lever, Workable, ...) have no
+  Cloudflare wall — `apply-job.mjs` extracts + auto-fills them cleanly with the
+  per-user profile, attaching `output/generic-cv.pdf`. This is the reliable path.
+- Job boards behind Cloudflare (Internshala, Shine) load fine but hide the
+  application form behind a **portal login**. The seeded `google-cookies.json`
+  is Google-only, and the encrypted `.portal-creds.json` vault is **empty** for
+  `hsinghjayesh@gmail.com` — so the auto-login has nothing to use and the
+  headless Google consent cannot complete. Unblock: store the portal email +
+  password in the vault (`POST /portal-creds`, AES-256-GCM at rest), and
+  `loginWithPortalCreds()` will log in headlessly (no popup) before filling.
 
 ## Related files
 
