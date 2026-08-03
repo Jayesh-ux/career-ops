@@ -1540,13 +1540,22 @@ function buildRfc2822Message({ from, to, subject, body, pdfPath }) {
 
 app.post('/email/send', async (req, res) => {
   try {
-    const { email, appPassword, company, role, body, to, pdfPath } = req.body;
+    const { email: emailParam, appPassword, company, role, body, to, pdfPath } = req.body;
+    // Sender is optional when X-User-Id is present (the app never sends it):
+    // fall back to the userId header, then the legacy GMAIL_USER env.
+    const email = (emailParam || '').trim() || req.userCtx?.userId || process.env.GMAIL_USER || '';
     if (!email || !body) {
-      return res.status(400).json({ error: 'email and body are required' });
+      return res.status(400).json({ error: 'email (sender) and body are required' });
     }
     if (!to || !String(to).trim()) {
       return res.status(400).json({ error: 'to (recipient) is required — refusing to send without a recipient' });
     }
+    // Application emails must carry the CV. When the caller didn't pass a
+    // pdfPath, default to the user's generated CV PDF (per-user, then legacy).
+    const defaultCv = req.userCtx?.userDir
+      ? join(req.userCtx.userDir, 'output', 'generic-cv.pdf')
+      : join(__dirname, 'output', 'generic-cv.pdf');
+    const resolvedPdf = (pdfPath && existsSync(pdfPath)) ? pdfPath : (existsSync(defaultCv) ? defaultCv : undefined);
 
     // Determine auth method: per-user OAuth2 > legacy OAuth2 > app password
     const userOAuth = req.userCtx.userId ? getUserOAuth(req.userCtx.userId) : null;
@@ -1565,7 +1574,7 @@ app.post('/email/send', async (req, res) => {
       }
       if (accessToken) {
         try {
-          const raw = buildRfc2822Message({ from: email, to, subject, body, pdfPath });
+          const raw = buildRfc2822Message({ from: email, to, subject, body, pdfPath: resolvedPdf });
           const sendResp = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
             method: 'POST',
             headers: {
@@ -1606,7 +1615,7 @@ app.post('/email/send', async (req, res) => {
       subject,
       text: body,
     };
-    if (pdfPath && existsSync(pdfPath)) mailOpts.attachments = [{ path: pdfPath }];
+    if (resolvedPdf) mailOpts.attachments = [{ path: resolvedPdf }];
 
     let lastErr = null;
     for (const attempt of attempts) {
@@ -2069,7 +2078,7 @@ app.post('/scan', async (req, res) => {
     }
 
     // Read user's location from profile for dynamic proximity
-    const userProfile = readProfile();
+    const userProfile = readUserProfileRaw(req);
     const userCity = ((userProfile.location?.city) || '').toLowerCase().trim();
     const userCountry = ((userProfile.location?.country) || '').toLowerCase().trim();
     const userLocFull = ((userProfile.candidate?.location) || '').toLowerCase().trim();
@@ -2706,7 +2715,7 @@ app.get('/scan/stream', async (req, res) => {
     }
 
     // Read user's location from profile for dynamic proximity
-    const userProfile = readProfile();
+    const userProfile = readUserProfileRaw(req);
     const userCity = ((userProfile.location?.city) || '').toLowerCase().trim();
     const userCountry = ((userProfile.location?.country) || '').toLowerCase().trim();
     const userLocFull = ((userProfile.candidate?.location) || '').toLowerCase().trim();
@@ -3190,7 +3199,7 @@ app.get('/scan/stream', async (req, res) => {
     }
 
     // Score every opportunity with the career-ops rubric so each card is rated.
-    const profileForScore = readProfile();
+    const profileForScore = readUserProfileRaw(req);
     const scored = usableResults.map(r => {
       const s = scoreScanResult(r, profileForScore, rawKw);
       return { ...r, score: s.score, scoreNum: s.scoreNum, fit: s.fit, scoreDetails: s.details };
