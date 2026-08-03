@@ -15,7 +15,8 @@ header.
 
 - Expose REST endpoints: `/health`, `/profile`, `/tracker`, `/email/*`,
   `/login/session/*`, `/login/session/seed`, `/portal/session/status`,
-  `/apply/open|fill`, `/cv`, `/resume/upload`, `/scan`, `/auto-pipeline`.
+  `/apply/open|fill`, `/cv`, `/resume/upload`, `/scan`, `/auto-pipeline`,
+  `/cv/tailor` (2026-08-03 — tailored ATS-optimized CV PDF per role).
 - Spawn the Node automation scripts (`apply-job.mjs`, `login-session.mjs`,
   `scan.mjs`, etc.) as child processes, passing `--user-dir` for the
   requesting user.
@@ -47,6 +48,21 @@ header.
   session status (`GET /portal/session/status`) — no browser launch needed.
 - Serve the user session for end-user agent chats via the `opencode serve`
   instance started by [[Start Bridge]].
+- Own the **tailored CV path** (`POST /cv/tailor`, 2026-08-03 redesign): a
+  *split* design so it stays reliable under stateless opencode timeouts. **Phase
+  A** (bridge, synchronous) gathers ALL context — `fetchJdAndContact`, the
+  per-user evaluation report (by `reportNum` or company/role fuzzy match over
+  `reports/*.md`), the zero-LLM `jd-skill-gap` classifier, the resolved template
+  (`cv-templates.mjs resolve cv` with `CAREER_OPS_PROFILE`), and inlines cv +
+  profile — into ONE focused opencode call whose only job is to return the
+  compact render JSON (no commands/files). **Phase B** (bridge, synchronous)
+  runs the deterministic scripts with exact exit codes:
+  `build-cv-html` → `verify-cv-facts` (hard **fact gate**) → `generate-pdf`
+  (`--allow-reorder`, `--user-dir` SPACED form, optional `--report=NNN`). A gate
+  failure re-runs the agent up to 3× with the rejected claims fed back
+  ("REJECTED BY THE FACT GATE — remove every mention of these"). Paper format is
+  `a4` unless the JD text clearly targets US/Canada. All artifacts land in the
+  requesting user's tree (`jds/`, `output/`, `data/pdf-index.tsv`).
 
 ## Design notes
 
@@ -74,3 +90,4 @@ header.
 - [[Playwright Automation]] — the spawned scripts
 - [[IMAP Email]] — OAuth token handling
 - [[Multi-user Data Model]] — per-user resolution
+- [[CV & PDF Generation]] — the tailored-CV pipeline `/cv/tailor` drives

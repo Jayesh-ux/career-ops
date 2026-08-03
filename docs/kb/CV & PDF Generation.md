@@ -15,6 +15,16 @@ files. Feeds the [[Auto-fill Pipeline]] and application emails.
 - `generate-latex.mjs` / `build-cv-latex.mjs` — LaTeX pipeline
 - `generate-cover-letter.mjs` — tailored cover letters
 - `templates/` + `fonts/` — ATS templates
+- `POST /cv/tailor` ([[Bridge Server]]) — per-role tailored CV PDF. Split
+  design: the bridge gathers all context (JD, evaluation report, skill-gap
+  classifier, resolved template) into one focused opencode call that returns the
+  render JSON; the bridge then runs `build-cv-html.mjs` → `verify-cv-facts.mjs`
+  (hard **fact gate**) → `generate-pdf.mjs`, retrying up to 3× with rejected
+  claims fed back. Zero-LLM pieces: `jd-skill-gap.mjs` (skill classifier,
+  `--summary` only used when it found skills), `cv-templates.mjs resolve cv`
+  (honors `CAREER_OPS_PROFILE`). Artifacts are per-user (`jds/`, `output/`,
+  `data/pdf-index.tsv`); `--user-dir` must be the SPACED form and
+  `--allow-reorder` is required (template owns section order, see `modes/pdf.md`).
 
 ## Truth rule
 
@@ -26,6 +36,8 @@ user maintains ([[Security & Human-in-the-loop]]).
 
 - `generate-pdf.mjs`, `cv.md`, `config/profile.yml`
 - `templates/cv-template.html`
+- `build-cv-html.mjs`, `verify-cv-facts.mjs`, `cv-templates.mjs`, `jd-skill-gap.mjs` — the `/cv/tailor` pipeline
+- `modes/pdf.md` — the JSON render schema + section-order rules
 
 ## Links
 
@@ -34,3 +46,4 @@ user maintains ([[Security & Human-in-the-loop]]).
 - [[Security & Human-in-the-loop]] — no fabrication
 - [[Playwright Automation]] — the PDF engine
 - [[Multi-user Data Model]] — per-user cv.md
+- [[Bridge Server]] — the `/cv/tailor` endpoint that drives this pipeline

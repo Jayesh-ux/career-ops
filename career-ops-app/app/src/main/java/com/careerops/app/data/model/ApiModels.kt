@@ -193,7 +193,9 @@ data class AutoPipelineResponse(
     val reportPath: String = "",
     val fit: String = "",
     val strengths: List<String> = emptyList(),
-    val gaps: List<String> = emptyList()
+    val gaps: List<String> = emptyList(),
+    val contactEmails: List<String> = emptyList(),
+    val contactPhones: List<String> = emptyList()
 )
 
 data class ClassifyRequest(
@@ -373,6 +375,24 @@ data class PdfResponse(
     val outputDir: String = ""
 )
 
+data class TailorCvRequest(
+    val url: String? = null,
+    val reportNum: Int? = null,
+    val company: String? = null,
+    val role: String? = null
+)
+
+data class TailorCvResponse(
+    val success: Boolean = false,
+    val pdfPath: String = "",
+    val htmlPath: String = "",
+    val reportNum: Int? = null,
+    val company: String = "",
+    val role: String = "",
+    val output: String = "",
+    val error: String? = null
+)
+
 data class SalaryGapResponse(
     val observations: List<Any> = emptyList(),
     val gaps: List<Any> = emptyList()
@@ -524,7 +544,8 @@ data class EmailSendRequest(
     val subject: String,
     val body: String,
     val company: String? = null,
-    val role: String? = null
+    val role: String? = null,
+    val pdfPath: String? = null
 )
 
 // ── Reply draft response ─────────────────────────────────────────────

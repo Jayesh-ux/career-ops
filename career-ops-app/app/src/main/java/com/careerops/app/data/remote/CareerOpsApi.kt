@@ -66,6 +66,9 @@ interface CareerOpsApi {
     @POST("batch")
     suspend fun batchEvaluate(@Body request: BatchRequest): BatchResponse
 
+    @POST("cv/tailor")
+    suspend fun tailorCv(@Body request: TailorCvRequest): TailorCvResponse
+
     // ── AI: Email Drafting ─────────────────────────────────────
     @POST("email/draft")
     suspend fun draftEmail(@Body request: EmailDraftRequest): EmailDraftResponse

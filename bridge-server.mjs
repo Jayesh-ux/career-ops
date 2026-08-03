@@ -690,10 +690,17 @@ async function runOpencode(prompt, timeoutMs = 120000, cwd) {
   // (hallucinated) details when a JD fetch failed. Always use a fresh session.
   const { client, sessionId } = await initOpencode(userId, cwd, true);
 
+  // "Train the spawned opencode": prepend the persistent agent-training context
+  // so every stateless call applies the same portal strategy, multi-user
+  // isolation, Kotlin-backend contracts and HITL guard. Loaded from the user's
+  // tree when present (per-user override), else the shared root copy.
+  const trainingContext = readAgentTraining(cwd);
+  const effectivePrompt = trainingContext ? `${trainingContext}\n\n${prompt}` : prompt;
+
   await client.session.promptAsync({
     path: { id: sessionId },
     body: {
-      parts: [{ type: "text", text: prompt }],
+      parts: [{ type: "text", text: effectivePrompt }],
       model: resolveModelForUser(userId)
     }
   });
@@ -751,6 +758,92 @@ async function runOpencode(prompt, timeoutMs = 120000, cwd) {
 function parseJsonFromOutput(text) {
   const m = text.match(/\{[\s\S]*?\}/);
   return m ? (() => { try { return JSON.parse(m[0]); } catch { return null; } })() : null;
+}
+
+// Robust JSON extraction for NESTED payloads (e.g. the CV render JSON), which
+// the non-greedy first-{..} regex in parseJsonFromOutput truncates at the first
+// closing brace. Prefers an exact parse, then a balanced-brace scan.
+function parseJsonPayload(text) {
+  if (!text) return null;
+  const trimmed = String(text).trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
+  try { return JSON.parse(trimmed); } catch { /* fall through to brace scan */ }
+  const start = trimmed.indexOf('{');
+  if (start === -1) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < trimmed.length; i++) {
+    const ch = trimmed[i];
+    if (esc) { esc = false; continue; }
+    if (ch === '\\') { esc = true; continue; }
+    if (ch === '"') inStr = !inStr;
+    if (inStr) continue;
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) {
+        try { return JSON.parse(trimmed.slice(start, i + 1)); } catch { return null; }
+      }
+    }
+  }
+  return null;
+}
+
+// ── Shared JD contact extraction (recruiter/application emails + phones) ──
+// Used by /auto-pipeline (report + response) and /email/draft (contact hints)
+// so recruiter emails are captured reliably for IMAP outreach and follow-ups.
+const NOISE_EMAIL = /example\.com|\.(png|jpe?g|gif|svg|webp)$|sentry|wixpress|\b(no-?reply|donotreply|do-not-reply|noreply|notifications|updates|bounce|mailer-daemon|postmaster)@|\d+@/i;
+const EMAIL_RE = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+const APP_HINT_RE = /\b(apply|careers?|recruit(er|ing|ment)?|hr|hiring|jobs?|talents?|resume|cv|talent-?acq(uisition)?|join)\b/i;
+const PHONE_RE = /(?:\+?91[\s-]?)?[6-9]\d{4}[\s-]?\d{5}(?!\d)/g;
+
+function extractJdContact(html, pageText) {
+  const raw = `${html || ''}\n${pageText || ''}`;
+  const seen = new Set();
+  const emails = [];
+  for (const m of raw.match(EMAIL_RE) || []) {
+    const e = m.replace(/^mailto:/i, '').toLowerCase().trim();
+    if (seen.has(e)) continue;
+    if (NOISE_EMAIL.test(e)) continue;
+    if (e.length > 60) continue;
+    seen.add(e);
+    emails.push(e);
+  }
+  const app = e => APP_HINT_RE.test(e);
+  emails.sort((a, b) => (app(b) ? 1 : 0) - (app(a) ? 1 : 0));
+  const phones = [...new Set((raw.match(PHONE_RE) || []).map(p => p.replace(/\s+/g, ' ').trim()))].slice(0, 3);
+  return { emails: emails.slice(0, 8), phones, applicationEmails: emails.filter(app).slice(0, 3) };
+}
+
+// Fetch a JD URL and return page text (for the LLM) + extracted contact info.
+async function fetchJdAndContact(url, { textLimit = 6000 } = {}) {
+  const resp = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    signal: AbortSignal.timeout(15000),
+    redirect: 'follow',
+  });
+  const html = resp.ok ? await resp.text() : '';
+  const pageText = html ? html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() : '';
+  return {
+    html,
+    pageText: pageText.slice(0, textLimit),
+    contact: html ? extractJdContact(html, pageText) : { emails: [], phones: [], applicationEmails: [] },
+  };
+}
+
+// Load the persistent agent-training context for spawned opencode calls.
+// Prefers <cwd>/agent-training.md (per-user override), falls back to root.
+function readAgentTraining(cwd) {
+  for (const candidate of [cwd, __dirname]) {
+    if (!candidate) continue;
+    const p = join(candidate, 'agent-training.md');
+    if (existsSync(p)) {
+      try { return readFileSync(p, 'utf-8').trim(); } catch { /* fall through */ }
+    }
+  }
+  return '';
 }
 
 function nextReportNum() {
@@ -1552,10 +1645,19 @@ app.post('/email/send', async (req, res) => {
     }
     // Application emails must carry the CV. When the caller didn't pass a
     // pdfPath, default to the user's generated CV PDF (per-user, then legacy).
+    // A relative pdfPath is resolved against the user's tree (multi-user).
     const defaultCv = req.userCtx?.userDir
       ? join(req.userCtx.userDir, 'output', 'generic-cv.pdf')
       : join(__dirname, 'output', 'generic-cv.pdf');
-    const resolvedPdf = (pdfPath && existsSync(pdfPath)) ? pdfPath : (existsSync(defaultCv) ? defaultCv : undefined);
+    let resolvedPdf;
+    if (pdfPath) {
+      if (existsSync(pdfPath)) {
+        resolvedPdf = pdfPath;
+      } else if (req.userCtx?.userDir && existsSync(join(req.userCtx.userDir, pdfPath))) {
+        resolvedPdf = join(req.userCtx.userDir, pdfPath);
+      }
+    }
+    if (!resolvedPdf && existsSync(defaultCv)) resolvedPdf = defaultCv;
 
     // Determine auth method: per-user OAuth2 > legacy OAuth2 > app password
     const userOAuth = req.userCtx.userId ? getUserOAuth(req.userCtx.userId) : null;
@@ -4070,32 +4172,25 @@ app.post('/email/spam/delete', async (req, res) => {
 app.post('/auto-pipeline', async (req, res) => {
   let evaluation = { score: 'N/A', fit: '', strengths: [], gaps: [] };
   let jdText = '';
+  let contact = { emails: [], phones: [], applicationEmails: [] };
 
   try {
     const { url, company, role } = req.body;
     if (!url) return res.status(400).json({ error: 'url required' });
 
-    // Fetch JD content for opencode context
+    // Fetch JD content + recruiter/application contact info for opencode context
     try {
-      const resp = await fetch(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Cache-Control': 'no-cache',
-          'Upgrade-Insecure-Requests': '1',
-        },
-        signal: AbortSignal.timeout(15000),
-      });
-      if (resp.ok) {
-        const html = await resp.text();
-        jdText = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 8000);
-      }
+      const fetched = await fetchJdAndContact(url, { textLimit: 8000 });
+      jdText = fetched.pageText;
+      contact = fetched.contact;
     } catch { /* fetch failed — opencode will handle it */ }
 
     // Delegate to opencode — the career-ops AI agent
+    const contactContext = (contact.emails.length || contact.phones.length)
+      ? `\nContact info found on the posting page (for the report + outreach): emails=${contact.emails.join(', ')} phones=${contact.phones.join(', ')}`
+      : '';
     const prompt = jdText
-      ? `Evaluate this job posting using career-ops auto-pipeline mode. Return ONLY a JSON object (no markdown, no code fences) with these fields: {"score": "X.X", "fit": "1-2 sentence fit assessment", "strengths": ["s1","s2"], "gaps": ["g1"]}. Score is 1.0-5.0. Be honest and conservative. Job URL: ${url} Company: ${company || 'Unknown'} Role: ${role || 'Unknown'} JD text: ${jdText.slice(0, 6000)}`
+      ? `Evaluate this job posting using career-ops auto-pipeline mode. Return ONLY a JSON object (no markdown, no code fences) with these fields: {"score": "X.X", "fit": "1-2 sentence fit assessment", "strengths": ["s1","s2"], "gaps": ["g1"]}. Score is 1.0-5.0. Be honest and conservative. Job URL: ${url} Company: ${company || 'Unknown'} Role: ${role || 'Unknown'} JD text: ${jdText.slice(0, 6000)}${contactContext}`
       : `Evaluate this job posting using career-ops auto-pipeline mode. IMPORTANT: the job description could NOT be fetched from the URL — do NOT guess or invent any details about salary, location, stack, or requirements. If you cannot evaluate without the JD, return exactly {"score": "N/A", "fit": "JD could not be fetched — cannot evaluate reliably", "strengths": [], "gaps": []}. Never copy details from any other job. Job URL: ${url} Company: ${company || 'Unknown'} Role: ${role || 'Unknown'}`;
 
     const result = await runOpencode(prompt, 120000, userCwd(req));
@@ -4127,6 +4222,9 @@ app.post('/auto-pipeline', async (req, res) => {
   // Save report to user's directory
   if (!existsSync(reportDir)) mkdirSync(reportDir, { recursive: true });
   const reportPath = join(reportDir, `${numStr}-${companySlug}-${today}.md`);
+  const contactLine = (contact.emails.length || contact.phones.length)
+    ? `**Contact:** emails: ${contact.emails.join(', ')}${contact.phones.length ? ` · phones: ${contact.phones.join(', ')}` : ''}`
+    : '**Contact:** not found on posting page';
   const reportContent = `# Evaluation Report #${numStr}
 
 **Company:** ${req.body.company || 'Unknown'}
@@ -4135,6 +4233,7 @@ app.post('/auto-pipeline', async (req, res) => {
 **Date:** ${today}
 **Score:** ${score}/5
 **PDF:** ❌
+${contactLine}
 
 ## Fit Assessment
 ${evaluation.fit || 'N/A'}
@@ -4151,7 +4250,8 @@ ${(evaluation.gaps || []).map(g => `- ${g}`).join('\n') || '- None identified'}
   const additionsDir = userAdditionsDir(req);
   if (!existsSync(additionsDir)) mkdirSync(additionsDir, { recursive: true });
   const tsvPath = join(additionsDir, `${numStr}-${companySlug}.tsv`);
-  const tsvLine = `${numStr}\t${today}\t${req.body.company || 'Unknown'}\t${req.body.role || 'Unknown'}\tEvaluated\t${score}/5\t❌\t[${numStr}](reports/${numStr}-${companySlug}-${today}.md)\tAuto-pipeline (opencode)`;
+  const contactNote = contact.applicationEmails.length ? ` Contact: ${contact.applicationEmails.join(', ')}` : '';
+  const tsvLine = `${numStr}\t${today}\t${req.body.company || 'Unknown'}\t${req.body.role || 'Unknown'}\tEvaluated\t${score}/5\t❌\t[${numStr}](reports/${numStr}-${companySlug}-${today}.md)\tAuto-pipeline (opencode)${contactNote}`;
   writeFileSync(tsvPath, tsvLine + '\n', 'utf-8');
 
   // Run merge-tracker from user dir or root
@@ -4170,6 +4270,8 @@ ${(evaluation.gaps || []).map(g => `- ${g}`).join('\n') || '- None identified'}
     fit: evaluation.fit,
     strengths: evaluation.strengths || [],
     gaps: evaluation.gaps || [],
+    contactEmails: contact.emails || [],
+    contactPhones: contact.phones || [],
   });
 });
 
@@ -4449,27 +4551,19 @@ app.post('/email/draft', async (req, res) => {
     let contactHints = '';
     if (jd && /^https?:\/\//i.test(jd)) {
       try {
-        const resp = await fetch(jd, {
-          headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36' },
-          signal: AbortSignal.timeout(15000),
-          redirect: 'follow',
-        });
-        if (resp.ok) {
-          const html = await resp.text();
-          const pageText = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-          if (pageText.length > 100) {
-            jdContext = `${jdContext}\n\nPosting text: ${pageText.slice(0, 4000)}`;
-          }
-          const emails = (html.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || []).map(e => e.replace(/^mailto:/i, '').toLowerCase());
-          const found = [...new Set(emails.filter(e => !e.includes('example.com') && !e.includes('sentry') && !e.includes('.png') && !e.includes('.jpg')))].slice(0, 5);
-          if (found.length) {
-            contactHints = `Contact emails found on the posting page: ${found.join(', ')}`;
-          }
-          const phonePattern = /(?:\+?91[\s-]?)?[6-9]\d{4}[\s-]?\d{5}(?!\d)/g;
-          const foundPhones = [...new Set((html.match(phonePattern) || []).map(p => p.replace(/\s+/g, ' ').trim()))].slice(0, 3);
-          if (foundPhones.length) {
-            contactHints += `${contactHints ? '\n' : ''}Contact phone numbers found on the posting page: ${foundPhones.join(', ')} — give these to the candidate so they can approach the recruiter manually if needed.`;
-          }
+        const fetched = await fetchJdAndContact(jd, { textLimit: 4000 });
+        if (fetched.pageText.length > 100) {
+          jdContext = `${jdContext}\n\nPosting text: ${fetched.pageText}`;
+        }
+        const { emails, phones, applicationEmails } = fetched.contact;
+        // Prefer application-looking emails (apply/careers/hr/jobs/recruit);
+        // fall back to any email found on the page.
+        const best = applicationEmails.length ? applicationEmails : emails;
+        if (best.length) {
+          contactHints = `Contact emails found on the posting page: ${best.join(', ')}`;
+        }
+        if (phones.length) {
+          contactHints += `${contactHints ? '\n' : ''}Contact phone numbers found on the posting page: ${phones.join(', ')} — give these to the candidate so they can approach the recruiter manually if needed.`;
         }
       } catch { /* fetch failed — the drafter proceeds on the URL alone */ }
     }
@@ -4602,6 +4696,233 @@ app.post('/pdf', async (req, res) => {
     const pdfFiles = existsSync(outputDir) ? readdirSync(outputDir).filter(f => f.endsWith('.pdf')) : [];
     const latest = pdfFiles.sort().pop();
     res.json({ success: true, pdfPath: latest || '', outputDir: 'output/' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /cv/tailor — generate a tailored, ATS-optimized CV PDF for a specific role.
+// Split design (reliable under stateless opencode timeouts — the old design made
+// one agent call run the whole 5-step pipeline and died at the 5-min cap):
+//   Phase A — the bridge gathers ALL context synchronously (fetch JD + contact,
+//     locate the evaluation report, run the zero-LLM jd-skill-gap classifier,
+//     resolve the CV template, inline cv/profile) and hands it to ONE focused
+//     opencode call whose only job is to return the compact render JSON
+//     (modes/pdf.md JSON Input Schema). No commands, no file writes by the agent.
+//   Phase B — the bridge runs the deterministic scripts itself with exact exit
+//     codes: build-cv-html -> verify-cv-facts (hard fact gate) -> generate-pdf.
+// Multi-user: every artifact (jds/, output/) lands in the requesting user's tree.
+// HITL: this only PRODUCES the PDF — sending still goes through /email/send with
+// the user's confirmation.
+app.post('/cv/tailor', async (req, res) => {
+  try {
+    const { url, reportNum, company, role } = req.body;
+    const toolchainDir = __dirname; // scripts + modes + fonts live only here
+    const userDir = userCwd(req);   // per-user execution tree (root = __dirname)
+    const reportDir = userReportDir(req);
+    const profilePath = req.userCtx?.profilePath || join(toolchainDir, 'config', 'profile.yml');
+    const outputDir = join(userDir, 'output');
+
+    if (!url && !reportNum && !company && !role) {
+      return res.status(400).json({ error: 'Provide url, reportNum, or company/role' });
+    }
+
+    // 1) JD text + recruiter contact (inline agent context)
+    let jdText = '';
+    let contact = { emails: [], phones: [], applicationEmails: [] };
+    try {
+      if (url) {
+        const fetched = await fetchJdAndContact(url, { textLimit: 8000 });
+        jdText = fetched.pageText;
+        contact = fetched.contact;
+      }
+    } catch { /* work from the report below */ }
+
+    // 2) Locate the evaluation report to anchor --report and give the agent context
+    let reportFile = '';
+    let reportContent = '';
+    if (existsSync(reportDir)) {
+      const files = readdirSync(reportDir).filter(f => f.endsWith('.md'));
+      const normCompany = String(company || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+      const normRole = String(role || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+      if (reportNum) {
+        reportFile = files.find(f => f.startsWith(String(reportNum).padStart(3, '0') + '-')) || '';
+      } else if (normCompany || normRole) {
+        for (const f of files) {
+          const text = readFileSync(join(reportDir, f), 'utf-8').toLowerCase();
+          if ((normCompany && text.includes(normCompany)) || (normRole && text.includes(normRole))) {
+            reportFile = f;
+            break;
+          }
+        }
+      }
+      if (reportFile) reportContent = readFileSync(join(reportDir, reportFile), 'utf-8');
+    }
+    const reportNumForPdf = reportFile
+      ? parseInt(reportFile.split('-')[0], 10)
+      : (reportNum ? parseInt(String(reportNum), 10) : 0);
+    const companySlug = String(company || (reportFile ? reportFile.slice(4).replace(/\.[^.]+$/, '') : '') || 'role')
+      .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+
+    // Nothing to tailor against — require a JD or a matched report.
+    if (!jdText && !reportContent) {
+      return res.status(400).json({ error: 'No JD text and no evaluation report found — provide url, or a reportNum/company+role that matches an existing report' });
+    }
+
+    // 3) Candidate slug + paper format (a4 unless the JD clearly targets US/Canada)
+    const profile = readUserProfileRaw(req);
+    const candidateName = profile?.candidate?.full_name || profile?.full_name || profile?.name || 'Candidate';
+    const candidate = String(candidateName).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    const sourceForFormat = `${jdText} ${reportContent}`;
+    const format = /\b(US|USA|United States|Canada)\b/i.test(sourceForFormat) && !/\bIndia\b/i.test(sourceForFormat) ? 'letter' : 'a4';
+
+    // 4) Persist the JD into the user's tree so artifacts stay per-user
+    const jdDir = join(userDir, 'jds');
+    if (!existsSync(jdDir)) mkdirSync(jdDir, { recursive: true });
+    const jdFileAbs = join(jdDir, `${companySlug}.md`);
+    writeFileSync(jdFileAbs, `# ${company || companySlug} — ${role || 'Job'}\n\n**Source:** ${url || 'evaluation report'}\n\n${jdText || reportContent}\n`, 'utf-8');
+
+    // 5) Zero-LLM skill-gap classifier (fast, deterministic) -> honest agent context.
+    //    NOTE: only used when it actually found skills — the fetched page text is
+    //    single-line and often yields "0 skills found", which is safer than the
+    //    reflow-based alternative that over-splits capitalized words into false gaps.
+    let skillGapSummary = '';
+    try {
+      const gapScript = join(toolchainDir, 'jd-skill-gap.mjs');
+      if (existsSync(gapScript) && existsSync(join(userDir, 'data', 'cv.md'))) {
+        const gap = spawnSync('node', [gapScript, jdFileAbs, '--summary'], { cwd: join(userDir, 'data'), encoding: 'utf-8', timeout: 15000 });
+        if (gap.status === 0 && /JD skills found:\s*[1-9]/.test(gap.stdout || '')) skillGapSummary = gap.stdout.trim().slice(0, 2000);
+      }
+    } catch { /* non-fatal */ }
+
+    // 6) Resolve the CV template (honors the user's profile override)
+    let templatePath = join(toolchainDir, 'templates', 'cv-template.html');
+    try {
+      const tpl = spawnSync('node', ['cv-templates.mjs', 'resolve', 'cv'], {
+        cwd: toolchainDir,
+        env: { ...process.env, CAREER_OPS_PROFILE: profilePath },
+        encoding: 'utf-8', timeout: 15000,
+      });
+      if (tpl.status === 0 && tpl.stdout.trim()) templatePath = tpl.stdout.trim().split('\n')[0];
+    } catch { /* fall back to the base template */ }
+
+    // 7) ONE focused opencode call per attempt: return ONLY the render JSON
+    //    (no commands/files). If the fact gate (step 8) rejects the rendered CV
+    //    (unsourced metric/claim), re-run the agent with the exact rejected
+    //    claims fed back — the same "stop, fix, re-run until it passes" loop the
+    //    pdf mode prescribes, done here so the deterministic scripts own it.
+    const cvContent = readUserCv(req);
+    const contactCtx = (contact.emails.length || contact.phones.length)
+      ? `\nContact on posting page: emails=${contact.emails.join(', ')} phones=${contact.phones.join(', ')}`
+      : '';
+    const schema = `{
+  "lang": "en",
+  "page_format": "${format}",
+  "candidate": {"name": "...", "phone": "...", "email": "...", "linkedin": {"url":"...","display":"..."}, "portfolio": {"url":"...","display":"..."}, "location": "...", "photo": ""},
+  "sections": {"summary":"Professional Summary","competencies":"Core Competencies","experience":"Work Experience","projects":"Projects","education":"Education","certifications":"Certifications","skills":"Skills"},
+  "summary": "...",
+  "competencies": ["..."],
+  "experience": [{"company":"...","role":"...","location":"...","dates":"...","bullets":["..."]}],
+  "projects": [{"name":"...","badge":"...","tech":"...","description":"..."}],
+  "education": [{"title":"...","org":"...","year":"...","description":"..."}],
+  "certifications": [{"title":"...","org":"...","year":"..."}],
+  "skills": [{"category":"Languages","items":"..."}]
+}`;
+
+    const buildPrompt = (rejectedClaims) => `Tailor a CV for this role and return ONLY the render JSON.
+
+You are the career-ops CV engine. Source of truth — NEVER invent skills, metrics, percentages, or employers:
+CV:\n${cvContent}\n
+Profile (JSON):\n${JSON.stringify(profile, null, 2)}\n
+Role: ${role || 'Unknown'} at ${company || 'Unknown'}
+${url ? `Job URL: ${url}\n` : ''}Job description:\n${(jdText || '(not fetched — use the evaluation report only)').slice(0, 6000)}\n
+Evaluation report:\n${reportContent.slice(0, 2500) || '(none)'}\n
+Skill-gap classifier (jd-skill-gap) — NEVER present gap items as skills the candidate has:\n${skillGapSummary || '(unavailable)'}${contactCtx}\n
+Rules:
+- candidate.name must equal "${candidateName}". Paper format is ${format}.
+- Inject JD keywords into real experience only. Reword honestly — never fabricate numbers, percentages, or employers.
+- competencies: 6-8 keyword phrases drawn only from existing / supported-by-resume skills.
+- Return ONLY one valid JSON object matching exactly this schema — no markdown, no code fences, no commentary, no extra keys:\n${schema}
+${rejectedClaims ? `\nREJECTED BY THE FACT GATE — these claims are NOT in cv.md. Remove every mention of them from the CV (including education/project descriptions). Do not re-insert them:\n${rejectedClaims}` : ''}`;
+
+    // 8) Generate-then-gate loop: agent JSON -> build-cv-html -> verify-cv-facts.
+    //    A gate failure regenerates the payload with the rejected claims fed back.
+    const dataDir = join(userDir, 'data');
+    if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
+    const jsonPath = join(outputDir, `cv-${candidate}-${companySlug}.json`);
+    const htmlAbs = join(outputDir, `cv-${candidate}-${companySlug}.html`);
+    const verifyScript = join(toolchainDir, 'verify-cv-facts.mjs');
+
+    let payload = null;
+    let lastAgentOutput = '';
+    let lastGateError = '';
+    let gateAttempts = 0;
+    const MAX_ATTEMPTS = 3;
+    while (gateAttempts < MAX_ATTEMPTS) {
+      const result = await runOpencode(buildPrompt(lastGateError), 240000, userCwd(req));
+      lastAgentOutput = result;
+      payload = parseJsonPayload(result);
+      if (!payload) { gateAttempts++; continue; } // e.g. opencode warmup — retry
+
+      if (!payload.candidate?.name || !payload.summary || !Array.isArray(payload.experience) || !Array.isArray(payload.skills)) {
+        return res.status(422).json({ error: 'render JSON missing required fields', output: JSON.stringify(payload).slice(0, 1500) });
+      }
+
+      writeFileSync(jsonPath, JSON.stringify(payload, null, 2), 'utf-8');
+      const r1 = spawnSync('node', [join(toolchainDir, 'build-cv-html.mjs'), jsonPath, htmlAbs, templatePath], { cwd: userDir, encoding: 'utf-8', timeout: 30000 });
+      if (r1.status !== 0) {
+        return res.status(500).json({ error: 'build-cv-html failed', stderr: (r1.stderr || r1.stdout || '').slice(0, 1500), htmlPath: `output/cv-${candidate}-${companySlug}.html`, output: result.slice(0, 1000) });
+      }
+
+      if (existsSync(dataDir) && existsSync(verifyScript)) {
+        const r2 = spawnSync('node', [verifyScript, htmlAbs, '--source', 'cv.md'], { cwd: dataDir, encoding: 'utf-8', timeout: 30000 });
+        if (r2.status !== 0) {
+          lastGateError = (r2.stderr || r2.stdout || '').slice(0, 1200);
+          gateAttempts++;
+          if (gateAttempts >= MAX_ATTEMPTS) {
+            return res.status(500).json({ error: 'verify-cv-facts failed (fact gate) after retries', stderr: lastGateError, htmlPath: `output/cv-${candidate}-${companySlug}.html` });
+          }
+          continue; // regenerate the payload with the rejected claims fed back
+        }
+      }
+      break; // fact gate passed
+    }
+    if (!payload) {
+      return res.status(422).json({ error: 'agent returned no valid render JSON after retries', output: lastAgentOutput.slice(0, 2000) });
+    }
+
+    const today = new Date().toISOString().slice(0, 10);
+    // Report-derived slugs already carry the date (011-mthree-2026-08-03.md) —
+    // don't stamp it twice. Bare company slugs still get today's date.
+    const pdfBase = `cv-${candidate}-${companySlug}`;
+    const pdfName = `${pdfBase}${pdfBase.endsWith(`-${today}`) ? '' : `-${today}`}.pdf`;
+    const pdfAbs = join(outputDir, pdfName);
+    // --allow-reorder: build-cv-html's template order is a deliberate design
+    // (modes/pdf.md "Section order") that legitimately differs from cv.md's
+    // order — the guard's job is to catch AGENT scrambling, which cannot happen
+    // here because the template owns the order. --user-dir must be the SPACED
+    // form: generate-pdf detects it via argv.indexOf('--user-dir').
+    const pdfArgs = [join(toolchainDir, 'generate-pdf.mjs'), htmlAbs, pdfAbs, `--format=${format}`, '--allow-reorder'];
+    pdfArgs.push('--user-dir', userDir);
+    if (reportNumForPdf > 0) pdfArgs.push(`--report=${String(reportNumForPdf).padStart(3, '0')}`);
+    const r3 = spawnSync('node', pdfArgs, { cwd: userDir, encoding: 'utf-8', timeout: 90000 });
+    if (r3.status !== 0) {
+      return res.status(500).json({ error: 'generate-pdf failed', stderr: (r3.stderr || '').slice(0, 1500), htmlPath: `output/cv-${candidate}-${companySlug}.html` });
+    }
+    if (!existsSync(pdfAbs)) {
+      return res.status(500).json({ error: 'generate-pdf produced no file', stdout: (r3.stdout || '').slice(0, 1000), htmlPath: `output/cv-${candidate}-${companySlug}.html` });
+    }
+
+    const gapsHint = skillGapSummary ? `\n\nSkill-gap summary:\n${skillGapSummary.slice(0, 800)}` : '';
+    res.json({
+      success: true,
+      pdfPath: `output/${pdfName}`,
+      htmlPath: `output/cv-${candidate}-${companySlug}.html`,
+      reportNum: reportNumForPdf || null,
+      company: company || (reportFile ? reportFile.replace(/^\d+-/, '').replace(/-\d{4}-\d{2}-\d{2}\.md$/, '') : ''),
+      role: role || '',
+      output: `Tailored CV generated for ${role || company}.\n- Format: ${format}\n- Report: ${reportNumForPdf ? String(reportNumForPdf).padStart(3, '0') : 'none'}${gapsHint}`,
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
