@@ -31,6 +31,7 @@ fun ConfirmStartScreen(
     var error by remember { mutableStateOf<String?>(null) }
     var hasResume by remember { mutableStateOf(false) }
     var hasProfile by remember { mutableStateOf(false) }
+    var hasGoogleSession by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         scope.launch {
@@ -43,6 +44,12 @@ fun ConfirmStartScreen(
                 hasProfile = profileComplete
             } catch (e: Exception) {
                 hasProfile = false
+            }
+            try {
+                val st = api.getPortalSessionStatus()
+                hasGoogleSession = (st["googleSession"] as? Boolean) == true
+            } catch (e: Exception) {
+                hasGoogleSession = false
             }
             // Resume is considered uploaded if profile exists (setupUser creates a skeleton cv.md)
             try {
@@ -134,6 +141,7 @@ fun ConfirmStartScreen(
                     SetupCheckItem("Google Account", userPrefs.userEmail.isNotEmpty(), userPrefs.userEmail)
                     SetupCheckItem("Resume", hasResume, if (hasResume) "Uploaded" else "Not uploaded — go back and upload")
                     SetupCheckItem("Profile", hasProfile, if (hasProfile) userPrefs.userName else "Incomplete — go back and fill all fields")
+                    SetupCheckItem("Job Portals (Google session)", hasGoogleSession, if (hasGoogleSession) "Session saved — auto-fill ready" else "Missing — go back and sign in with Google on the portals step")
                     SetupCheckItem("OAuth2 Token", userPrefs.refreshToken.isNotEmpty(), "Configured")
                 }
             }
@@ -167,6 +175,10 @@ fun ConfirmStartScreen(
                         error = "Please go back and complete your profile (name, roles, location, salary)."
                         return@Button
                     }
+                    if (!hasGoogleSession) {
+                        error = "Please go back to the portals step and complete the Google sign-in — Chat opens only after every dependency is ready."
+                        return@Button
+                    }
                     scope.launch {
                         try {
                             userPrefs.isOnboarded = true
@@ -179,7 +191,7 @@ fun ConfirmStartScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(56.dp),
-                enabled = hasResume && hasProfile
+                enabled = hasResume && hasProfile && hasGoogleSession
             ) {
                 Text("Confirm & Start", fontSize = 16.sp)
             }

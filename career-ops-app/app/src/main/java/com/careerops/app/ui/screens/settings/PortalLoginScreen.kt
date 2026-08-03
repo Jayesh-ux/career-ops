@@ -158,9 +158,9 @@ fun PortalLoginScreen(
                 Column(modifier = Modifier.padding(12.dp)) {
                     Text(
                         if (inOnboarding)
-                            "Almost done — one Google sign-in unlocks every job portal (Internshala, Naukri, Shine, …). " +
-                            "Choose your account below or on the screen — no password needed for accounts already signed in. " +
-                            "You can skip this for now and do it later from Settings → Portal Logins."
+                            "Almost done — this one Google sign-in unlocks every job portal (Internshala, Naukri, Shine, …) " +
+                            "so auto-fill works everywhere. Choose your account below or on the screen — no password needed for " +
+                            "accounts already signed in. Chat opens only after this step is complete."
                         else
                             "Sign in once with Google here. Your session is saved to this device and " +
                             "reused automatically for every future auto-fill (Internshala, Naukri, Shine, ...). " +
@@ -347,12 +347,11 @@ fun PortalLoginScreen(
             if (inOnboarding && !finished) {
                 OutlinedButton(
                     onClick = {
-                        scope.launch { try { api.finishLoginSession() } catch (_: Exception) {} }
-                        onClose()
+                        error = "This step is required before you can start job search. Sign in with Google above, or use the back arrow to go back."
                     },
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("Skip for now — I'll do this later")
+                    Text("I'll do this later")
                 }
             }
         }

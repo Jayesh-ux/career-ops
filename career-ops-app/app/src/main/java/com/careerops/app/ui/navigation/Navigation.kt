@@ -67,17 +67,20 @@ private suspend fun hasOnboardedProfile(api: CareerOpsApi, userPrefs: UserPrefs)
  *
  * Fresh users continue the onboarding chain (resume → profile → portal).
  * Existing users with no saved Google portal session are routed through the
- * skipable portal step until a session is captured; once saved (or if the
- * status check fails), they go straight to Chat.
+ * portal step until a session is captured. Chat opens ONLY when every
+ * dependency (Google account, resume, profile, portal session) is resolved —
+ * an unreachable bridge never fail-opens straight to Chat.
  */
 private suspend fun nextRouteAfterAuth(api: CareerOpsApi, userPrefs: UserPrefs): String {
     if (!hasOnboardedProfile(api, userPrefs)) return Routes.ONBOARDING_RESUME
-    return try {
+    val googleSessionReady = try {
         val st = api.getPortalSessionStatus()
-        if ((st["googleSession"] as? Boolean) == true) Routes.CHAT else Routes.ONBOARDING_PORTAL
+        (st["googleSession"] as? Boolean) == true
     } catch (_: Exception) {
-        Routes.CHAT // fail-open: never block the user
+        false // bridge unreachable — route through portal step, never straight to Chat
     }
+    return if (googleSessionReady) Routes.CHAT
+    else "${Routes.ONBOARDING_PORTAL}?next=${Routes.CHAT}"
 }
 
 @Composable
