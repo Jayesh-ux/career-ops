@@ -6578,7 +6578,11 @@ function parseGoogleCookieString(cookieString) {
 
 app.post('/login/session/seed', (req, res) => {
   try {
-    const userDir = req.userCtx?.userDir || __dirname;
+    // Cookies must land in the right user's dir — never fall back to root.
+    if (!req.userCtx?.userId || !req.userCtx?.userDir) {
+      return res.status(400).json({ success: false, error: 'X-User-Id header required' });
+    }
+    const userDir = req.userCtx.userDir;
     const body = req.body || {};
     const raw = body.cookieString || body.cookies || '';
     const cookies = typeof raw === 'string' ? parseGoogleCookieString(raw) : raw;

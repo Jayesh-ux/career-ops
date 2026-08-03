@@ -10,6 +10,7 @@ import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import java.util.LinkedHashMap
 
 class GoogleOAuthActivity : Activity() {
 
@@ -20,6 +21,32 @@ class GoogleOAuthActivity : Activity() {
             return Intent(context, GoogleOAuthActivity::class.java).apply {
                 putExtra(EXTRA_AUTH_URL, authUrl)
             }
+        }
+
+        /**
+         * Collect the Google session cookies the WebView just minted. Each host
+         * query only returns cookies scoped to that URL (host-only cookies like
+         * `__Secure-1PSID` on google.com are invisible from accounts.google.com),
+         * so probe several hosts and merge by name.
+         */
+        private fun captureGoogleCookies(): String {
+            val hosts = listOf(
+                "https://accounts.google.com",
+                "https://google.com",
+                "https://www.google.com"
+            )
+            val merged = LinkedHashMap<String, String>()
+            for (host in hosts) {
+                val cookies = CookieManager.getInstance().getCookie(host).orEmpty()
+                for (pair in cookies.split("; ")) {
+                    val idx = pair.indexOf('=')
+                    if (idx <= 0) continue
+                    val name = pair.substring(0, idx).trim()
+                    val value = pair.substring(idx + 1).trim()
+                    if (name.isNotEmpty() && value.isNotEmpty()) merged.putIfAbsent(name, value)
+                }
+            }
+            return merged.entries.joinToString("; ") { "${it.key}=${it.value}" }
         }
     }
 
@@ -46,24 +73,25 @@ class GoogleOAuthActivity : Activity() {
                         val code = uri.getQueryParameter("code")
                         val error = uri.getQueryParameter("error")
 
-                        val resultIntent = Intent().apply {
-                            if (!code.isNullOrEmpty()) {
-                                putExtra("auth_code", code)
-                                setResult(Activity.RESULT_OK, this)
-                            } else {
-                                putExtra("auth_error", error ?: "Authorization failed")
-                                setResult(Activity.RESULT_CANCELED, this)
-                            }
+                        val resultIntent = Intent()
+                        if (code.isNullOrEmpty()) {
+                            resultIntent.putExtra("auth_error", error ?: "Authorization failed")
+                        } else {
+                            resultIntent.putExtra("auth_code", code)
                         }
                         // Let the Google session cookies settle, then grab them
                         // so the same login can seed the Playwright profile
                         // (one login powers IMAP + portal auto-fill).
                         view?.postDelayed({
-                            val cookies = CookieManager.getInstance()
-                                .getCookie("https://accounts.google.com").orEmpty()
-                            resultIntent.putExtra("google_cookies", cookies)
-                            setResultActivity(resultIntent)
-                        }, 1000L)
+                            if (!code.isNullOrEmpty()) {
+                                val cookies = captureGoogleCookies()
+                                if (cookies.isNotEmpty()) {
+                                    resultIntent.putExtra("google_cookies", cookies)
+                                }
+                            }
+                            setResult(Activity.RESULT_OK, resultIntent)
+                            finish()
+                        }, 1500L)
                         return true
                     }
 
@@ -75,10 +103,5 @@ class GoogleOAuthActivity : Activity() {
 
         setContentView(webView)
         webView.loadUrl(authUrl)
-    }
-
-    private fun setResultActivity(resultIntent: Intent) {
-        setResult(RESULT_OK, resultIntent)
-        finish()
     }
 }

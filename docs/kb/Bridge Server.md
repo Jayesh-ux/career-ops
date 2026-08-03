@@ -21,8 +21,9 @@ header.
   requesting user.
 - Own Google OAuth tokens for **IMAP email** (`getUserOAuth`/`setUserOAuth`).
 - Own the **seeded portal session**: `POST /login/session/seed` stores the
-  WebView session cookies per-user at `<userDir>/google-cookies.json`, which
-  `seed-cookies.mjs` injects into every Playwright spawn.
+  WebView session cookies per-user at `<userDir>/google-cookies.json` (requires
+  `X-User-Id`; rejected without it), which `seed-cookies.mjs` injects into every
+  Playwright spawn.
 - Read the **seeded cookie file + persisted Playwright cookie DB** for portal
   session status (`GET /portal/session/status`) — no browser launch needed.
 - Serve the user session for end-user agent chats via the `opencode serve`

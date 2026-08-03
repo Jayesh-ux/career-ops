@@ -106,6 +106,18 @@ fun CareerOpsNavHost(
     ) {
         composable(Routes.ONBOARDING_GOOGLE) {
             var oauthError by remember { mutableStateOf<String?>(null) }
+            // Cookies captured from the WebView login. Seeded only AFTER the
+            // OAuth exchange resolves userEmail — otherwise the seed POST goes
+            // out without X-User-Id and lands in the wrong user dir.
+            var pendingCookies by remember { mutableStateOf("") }
+
+            suspend fun seedPendingCookies() {
+                val cs = pendingCookies
+                if (cs.isNotBlank()) {
+                    try { api.seedLoginSession(mapOf("cookieString" to cs)) } catch (_: Exception) { }
+                    pendingCookies = ""
+                }
+            }
 
             GoogleSignInScreen(
                 oauthError = oauthError,
@@ -125,6 +137,7 @@ fun CareerOpsNavHost(
                                 Log.d(TAG, "ID token verify: success=${resp.success}, email=${resp.email}, hasGmailAuth=${resp.hasGmailAuth}")
                                 if (resp.success) {
                                     userPrefs.userEmail = resp.email
+                                    seedPendingCookies()
                                     if (resp.hasGmailAuth) {
                                         // Already has Gmail access — done
                                         scope.launch(Dispatchers.Main) {
@@ -156,6 +169,9 @@ fun CareerOpsNavHost(
                                     if (!resolvedEmail.isNullOrEmpty()) {
                                         userPrefs.userEmail = resolvedEmail
                                     }
+                                    // Seed the portal session NOW that the user
+                                    // id is known (X-User-Id is present).
+                                    seedPendingCookies()
                                     scope.launch(Dispatchers.Main) {
                                         val next = nextRouteAfterAuth(api, userPrefs)
                                         navController.navigate(next) {
@@ -174,15 +190,8 @@ fun CareerOpsNavHost(
                 },
                 onSignInError = { oauthError = it },
                 onSessionCookies = { cookieString ->
-                    if (cookieString.isNotBlank()) {
-                        // Best-effort: seed the Playwright profile so the SAME
-                        // login powers portal auto-fill. Never blocks IMAP auth.
-                        scope.launch(Dispatchers.IO) {
-                            try {
-                                api.seedLoginSession(mapOf("cookieString" to cookieString))
-                            } catch (_: Exception) { }
-                        }
-                    }
+                    // Defer seeding until the exchange has set userPrefs.userEmail.
+                    if (cookieString.isNotBlank()) pendingCookies = cookieString
                 }
             )
         }
