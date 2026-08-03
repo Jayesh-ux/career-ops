@@ -164,7 +164,18 @@ fun CareerOpsNavHost(
                         }
                     }
                 },
-                onSignInError = { oauthError = it }
+                onSignInError = { oauthError = it },
+                onSessionCookies = { cookieString ->
+                    if (cookieString.isNotBlank()) {
+                        // Best-effort: seed the Playwright profile so the SAME
+                        // login powers portal auto-fill. Never blocks IMAP auth.
+                        scope.launch(Dispatchers.IO) {
+                            try {
+                                api.seedLoginSession(mapOf("cookieString" to cookieString))
+                            } catch (_: Exception) { }
+                        }
+                    }
+                }
             )
         }
 

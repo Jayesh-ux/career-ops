@@ -202,6 +202,9 @@ interface CareerOpsApi {
     @POST("login/session/finish")
     suspend fun finishLoginSession(): Map<String, Any>
 
+    @POST("login/session/seed")
+    suspend fun seedLoginSession(@Body body: Map<String, Any>): Map<String, Any>
+
     @GET("portal/session/status")
     suspend fun getPortalSessionStatus(): Map<String, Any>
 

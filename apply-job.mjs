@@ -17,6 +17,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSy
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
+import { seedGoogleCookies, stealthInitScript } from './seed-cookies.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -1229,6 +1230,13 @@ async function main() {
     }
 
     const page = await context.newPage();
+
+    // Seed the Google session captured from the app's one-time WebView login
+    // (google-cookies.json), and hide Playwright automation markers so Google
+    // and portals don't flag the browser.
+    try { await context.addInitScript(stealthInitScript()); } catch {}
+    const seeded = await seedGoogleCookies(context, userDir);
+    if (seeded) console.error(`[seed] applied ${seeded} google cookies`);
 
     // Navigate with timeout
     try {

@@ -31,7 +31,8 @@ private const val WEB_CLIENT_ID = "221656652451-5cb11e7qhkkngdjbs6emaiqidt4a93dr
 fun GoogleSignInScreen(
     oauthError: String? = null,
     onSignInSuccess: (email: String, authToken: String) -> Unit,
-    onSignInError: (String) -> Unit
+    onSignInError: (String) -> Unit,
+    onSessionCookies: (String) -> Unit = {}
 ) {
     val context = LocalContext.current
     var isLoading by remember { mutableStateOf(false) }
@@ -57,10 +58,13 @@ fun GoogleSignInScreen(
         isLoading = false
         if (result.resultCode == Activity.RESULT_OK) {
             val code = result.data?.getStringExtra("auth_code")
+            val googleCookies = result.data?.getStringExtra("google_cookies").orEmpty()
             if (!code.isNullOrEmpty()) {
                 // Email may be unknown (standalone "Use browser sign-in" flow).
                 // The bridge resolves the real email from the ID token.
                 onSignInSuccess(pendingGmailEmail.orEmpty(), code)
+                // The WebView's Google session cookies power portal auto-fill.
+                if (googleCookies.isNotEmpty()) onSessionCookies(googleCookies)
             } else {
                 onSignInError("Authorization failed.")
             }

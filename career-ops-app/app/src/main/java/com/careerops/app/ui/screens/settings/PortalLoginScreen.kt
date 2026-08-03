@@ -1,8 +1,11 @@
 package com.careerops.app.ui.screens.settings
 
+import android.app.Activity
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.Base64
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -21,21 +24,27 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.careerops.app.GoogleOAuthActivity
 import com.careerops.app.data.remote.CareerOpsApi
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
+private const val WEB_CLIENT_ID = "221656652451-5cb11e7qhkkngdjbs6emaiqidt4a93dr.apps.googleusercontent.com"
+
 /**
- * One-time interactive portal/Google login.
+ * One-time Google login for portals — user-friendly first.
  *
- * Renders a live screenshot of the persistent browser profile (driven by the
- * bridge's login-session.mjs) so the user can sign in with Google ONCE. The
- * session cookies are saved into the profile and reused by every future
- * auto-fill run. Supports tap, typing, back, and URL navigation.
+ * The SAME login the user already did for Gmail/IMAP also leaves browser
+ * session cookies in the app's WebView. This screen reuses that: it checks the
+ * saved session and, if present, just confirms it (zero extra steps). If not,
+ * it offers a single "Sign in with Google" button that runs the familiar WebView
+ * login and captures the cookies. The raw in-app browser is hidden behind an
+ * "Advanced" toggle for troubleshooting / power users.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -47,6 +56,7 @@ fun PortalLoginScreen(
     onClose: () -> Unit = {},
     inOnboarding: Boolean = false
 ) {
+    val context = LocalContext.current
     var screenshotB64 by remember { mutableStateOf("") }
     var liveUrl by remember { mutableStateOf("") }
     var liveTitle by remember { mutableStateOf("") }
@@ -65,6 +75,9 @@ fun PortalLoginScreen(
     var navText by remember { mutableStateOf(startUrl) }
     var displayedWidth by remember { mutableStateOf(0) }
     var displayedHeight by remember { mutableStateOf(0) }
+    var alreadyConnected by remember { mutableStateOf(false) }
+    var showAdvanced by remember { mutableStateOf(false) }
+    var sessionOpen by remember { mutableStateOf(false) }
 
     val scope = rememberCoroutineScope()
     val pageW = 1280f
@@ -78,26 +91,41 @@ fun PortalLoginScreen(
         } catch (_: Exception) { null }
     }
 
-    // Start the session once, then poll the live frame.
-    LaunchedEffect(api) {
-        loading = true
-        try {
-            val opened = api.openLoginSession(mapOf("url" to startUrl))
-            if ((opened["success"] as? Boolean) == true) {
-                error = ""
-            } else {
-                error = opened["error"] as? String ?: "Could not start browser session"
+    fun refreshConnection() {
+        scope.launch {
+            try {
+                val st = api.getPortalSessionStatus()
+                alreadyConnected = (st["googleSession"] as? Boolean) == true
+                error = if (alreadyConnected) "" else "Not connected yet — tap “Sign in with Google” to connect."
+            } catch (e: Exception) {
+                error = e.message ?: "Could not reach the server. Check that career-ops is running and try again."
             }
-        } catch (e: Exception) {
-            error = e.message ?: "Could not reach the bridge server"
+        }
+    }
+
+    // One login powers both IMAP and portals: if the WebView OAuth already
+    // seeded a Google session, there is nothing to do — just confirm & continue.
+    LaunchedEffect(api) {
+        try {
+            val st = api.getPortalSessionStatus()
+            if ((st["googleSession"] as? Boolean) == true) {
+                alreadyConnected = true
+                loading = false
+                return@LaunchedEffect
+            }
+            error = "Connect your job portals so applications can be auto-filled for you."
+        } catch (_: Exception) {
+            error = "Could not reach the server. Check that career-ops is running and try again."
         }
         loading = false
     }
 
+    // Poll the live frame only while the in-app browser session is open.
     LaunchedEffect(api) {
         while (isActive) {
             delay(1600)
-            if (finished) break
+            if (finished || alreadyConnected) break
+            if (!sessionOpen) continue
             try {
                 val st = api.getLoginSessionState()
                 if (st["success"] == true) {
@@ -110,12 +138,11 @@ fun PortalLoginScreen(
                     hasGaps = (st["hasGaps"] as? Boolean) == true
                     onGoogleAuth = (st["onGoogleAuth"] as? Boolean) == true
                     accounts = (st["accounts"] as? List<*>)?.mapNotNull { it as? String } ?: emptyList()
-                    error = ""
-                } else {
+                    if (error == "Not connected yet — tap “Sign in with Google” to connect.") error = ""
+                } else if (!error.startsWith("Not connected") && !error.startsWith("Could not reach")) {
                     error = st["error"] as? String ?: error
                 }
             } catch (_: Exception) { /* transient — keep polling */ }
-            loading = false
         }
     }
 
@@ -136,6 +163,61 @@ fun PortalLoginScreen(
         }
     }
 
+    fun openBrowserFallback() {
+        scope.launch {
+            loading = true
+            try {
+                val opened = api.openLoginSession(mapOf("url" to startUrl))
+                if ((opened["success"] as? Boolean) == true) {
+                    sessionOpen = true
+                    error = ""
+                } else {
+                    error = opened["error"] as? String ?: "Could not start browser"
+                }
+            } catch (e: Exception) {
+                error = e.message ?: "Could not reach the server"
+            }
+            loading = false
+        }
+    }
+
+    // The one-tap path: run the familiar WebView Google login. Its session
+    // cookies are extracted and seeded to the Playwright profile by the
+    // GoogleOAuthActivity, so portals connect with the same login as IMAP.
+    val oauthLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val cookies = result.data?.getStringExtra("google_cookies").orEmpty()
+            scope.launch {
+                if (cookies.isNotEmpty()) {
+                    try { api.seedLoginSession(mapOf("cookieString" to cookies)) } catch (_: Exception) {}
+                }
+                try {
+                    val st = api.getPortalSessionStatus()
+                    alreadyConnected = (st["googleSession"] as? Boolean) == true
+                    error = if (alreadyConnected) "" else "Couldn't confirm the session yet. Tap “Sign in with Google” again, or use the in-app browser below."
+                } catch (e: Exception) {
+                    error = e.message ?: "Could not reach the server"
+                }
+            }
+        } else {
+            error = "Google sign-in was cancelled. Try again, or use the in-app browser below."
+        }
+    }
+
+    fun launchGoogleSignIn() {
+        val authUri = "https://accounts.google.com/o/oauth2/v2/auth?" +
+            "client_id=$WEB_CLIENT_ID&" +
+            "redirect_uri=https://career-ops.app&" +
+            "response_type=code&" +
+            "scope=openid email https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly&" +
+            "access_type=offline&" +
+            "prompt=select_account"
+        val intent = GoogleOAuthActivity.createIntent(context, authUri)
+        oauthLauncher.launch(intent)
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -154,204 +236,223 @@ fun PortalLoginScreen(
                 .padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+            // ── Already connected (one-login-for-both) ──
+            if (alreadyConnected) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF2E7D32))
+                ) {
+                    Row(
+                        modifier = Modifier.padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Default.CheckCircle, null, tint = Color.White)
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Column {
+                            Text("Portals connected!", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                            Text(
+                                "Your Google login is saved — Internshala, Naukri, Shine & more will auto-fill your applications.",
+                                color = Color.White, fontSize = 12.sp, lineHeight = 16.sp
+                            )
+                        }
+                    }
+                }
+                Button(
+                    onClick = onDone,
+                    modifier = Modifier.fillMaxWidth().height(56.dp)
+                ) {
+                    Text("Continue", fontSize = 16.sp)
+                }
+                return@Column
+            }
+
+            // ── One-tap connect ──
             Card(modifier = Modifier.fillMaxWidth()) {
-                Column(modifier = Modifier.padding(12.dp)) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text("Connect your job portals", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                    Spacer(modifier = Modifier.height(6.dp))
                     Text(
                         if (inOnboarding)
-                            "Almost done — this one Google sign-in unlocks every job portal (Internshala, Naukri, Shine, …) " +
-                            "so auto-fill works everywhere. Choose your account below or on the screen — no password needed for " +
-                            "accounts already signed in. Chat opens only after this step is complete."
+                            "One Google login powers your emails AND auto-fill on Internshala, Naukri, Shine & more. " +
+                            "Tap below — no password needed again."
                         else
-                            "Sign in once with Google here. Your session is saved to this device and " +
-                            "reused automatically for every future auto-fill (Internshala, Naukri, Shine, ...). " +
-                            "Tap an account below to sign in instantly (like the Gmail account picker), or tap the screen to interact.",
+                            "Reconnect your Google login so applications can be auto-filled on Internshala, Naukri, Shine & more.",
                         fontSize = 13.sp, lineHeight = 18.sp
                     )
-                    if (hasGoogle) {
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text("✓ Google sign-in detected on this page — tap it.", fontSize = 12.sp, color = Color(0xFF2E7D32))
-                    }
-                    when {
-                        googleSignedIn -> {
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                "✅ Google signed in. Complete any consent (Continue/Allow) if asked, then tap “I'm logged in — Save session”.",
-                                fontSize = 12.sp, color = Color(0xFF2E7D32)
-                            )
-                        }
-                        onGoogleAuth -> {
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                if (accounts.isNotEmpty())
-                                    "⚠️ Google is NOT signed in yet. Tap the account you want above, then complete any password/verification steps until the status turns green."
-                                else
-                                    "⚠️ On Google's sign-in page — Google is NOT signed in yet. Tap the email field, type it, continue, type your password, and complete any verification, all the way to the end.",
-                                fontSize = 12.sp, color = Color(0xFFB26A00)
-                            )
-                        }
-                        hasGaps && !googleSignedIn -> {
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                "⚠️ Partial Google session only — not fully signed in. Keep going through the sign-in until the status turns green.",
-                                fontSize = 12.sp, color = Color(0xFFB26A00)
-                            )
-                        }
-                        formVisible && liveUrl.contains("google") -> {
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text("✓ On Google's sign-in page. Enter your Google credentials to continue.", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
-                        }
-                    }
-                }
-            }
-
-            if (error.isNotBlank()) {
-                Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
-                    Text(error, modifier = Modifier.padding(12.dp), color = MaterialTheme.colorScheme.onErrorContainer, fontSize = 13.sp)
-                }
-            }
-
-            // Tap-to-sign-in account chips (Google account chooser)
-            if (accounts.isNotEmpty() && !googleSignedIn) {
-                Card(modifier = Modifier.fillMaxWidth()) {
-                    Column(
-                        modifier = Modifier.padding(12.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    Spacer(modifier = Modifier.height(14.dp))
+                    Button(
+                        onClick = { launchGoogleSignIn() },
+                        modifier = Modifier.fillMaxWidth().height(52.dp)
                     ) {
-                        Text("Choose an account", fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                        accounts.forEach { acc ->
-                            OutlinedButton(
-                                onClick = {
-                                    scope.launch {
-                                        try {
-                                            val r = api.loginSessionAccount(mapOf("email" to acc))
-                                            screenshotB64 = r["screenshot"] as? String ?: screenshotB64
-                                        } catch (_: Exception) {}
-                                    }
-                                },
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Icon(Icons.Default.Person, null, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(acc, maxLines = 1)
-                            }
-                        }
+                        Icon(Icons.Default.Person, null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Sign in with Google", fontSize = 15.sp)
+                    }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    TextButton(
+                        onClick = {
+                            showAdvanced = !showAdvanced
+                            if (showAdvanced) openBrowserFallback()
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
                         Text(
-                            "Tap an account to sign in — no password needed if its session is still valid. " +
-                            "Accounts not shown here need a one-time email + password login.",
-                            fontSize = 11.sp, lineHeight = 15.sp, color = MaterialTheme.colorScheme.outline
+                            if (showAdvanced) "Hide the in-app browser" else "Trouble signing in? Use the in-app browser",
+                            fontSize = 12.sp
                         )
                     }
                 }
             }
 
-            // Live browser frame
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .aspectRatio(pageW / pageH)
-                    .background(Color(0xFF111111))
-                    .onSizeChanged { displayedWidth = it.width; displayedHeight = it.height }
-                    .pointerInput(bmp) {
-                        detectTapGestures { offset -> applyTap(offset) }
-                    },
-                contentAlignment = Alignment.Center
-            ) {
-                val image = bmp
-                if (image != null) {
-                    Image(
-                        bitmap = image.asImageBitmap(),
-                        contentDescription = "Live portal login view",
-                        modifier = Modifier.fillMaxSize()
+            if (error.isNotBlank()) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
+                ) {
+                    Text(
+                        error,
+                        modifier = Modifier.padding(12.dp),
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        fontSize = 13.sp
                     )
-                } else if (loading) {
-                    CircularProgressIndicator()
-                } else {
-                    Text("Waiting for browser…", color = Color.White, fontSize = 13.sp)
                 }
             }
 
-            Text("Page: ${liveTitle.ifEmpty { "…" }}", fontSize = 11.sp, color = MaterialTheme.colorScheme.outline, maxLines = 1)
-            Text(liveUrl, fontSize = 11.sp, color = MaterialTheme.colorScheme.outline, maxLines = 1)
-
-            // Navigation controls
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                OutlinedButton(onClick = {
-                    scope.launch {
-                        try { val r = api.loginSessionBack(); screenshotB64 = r["screenshot"] as? String ?: screenshotB64 } catch (_: Exception) {}
+            // ── Advanced: live in-app browser (troubleshooting / power users) ──
+            if (showAdvanced) {
+                if (loading) {
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        Row(
+                            modifier = Modifier.padding(16.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Text("Opening the in-app browser…", fontSize = 13.sp)
+                        }
                     }
-                }) { Icon(Icons.Default.ArrowBack, null, modifier = Modifier.size(16.dp)); Text(" Back") }
-                OutlinedTextField(
-                    value = navText, onValueChange = { navText = it },
-                    label = { Text("URL") }, modifier = Modifier.weight(1f), singleLine = true
-                )
-                Button(onClick = {
-                    scope.launch {
-                        try {
-                            val r = api.loginSessionNavigate(mapOf("url" to navText.trim()))
-                            screenshotB64 = r["screenshot"] as? String ?: screenshotB64
-                            liveUrl = r["url"] as? String ?: liveUrl
-                        } catch (_: Exception) {}
-                    }
-                }) { Text("Go") }
-            }
+                }
 
-            // Typing (for passwords / email)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                OutlinedTextField(
-                    value = typingText, onValueChange = { typingText = it },
-                    label = { Text("Type into focused field (e.g. password)") },
-                    modifier = Modifier.weight(1f), singleLine = true
-                )
-                Button(onClick = {
-                    scope.launch {
-                        try {
-                            val r = api.loginSessionType(mapOf("text" to typingText))
-                            screenshotB64 = r["screenshot"] as? String ?: screenshotB64
-                        } catch (_: Exception) {}
-                    }
-                }, enabled = typingText.isNotEmpty()) { Text("Type") }
-            }
-
-            Button(
-                onClick = {
-                    scope.launch {
-                        saving = true
-                        try {
-                            val r = api.finishLoginSession()
-                            finished = true
-                            val google = (r["googleSession"] as? Boolean) == true
-                            val count = r["cookieCount"] as? Number ?: 0
-                            if (google) {
-                                error = ""
-                                onDone()
-                            } else {
-                                error = if ((count as? Int ?: 0) > 0) {
-                                    "Session saved (${count} cookies) but no Google session cookie detected. Sign in with Google first."
-                                } else {
-                                    "No cookies saved — sign in before finishing."
+                // Tap-to-sign-in account chips (Google account chooser)
+                if (accounts.isNotEmpty() && !googleSignedIn) {
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text("Choose an account", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            accounts.forEach { acc ->
+                                OutlinedButton(
+                                    onClick = {
+                                        scope.launch {
+                                            try {
+                                                val r = api.loginSessionAccount(mapOf("email" to acc))
+                                                screenshotB64 = r["screenshot"] as? String ?: screenshotB64
+                                            } catch (_: Exception) {}
+                                        }
+                                    },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Icon(Icons.Default.Person, null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(acc, maxLines = 1)
                                 }
                             }
-                        } catch (e: Exception) {
-                            error = e.message ?: "Finish failed"
                         }
-                        saving = false
                     }
-                },
-                enabled = !saving && !finished,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                if (saving) CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                else Text("I'm logged in — Save session")
-            }
+                }
 
-            if (inOnboarding && !finished) {
-                OutlinedButton(
+                // Live browser frame
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(pageW / pageH)
+                        .background(Color(0xFF111111))
+                        .onSizeChanged { displayedWidth = it.width; displayedHeight = it.height }
+                        .pointerInput(bmp) {
+                            detectTapGestures { offset -> applyTap(offset) }
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    val image = bmp
+                    if (image != null) {
+                        Image(
+                            bitmap = image.asImageBitmap(),
+                            contentDescription = "Live portal login view",
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    } else {
+                        Text("Waiting for browser…", color = Color.White, fontSize = 13.sp)
+                    }
+                }
+
+                Text("Page: ${liveTitle.ifEmpty { "…" }}", fontSize = 11.sp, color = MaterialTheme.colorScheme.outline, maxLines = 1)
+                Text(liveUrl, fontSize = 11.sp, color = MaterialTheme.colorScheme.outline, maxLines = 1)
+
+                // Navigation controls
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedButton(onClick = {
+                        scope.launch {
+                            try { val r = api.loginSessionBack(); screenshotB64 = r["screenshot"] as? String ?: screenshotB64 } catch (_: Exception) {}
+                        }
+                    }) { Icon(Icons.Default.ArrowBack, null, modifier = Modifier.size(16.dp)); Text(" Back") }
+                    OutlinedTextField(
+                        value = navText, onValueChange = { navText = it },
+                        label = { Text("URL") }, modifier = Modifier.weight(1f), singleLine = true
+                    )
+                    Button(onClick = {
+                        scope.launch {
+                            try {
+                                val r = api.loginSessionNavigate(mapOf("url" to navText.trim()))
+                                screenshotB64 = r["screenshot"] as? String ?: screenshotB64
+                                liveUrl = r["url"] as? String ?: liveUrl
+                            } catch (_: Exception) {}
+                        }
+                    }) { Text("Go") }
+                }
+
+                // Typing (for passwords / email)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(
+                        value = typingText, onValueChange = { typingText = it },
+                        label = { Text("Type into focused field (e.g. password)") },
+                        modifier = Modifier.weight(1f), singleLine = true
+                    )
+                    Button(onClick = {
+                        scope.launch {
+                            try {
+                                val r = api.loginSessionType(mapOf("text" to typingText))
+                                screenshotB64 = r["screenshot"] as? String ?: screenshotB64
+                            } catch (_: Exception) {}
+                        }
+                    }, enabled = typingText.isNotEmpty()) { Text("Type") }
+                }
+
+                Button(
                     onClick = {
-                        error = "This step is required before you can start job search. Sign in with Google above, or use the back arrow to go back."
+                        scope.launch {
+                            saving = true
+                            try {
+                                val r = api.finishLoginSession()
+                                finished = true
+                                val google = (r["googleSession"] as? Boolean) == true
+                                if (google) {
+                                    error = ""
+                                    onDone()
+                                } else {
+                                    error = "No Google session detected. Sign in with Google first."
+                                }
+                            } catch (e: Exception) {
+                                error = e.message ?: "Finish failed"
+                            }
+                            saving = false
+                        }
                     },
+                    enabled = !saving && !finished,
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("I'll do this later")
+                    if (saving) CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    else Text("I'm logged in — Save session")
                 }
             }
         }

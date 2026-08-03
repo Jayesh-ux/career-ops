@@ -25,6 +25,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
 import http from 'http';
+import { seedGoogleCookies, stealthInitScript } from './seed-cookies.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -344,6 +345,13 @@ async function main() {
     permissions: ['geolocation'],
   });
   browser = context.browser();
+
+  // Seed the Google session captured from the app's one-time WebView login,
+  // and hide Playwright automation markers so Google doesn't flag the browser.
+  try { await context.addInitScript(stealthInitScript()); } catch {}
+  const seeded = await seedGoogleCookies(context, userDir);
+  if (seeded) console.log(`[seed] applied ${seeded} google cookies`);
+
   attachPopupHandling();
   page = context.pages()[0] || await context.newPage();
 

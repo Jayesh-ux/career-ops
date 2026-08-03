@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -54,7 +55,15 @@ class GoogleOAuthActivity : Activity() {
                                 setResult(Activity.RESULT_CANCELED, this)
                             }
                         }
-                        setResultActivity(resultIntent)
+                        // Let the Google session cookies settle, then grab them
+                        // so the same login can seed the Playwright profile
+                        // (one login powers IMAP + portal auto-fill).
+                        view?.postDelayed({
+                            val cookies = CookieManager.getInstance()
+                                .getCookie("https://accounts.google.com").orEmpty()
+                            resultIntent.putExtra("google_cookies", cookies)
+                            setResultActivity(resultIntent)
+                        }, 1000L)
                         return true
                     }
 

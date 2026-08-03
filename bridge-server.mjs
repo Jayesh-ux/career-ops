@@ -6340,26 +6340,50 @@ app.delete('/portal-creds/:portal', (req, res) => {
 app.get('/portal/session/status', (req, res) => {
   try {
     const userDir = req.userCtx?.userDir || __dirname;
+    const SESSION_COOKIES = ['SID', 'HSID', 'SAPISID', '__Secure-1PSID'];
+    const TRACK_COOKIES = [...SESSION_COOKIES, '__Host-GAPS', 'NID', 'OTZ'];
+
+    // Seeded from the app's WebView OAuth login (google-cookies.json) — the
+    // one-login-for-both path. Present before any Playwright run has consumed
+    // them, so the app can report "connected" immediately.
+    const seedFile = join(userDir, 'google-cookies.json');
+    let seeded = false;
+    let seededNames = [];
+    if (existsSync(seedFile)) {
+      try {
+        const data = JSON.parse(readFileSync(seedFile, 'utf-8'));
+        const list = Array.isArray(data) ? data : (data.cookies || []);
+        seededNames = SESSION_COOKIES.filter((n) => list.some((c) => c && c.name === n));
+        seeded = seededNames.length > 0;
+      } catch { /* ignore corrupt seed file */ }
+    }
+
+    // Live Playwright profile cookie DB (consumed by login-session/apply-job).
     const cookiesDb = join(userDir, '.pwprofile', 'Default', 'Cookies');
-    if (!existsSync(cookiesDb)) {
-      return res.json({ success: true, profileExists: false, googleSession: false, hasGaps: false, cookieCount: 0, signedInNames: [] });
+    let profileNames = [];
+    let profileExists = false;
+    if (existsSync(cookiesDb)) {
+      profileExists = true;
+      const r = spawnSync('sqlite3', [
+        cookiesDb,
+        `SELECT name FROM cookies WHERE host_key LIKE '%google.com' AND name IN ('${TRACK_COOKIES.join("','")}');`,
+      ], { encoding: 'utf-8', timeout: 10000 });
+      if (!r.error && r.status === 0) {
+        profileNames = (r.stdout || '').split('\n').map((s) => s.trim()).filter(Boolean);
+      }
     }
-    const r = spawnSync('sqlite3', [
-      cookiesDb,
-      "SELECT name FROM cookies WHERE host_key LIKE '%google.com' AND name IN ('SID','HSID','SAPISID','__Secure-1PSID','__Host-GAPS','NID','OTZ');",
-    ], { encoding: 'utf-8', timeout: 10000 });
-    if (r.error || r.status !== 0) {
-      return res.json({ success: false, error: (r.error && r.error.message) || r.stderr || 'cookie db read failed' });
-    }
-    const names = (r.stdout || '').split('\n').map((s) => s.trim()).filter(Boolean);
-    const signedInNames = ['SID', 'HSID', 'SAPISID', '__Secure-1PSID'].filter((n) => names.includes(n));
+    const signedInNames = SESSION_COOKIES.filter((n) => profileNames.includes(n));
+    const googleSession = signedInNames.length > 0 || seeded;
+    const allNames = [...new Set([...profileNames, ...seededNames])];
     res.json({
       success: true,
-      profileExists: true,
-      googleSession: signedInNames.length > 0,
+      profileExists,
+      googleSession,
       signedInNames,
-      hasGaps: names.includes('__Host-GAPS'),
-      cookieCount: names.length,
+      seeded,
+      via: signedInNames.length > 0 ? 'profile' : (seeded ? 'oauth-seed' : 'none'),
+      hasGaps: allNames.includes('__Host-GAPS'),
+      cookieCount: allNames.length,
     });
   } catch (e) {
     res.json({ success: false, error: e.message });
@@ -6514,6 +6538,58 @@ app.post('/login/session/finish', async (req, res) => {
   } catch (e) {
     loginSession = null;
     res.json({ success: false, error: e.message });
+  }
+});
+
+// ── Google session cookie seeding ────────────────────────────────────
+// The user's single Google login in the app's WebView leaves real browser
+// session cookies. The app extracts them (CookieManager) and POSTs them here,
+// so every Playwright run (login-session.mjs + apply-job.mjs) can seed them —
+// portals then recognise the user without a second login. Stored per-user at
+// <userDir>/google-cookies.json, read by seed-cookies.mjs.
+const GOOGLE_COOKIE_DOMAINS = new Map([
+  // __Host-* cookies are host-only on accounts.google.com.
+  ['__Host-GAPS', 'accounts.google.com'],
+  ['__Host-3PLSID', 'accounts.google.com'],
+]);
+
+function parseGoogleCookieString(cookieString) {
+  const out = [];
+  if (!cookieString || typeof cookieString !== 'string') return out;
+  for (const pair of cookieString.split(/;\s*/)) {
+    const idx = pair.indexOf('=');
+    if (idx <= 0) continue;
+    const name = pair.slice(0, idx).trim();
+    const value = pair.slice(idx + 1).trim();
+    if (!name || !value) continue;
+    const hostOnly = name.startsWith('__Host-');
+    out.push({
+      name,
+      value,
+      domain: GOOGLE_COOKIE_DOMAINS.get(name) || (hostOnly ? 'accounts.google.com' : '.google.com'),
+      path: '/',
+      secure: true,
+      httpOnly: true,
+      sameSite: 'Lax',
+    });
+  }
+  return out;
+}
+
+app.post('/login/session/seed', (req, res) => {
+  try {
+    const userDir = req.userCtx?.userDir || __dirname;
+    const body = req.body || {};
+    const raw = body.cookieString || body.cookies || '';
+    const cookies = typeof raw === 'string' ? parseGoogleCookieString(raw) : raw;
+    if (!Array.isArray(cookies) || cookies.length === 0) {
+      return res.json({ success: false, error: 'no google cookies provided', count: 0 });
+    }
+    const target = join(userDir, 'google-cookies.json');
+    writeFileSync(target, JSON.stringify({ cookies, updatedAt: new Date().toISOString() }, null, 2));
+    res.json({ success: true, count: cookies.length, file: target });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
