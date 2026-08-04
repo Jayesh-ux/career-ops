@@ -56,6 +56,8 @@ sealed class ChatMessage {
         val body: String,
         val subject: String = "",
         val contactBlock: String = "",
+        val sending: Boolean = false,
+        val sent: Boolean = false,
         val onSend: (() -> Unit)? = null,
         val onEdit: (() -> Unit)? = null
     ) : ChatMessage()
@@ -65,6 +67,8 @@ sealed class ChatMessage {
         val subject: String,
         val body: String,
         val replyType: String,
+        val sending: Boolean = false,
+        val sent: Boolean = false,
         val onSend: (() -> Unit)? = null,
         val onEdit: (() -> Unit)? = null
     ) : ChatMessage()
@@ -239,6 +243,13 @@ class ChatViewModel @Inject constructor(
     }
 
     val messages = mutableStateListOf<ChatMessage>()
+
+    // Guard against duplicate application sends: rapid taps on a draft's Send
+    // button used to fire multiple /email/send calls (3 clicks = 3 emails + 3
+    // tracker rows). sendingDraftIds blocks concurrent sends for the same
+    // draft; sentDraftIds blocks any re-send after success.
+    private val sendingDraftIds = mutableSetOf<Long>()
+    private val sentDraftIds = mutableSetOf<Long>()
 
     // ── CLI-like operation control ──────────────────────────────────────
     // isProcessing drives the persistent Stop/Retry bar. When it flips to
@@ -1072,6 +1083,10 @@ class ChatViewModel @Inject constructor(
                 replyType = replyType,
                 onSend = {
                     viewModelScope.launch {
+                        // No repeat sends for the same reply draft.
+                        if (replyDraftId in sendingDraftIds || replyDraftId in sentDraftIds) return@launch
+                        sendingDraftIds.add(replyDraftId)
+                        setDraftSendState(replyDraftId, sending = true, sent = false)
                         try {
                             withContext(Dispatchers.IO) {
                                 api.sendReplyDraft(mapOf(
@@ -1080,10 +1095,14 @@ class ChatViewModel @Inject constructor(
                                     "body" to replyBody
                                 ))
                             }
+                            sentDraftIds.add(replyDraftId)
+                            setDraftSendState(replyDraftId, sending = false, sent = true)
                             messages.add(ChatMessage.System("\u2705 Reply sent."))
                         } catch (e: Exception) {
+                            setDraftSendState(replyDraftId, sending = false, sent = false)
                             messages.add(ChatMessage.System("\u274C Failed to send reply."))
                         }
+                        sendingDraftIds.remove(replyDraftId)
                     }
                 },
                 onEdit = {
@@ -2211,6 +2230,7 @@ class ChatViewModel @Inject constructor(
                                 onSend = {
                                     viewModelScope.launch {
                                         sendEmail(
+                                            draftId = draftId,
                                             to = action.data["to"] ?: "",
                                             subject = action.data["subject"] ?: "",
                                             body = action.data["body"] ?: "",
@@ -2834,7 +2854,7 @@ class ChatViewModel @Inject constructor(
                         to = response.to, company = company, role = role,
                         body = response.body, subject = response.subject,
                         contactBlock = response.contactBlock,
-                        onSend = { viewModelScope.launch { sendEmail(response.to, response.subject, response.body, company, role) } },
+                        onSend = { viewModelScope.launch { sendEmail(draftId, response.to, response.subject, response.body, company, role) } },
                         onEdit = { openDraftEditor(draftId) }
                     ))
                 }
@@ -2854,7 +2874,11 @@ class ChatViewModel @Inject constructor(
         persistMessages()
     }
 
-    private suspend fun sendEmail(to: String, subject: String, body: String, company: String, role: String) {
+    private suspend fun sendEmail(draftId: Long?, to: String, subject: String, body: String, company: String, role: String) {
+        // No repeat sends: ignore taps while a send is in flight or already done.
+        if (draftId != null && (draftId in sendingDraftIds || draftId in sentDraftIds)) return
+        if (draftId != null) sendingDraftIds.add(draftId)
+        setDraftSendState(draftId, sending = true, sent = false)
         try {
             removeProcessing()
 
@@ -2865,6 +2889,8 @@ class ChatViewModel @Inject constructor(
             }
 
             if ((response["success"] as? Boolean) == true) {
+                if (draftId != null) sentDraftIds.add(draftId)
+                setDraftSendState(draftId, sending = false, sent = true)
                 try {
                     withContext(Dispatchers.IO) {
                         api.addTrackerEntry(TrackerAddRequest(
@@ -2882,6 +2908,7 @@ class ChatViewModel @Inject constructor(
                 ))
             } else {
                 val errorMsg = (response["error"] as? String) ?: "Unknown error"
+                setDraftSendState(draftId, sending = false, sent = false)
                 messages.add(ChatMessage.System(
                     "\u274C Failed to send application to **$company**.\n" +
                     "Error: $errorMsg\n" +
@@ -2889,11 +2916,24 @@ class ChatViewModel @Inject constructor(
                 ))
             }
         } catch (e: Exception) {
+            setDraftSendState(draftId, sending = false, sent = false)
             messages.add(ChatMessage.System(
                 "\u274C Couldn't send the application to **$company**. Please check your connection and try again."
             ))
         }
+        if (draftId != null) sendingDraftIds.remove(draftId)
         isProcessing = false
+    }
+
+    private fun setDraftSendState(draftId: Long?, sending: Boolean, sent: Boolean) {
+        if (draftId == null) return
+        val idx = messages.indexOfFirst { it.id == draftId }
+        if (idx < 0) return
+        messages[idx] = when (val m = messages[idx]) {
+            is ChatMessage.EmailDraft -> m.copy(sending = sending, sent = sent)
+            is ChatMessage.ReplyDraft -> m.copy(sending = sending, sent = sent)
+            else -> return
+        }
     }
 
     fun resetSession() {

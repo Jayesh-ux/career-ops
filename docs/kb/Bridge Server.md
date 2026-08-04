@@ -1,7 +1,7 @@
 ---
 type: component
 tags: [component, backend, api]
-updated: 2026-08-03
+updated: 2026-08-04
 ---
 
 # Bridge Server
@@ -31,7 +31,20 @@ header.
   never sends `email`, which used to hard-fail with `email and body are
   required`), and the **user's CV PDF is attached by default**
   (`<userDir>/output/generic-cv.pdf`) so application emails always carry the
-  resume.
+  resume. Since 2026-08-04 the endpoint **idempotency-guards** identical sends
+  (same user, recipient, company, role) within a 60s window (`_recentEmailSends`)
+  and returns `{success:true, duplicate:true}` for the repeat — so a double-tap
+  or client retry can never email a recruiter twice.
+- Own **application email drafting** (`POST /email/draft`): `fetchJdAndContact`
+  scrapes the posting page (plain HTTP, then a headless-Chromium render
+  fallback) for a real application email. If the page yields none — Internshala
+  & co. hide the company email behind their Apply flow — the prompt instructs
+  the spawned agent to **websearch** for the company's real application/HR
+  email (company careers page/contact page) and return it as `to`, falling back
+  to `""` (and thus Playwright auto-fill) only if nothing verified is found.
+  `runOpencode` polls the session until assistant **text** is present (a prior
+  idle-count break raced the final text after tool calls, causing
+  "opencode produced no text output").
 - Own the **scan paths** (`POST /scan`, `GET /scan/stream`): keywords,
   location proximity (`buildNearbyTerms`), and the career-ops rubric scoring
   (`scoreScanResult`) are all driven by the **per-user** profile via

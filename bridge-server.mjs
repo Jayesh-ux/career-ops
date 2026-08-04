@@ -1709,6 +1709,22 @@ app.post('/email/send', async (req, res) => {
     if (!to || !String(to).trim()) {
       return res.status(400).json({ error: 'to (recipient) is required — refusing to send without a recipient' });
     }
+
+    // Idempotency: refuse an identical send (user, recipient, company, role)
+    // within the dedup window — the app's Send button already guards client-side,
+    // this is the server-side net so a retry/double-tap never emails twice.
+    const dedupKey = recentEmailSendKey(req.userCtx?.userId, to, company, role);
+    const now = Date.now();
+    const prevSend = _recentEmailSends.get(dedupKey);
+    if (prevSend && now - prevSend.ts < EMAIL_SEND_DEDUP_MS) {
+      console.log(`[email/send] duplicate blocked (${dedupKey})`);
+      return res.json({ success: true, duplicate: true, method: 'dedup', messageId: prevSend.messageId || null });
+    }
+    _recentEmailSends.set(dedupKey, { ts: now, messageId: null });
+    const recordSent = (messageId) => {
+      _recentEmailSends.set(dedupKey, { ts: Date.now(), messageId: messageId || null });
+    };
+    const clearSend = () => _recentEmailSends.delete(dedupKey);
     // Application emails must carry the CV. When the caller didn't pass a
     // pdfPath, default to the user's generated CV PDF (per-user, then legacy).
     // A relative pdfPath is resolved against the user's tree (multi-user).
@@ -1754,6 +1770,7 @@ app.post('/email/send', async (req, res) => {
           if (sendResp.ok) {
             const sent = await sendResp.json();
             console.log(`[email/send] gmail_rest success (id=${sent.id})`);
+            recordSent(sent.id);
             return res.json({ success: true, applicationId: 0, method: hasUserOAuth2 ? 'per_user_oauth2_rest' : 'legacy_oauth2_rest', messageId: sent.id });
           }
           const errText = await sendResp.text();
@@ -1774,6 +1791,7 @@ app.post('/email/send', async (req, res) => {
     }
 
     if (attempts.length === 0) {
+      clearSend();
       return res.status(400).json({ error: 'Gmail REST send unavailable and no appPassword configured for SMTP fallback' });
     }
 
@@ -1794,12 +1812,14 @@ app.post('/email/send', async (req, res) => {
         });
         await transporter.sendMail(mailOpts);
         console.log(`[email/send] ${attempt.label} success`);
+        recordSent(null);
         return res.json({ success: true, applicationId: 0, method: attempt.label });
       } catch (e) {
         console.warn(`[email/send] ${attempt.label} failed: ${e.message}`);
         lastErr = e;
       }
     }
+    clearSend();
     return res.status(500).json({ success: false, error: lastErr ? lastErr.message : 'Email send failed' });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
@@ -1813,6 +1833,14 @@ app.post('/email/send', async (req, res) => {
 // minutes, so an auth/config failure would otherwise spam the logs. Log once
 // per email per hour (or immediately when the error text changes).
 const _imapErrorLog = new Map();
+// Idempotency guard for /email/send: blocks duplicate sends of the same
+// application (same user, recipient, company, role) within a short window,
+// so a double-tap / retry in the app can never email a recruiter twice.
+const _recentEmailSends = new Map();
+const EMAIL_SEND_DEDUP_MS = 60000;
+function recentEmailSendKey(userId, to, company, role) {
+  return `${String(userId || '').toLowerCase()}|${String(to || '').trim().toLowerCase()}|${String(company || '').trim().toLowerCase()}|${String(role || '').trim().toLowerCase()}`;
+}
 function logImapError(email, err) {
   const msg = err?.message || String(err);
   const key = String(email || '').toLowerCase();

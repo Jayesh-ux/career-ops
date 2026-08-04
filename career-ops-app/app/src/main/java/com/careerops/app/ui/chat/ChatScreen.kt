@@ -852,12 +852,32 @@ fun EmailDraftBubble(message: ChatMessage.EmailDraft) {
             
             Spacer(modifier = Modifier.height(12.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { showConfirm = true }, modifier = Modifier.weight(1f)) {
-                    Icon(Icons.Default.Send, null, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("Send")
+                val sending = message.sending
+                val sent = message.sent
+                Button(
+                    onClick = { if (!sending && !sent) showConfirm = true },
+                    enabled = !sending && !sent,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    if (sending) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Sending...")
+                    } else if (sent) {
+                        Icon(Icons.Default.Check, null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Sent")
+                    } else {
+                        Icon(Icons.Default.Send, null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Send")
+                    }
                 }
-                OutlinedButton(onClick = { message.onEdit?.invoke() }, modifier = Modifier.weight(1f)) {
+                OutlinedButton(
+                    onClick = { message.onEdit?.invoke() },
+                    enabled = !sending && !sent,
+                    modifier = Modifier.weight(1f)
+                ) {
                     Icon(Icons.Default.Edit, null, modifier = Modifier.size(16.dp))
                     Spacer(modifier = Modifier.width(4.dp))
                     Text("Edit")
@@ -936,12 +956,32 @@ fun ReplyDraftBubble(message: ChatMessage.ReplyDraft) {
 
             Spacer(modifier = Modifier.height(12.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { showConfirm = true }, modifier = Modifier.weight(1f)) {
-                    Icon(Icons.Default.Send, null, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("Send")
+                val sending = message.sending
+                val sent = message.sent
+                Button(
+                    onClick = { if (!sending && !sent) showConfirm = true },
+                    enabled = !sending && !sent,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    if (sending) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Sending...")
+                    } else if (sent) {
+                        Icon(Icons.Default.Check, null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Sent")
+                    } else {
+                        Icon(Icons.Default.Send, null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Send")
+                    }
                 }
-                OutlinedButton(onClick = { message.onEdit?.invoke() }, modifier = Modifier.weight(1f)) {
+                OutlinedButton(
+                    onClick = { message.onEdit?.invoke() },
+                    enabled = !sending && !sent,
+                    modifier = Modifier.weight(1f)
+                ) {
                     Icon(Icons.Default.Edit, null, modifier = Modifier.size(16.dp))
                     Spacer(modifier = Modifier.width(4.dp))
                     Text("Edit")

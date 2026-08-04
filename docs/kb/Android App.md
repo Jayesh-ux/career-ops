@@ -52,8 +52,17 @@ cards and scan results. It runs:
 3. **Email found** → `EmailDraft` card → user confirms → `sendEmail()` →
    `POST /email/send` (per-user OAuth, per-user CV attached) → tracker row
    `Applied` with notes `Emailed {to} via career-ops app` + `contactEmail`.
-4. **No email found** → fall back to Playwright auto-fill (`startAutoFill` /
-   `/apply/open` + `/apply/fill`) or a manual-apply message.
+   The draft card carries `sending`/`sent` state: while `POST /email/send` is
+   in flight the Send button shows a spinner and is disabled ("Sending…"), then
+   flips to a disabled "Sent" state. `sendEmail()` also guards against repeat
+   taps in the ViewModel (`sendingDraftIds`/`sentDraftIds`), so one confirmation
+   can never fire multiple sends; `ReplyDraft` has the same guard. The bridge's
+   `/email/send` additionally idempotency-blocks identical sends within 60s.
+4. **No email on the posting page** → the drafter agent websearches for the
+   company's real application/HR email (e.g. "<company> careers email" or the
+   company site's contact page) before giving up; only if still nothing does it
+   fall back to Playwright auto-fill (`startAutoFill` / `/apply/open` +
+   `/apply/fill`) or a manual-apply message.
 
 Never auto-sends: the email is always shown for review first
 ([[Security & Human-in-the-loop]]).
