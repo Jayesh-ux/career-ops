@@ -697,83 +697,66 @@ async function runOpencode(prompt, timeoutMs = 120000, cwd) {
   const trainingContext = readAgentTraining(cwd);
   const effectivePrompt = trainingContext ? `${trainingContext}\n\n${prompt}` : prompt;
 
-  await client.session.promptAsync({
+  // Blocking prompt — POST /session/{id}/message resolves when the assistant's
+  // turn completes (finish:"stop"), returning the final assistant message. The
+  // old promptAsync + status/message poll loop raced multi-step tool-call
+  // flows: after a websearch the session showed "idle" between steps, the poll
+  // broke early, and drafts/evals failed with "opencode produced no text
+  // output" even though the agent later emitted a full answer.
+  let result;
+  try {
+    result = await Promise.race([
+      client.session.prompt({
+        path: { id: sessionId },
+        body: {
+          parts: [{ type: "text", text: effectivePrompt }],
+          model: resolveModelForUser(userId)
+        }
+      }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('opencode prompt timeout')), timeoutMs))
+    ]);
+  } catch (e) {
+    // Timeout or transport error: salvage whatever the session already emitted
+    // rather than failing hard — a late/partial answer still beats an error.
+    console.warn(`[opencode] blocking prompt ${e.message} — reading partial session`);
+    const msgsResult = await client.session.messages({
+      path: { id: sessionId },
+      query: { limit: 50 }
+    }).catch(() => ({ data: [] }));
+    const collected = collectAssistantText(msgsResult.data);
+    if (collected) return collected;
+    throw e;
+  }
+
+  // If the returned payload isn't a string, it's the assistant message object —
+  // pull its text parts; if empty, fall back to the full session message list.
+  const direct = collectAssistantText(result);
+  if (direct) return direct;
+  const msgsResult = await client.session.messages({
     path: { id: sessionId },
-    body: {
-      parts: [{ type: "text", text: effectivePrompt }],
-      model: resolveModelForUser(userId)
-    }
-  });
+    query: { limit: 50 }
+  }).catch(() => ({ data: [] }));
+  const collected = collectAssistantText(msgsResult.data);
+  if (!collected) throw new Error('opencode produced no text output');
+  return collected;
+}
 
-  const deadline = Date.now() + timeoutMs;
-  let lastBusyPoll = 0;
-  let msgsResult = { data: [] };
-  let msgs = [];
-
-  // Poll until we see assistant text OR the deadline/10s-idle grace expires.
-  // Previous loop broke on idleCount>=2 which raced the model's final text step
-  // (tool call finishes → status idle → loop breaks → final text not yet emitted).
-  while (Date.now() < deadline) {
-    await new Promise(r => setTimeout(r, 1000));
-    const statusResult = await client.session.status({}).catch(() => ({ data: {} }));
-    const st = statusResult.data?.[sessionId]?.type;
-    const isBusy = (st === 'busy' || st === 'retry');
-    if (isBusy) { lastBusyPoll = Date.now(); continue; }
-
-    // Status idle — check messages for actual assistant text (not just tool calls).
-    msgsResult = await client.session.messages({
-      path: { id: sessionId },
-      query: { limit: 50 }
-    }).catch(() => ({ data: [] }));
-    msgs = Array.isArray(msgsResult.data) ? msgsResult.data : [];
-
-    const hasAssistantText = msgs.some(m =>
-      m.info?.role === 'assistant' && (m.parts || []).some(p =>
-        p.type === 'text' && (p.text || p.content || '').trim().length > 10
-      )
-    );
-    if (hasAssistantText) break;
-
-    // If never-busy case: break after 5s with no text (prompt likely rejected/error).
-    // If was-busy: break after 10s idle with no text (agent stuck on tool calls without
-    // producing a final answer — common when websearch returns but model doesn't emit text).
-    const idleMs = lastBusyPoll ? (Date.now() - lastBusyPoll) : (Date.now() - (deadline - timeoutMs));
-    if (idleMs > (lastBusyPoll ? 10000 : 5000)) break;
-  }
-
-  // One final query if we don't have text yet (text may have arrived after last poll).
-  if (!msgs.some(m =>
-    m.info?.role === 'assistant' && (m.parts || []).some(p =>
-      p.type === 'text' && (p.text || p.content || '').trim().length > 10
-    )
-  )) {
-    await new Promise(r => setTimeout(r, 2000));
-    msgsResult = await client.session.messages({
-      path: { id: sessionId },
-      query: { limit: 50 }
-    }).catch(() => ({ data: [] }));
-    msgs = Array.isArray(msgsResult.data) ? msgsResult.data : [];
-  }
-  const assistants = msgs.filter(m => m.info?.role === 'assistant');
-
+// Extract joined assistant text from either a single message object or a list
+// of messages. Keeps JSON blocks (draft/classify/reply/eval return JSON); only
+// strips the skill-wrapper artifacts injected by the agent runtime.
+function collectAssistantText(msgs) {
+  const list = Array.isArray(msgs) ? msgs : (msgs ? [msgs] : []);
   const textParts = [];
-  for (const m of assistants) {
+  for (const m of list) {
+    if (m?.info?.role !== 'assistant') continue;
     for (const p of (m.parts || [])) {
       if (p.type === 'text') {
         const t = (p.text || p.content || '').trim();
-        // Keep JSON blocks too — draft/classify/reply/eval prompts return JSON,
-        // and filtering them out made those endpoints return empty. Only strip
-        // the skill-wrapper artifacts injected by the agent runtime.
-        if (t && !t.startsWith('<skill_content')) {
-          textParts.push(t);
-        }
+        if (t && !t.startsWith('<skill_content')) textParts.push(t);
       }
     }
   }
-
-  const output = textParts.join('\n\n');
-  if (!output) throw new Error('opencode produced no text output');
-  return output;
+  return textParts.join('\n\n');
 }
 
 function parseJsonFromOutput(text) {
