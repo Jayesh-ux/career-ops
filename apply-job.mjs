@@ -78,11 +78,13 @@ let answersJsonPath = '';
 let companyOverride = '';
 let stealthMode = false;
 let manualGuideMode = false;
+let submitMode = false;
 
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--user-dir' && args[i + 1]) userDir = args[++i];
   if (args[i] === '--headless') headless = true;
   if (args[i] === '--fill') fillMode = true;
+  if (args[i] === '--submit') submitMode = true;
   if (args[i] === '--answers-json' && args[i + 1]) answersJsonPath = args[++i];
   if (args[i] === '--company' && args[i + 1]) companyOverride = args[++i];
   if (args[i] === '--stealth') stealthMode = true;
@@ -554,17 +556,48 @@ async function extractFields(page) {
           const style = window.getComputedStyle(el);
           if (rect.width <= 0 || rect.height <= 0 || style.visibility === 'hidden' || style.display === 'none') continue;
 
-          const label = el.getAttribute('aria-label') ||
-            el.getAttribute('placeholder') ||
-            el.getAttribute('name') ||
-            el.closest('label')?.textContent?.trim() || '';
+          // Resolve a human-readable label: aria-label > placeholder >
+          // explicit label[for] > wrapping label > fieldset legend > name.
+          const resolveLabel = (e) => {
+            const aria = e.getAttribute('aria-label');
+            if (aria && aria.trim()) return aria.trim();
+            const ph = e.getAttribute('placeholder');
+            if (ph && ph.trim()) return ph.trim();
+            const wrapLabel = e.closest('label');
+            if (wrapLabel && wrapLabel.textContent.trim()) {
+              // For radios/checkboxes the wrapping label is the option text,
+              // not the question — use the fieldset legend when present.
+              const fs = e.closest('fieldset');
+              const legend = fs ? fs.querySelector('legend') : null;
+              if (legend && legend.textContent.trim()) return legend.textContent.trim();
+              const lblText = wrapLabel.textContent.trim().split('\n')[0];
+              if (lblText) return lblText;
+            }
+            if (e.id) {
+              const forLabel = document.querySelector(`label[for="${CSS.escape(e.id)}"]`);
+              if (forLabel && forLabel.textContent.trim()) return forLabel.textContent.trim();
+            }
+            const fs2 = e.closest('fieldset');
+            if (fs2) {
+              const legend2 = fs2.querySelector('legend');
+              if (legend2 && legend2.textContent.trim()) return legend2.textContent.trim();
+            }
+            const wrapper = e.closest('div, li, p');
+            if (wrapper) {
+              const inner = wrapper.querySelector('label:not(label *)');
+              if (inner && inner.textContent.trim() && !inner.contains(e)) return inner.textContent.trim();
+            }
+            return e.getAttribute('name') || '';
+          };
+
+          const label = resolveLabel(el);
 
           result.push({
             id: el.id || el.name || `field_${result.length}`,
             type: el.tagName.toLowerCase() === 'select' ? 'select' :
                   el.tagName.toLowerCase() === 'textarea' ? 'textarea' :
                   el.type || 'text',
-            label: label.slice(0, 100),
+            label: label.slice(0, 120),
             required: el.required || el.getAttribute('aria-required') === 'true',
             options: el.tagName.toLowerCase() === 'select'
               ? Array.from(el.options).map(o => o.text).slice(0, 20)
@@ -1103,24 +1136,239 @@ async function fillForm(page, answers) {
       const cssEscape = (v) => String(v).replace(/[^a-zA-Z0-9_-]/g, '\\$&');
       let el = await page.$(`[id="${cssEscape(fieldId)}"]`);
       if (!el) el = await page.$(`[name="${cssEscape(fieldId)}"]`);
-      if (!el) { skipped.push(fieldId); continue; }
+      if (!el) {
+        console.error(`[fill-skip] no-element id=[${fieldId}]`);
+        skipped.push(fieldId);
+        continue;
+      }
 
       const tag = await el.evaluate(e => e.tagName.toLowerCase());
-      if (tag === 'select') {
-        // Try to match by text
+      const type = await el.evaluate(e => (e.getAttribute('type') || '').toLowerCase());
+      if (type === 'radio' || type === 'checkbox') {
+        const truthy = value === true || /^(true|yes|1|on)$/i.test(String(value).trim());
+        // Greenhouse and similar ATS boards re-render the form after a control
+        // is clicked, which DETACHES our ElementHandle. Always re-resolve by
+        // id/name before inspecting state so we never act on a stale handle.
+        const resolveEl = async () => {
+          const byId = await page.$(`[id="${cssEscape(fieldId)}"]`).catch(() => null);
+          if (byId) return byId;
+          return (await page.$(`[name="${cssEscape(fieldId)}"]`).catch(() => null)) || el;
+        };
+        // Greenhouse and similar ATS boards (SmartRecruiters, …) render their
+        // checkbox/radio boxes as a plain native input plus a decorative div/svg
+        // whose visibility is driven by CSS `:checked`. Their JS is bound at
+        // page load and rejects UNTRUSTED in-page clicks; even a trusted mouse
+        // click can miss because the native input sits on top of the overlay
+        // and swallows pointer events, so the page's own state never updates.
+        // A trusted KEYBOARD interaction on the focused control (Space toggles
+        // a checkbox / selects a radio) fires the real click+change events and
+        // updates both the DOM state and the CSS overlay — which is exactly what
+        // the ATS's submit validation reads.
+        // Last-resort in-page fallback: click custom container / label / input
+        // (untrusted), then force the native setter + change/input events.
+        const setCheckedInPage = async (want) => {
+          try {
+            await el.evaluate((e, w) => {
+              const label =
+                (e.id ? document.querySelector(`label[for="${CSS.escape(e.id)}"]`) : null) ||
+                e.closest('label');
+              const container = e.closest('.checkbox__input, .checkbox__wrapper, [class*="radio"], [class*="checkbox"], [class*="toggle"], [class*="option"]');
+              const targets = [container, label, e].filter(Boolean);
+              for (const t of targets) {
+                if (e.checked === w) break;
+                if (e.checked !== w) t.click();
+              }
+              if (e.checked !== w) {
+                const proto = e.constructor?.prototype;
+                const desc = proto ? Object.getOwnPropertyDescriptor(proto, 'checked') : null;
+                if (desc?.set) desc.set.call(e, w); else e.checked = w;
+                e.dispatchEvent(new Event('click', { bubbles: true }));
+                e.dispatchEvent(new Event('change', { bubbles: true }));
+                e.dispatchEvent(new Event('input', { bubbles: true }));
+              }
+            }, want);
+          } catch { /* detached element */ }
+          await page.waitForTimeout(120);
+        };
+        const setChecked = async (want) => {
+          const now = await el.isChecked().catch(() => false);
+          const needsKey = type === 'radio' ? !now : now !== want;
+          if (needsKey) {
+            await el.focus().catch(() => {});
+            await page.waitForTimeout(80);
+            await page.keyboard.press('Space');
+            await page.waitForTimeout(180);
+            el = await resolveEl();
+          }
+          // Fallback: force the native setter + events if the keystroke didn't
+          // stick (e.g. custom controls that need an extra change dispatch).
+          const ok = await el.isChecked().catch(() => false) === want || type === 'radio';
+          if (!ok) {
+            await setCheckedInPage(want);
+            el = await resolveEl();
+          }
+        };
+        if (type === 'radio') {
+          if (truthy) {
+            await setChecked(true);
+            filled.push(fieldId);
+          } else skipped.push(fieldId);
+        } else {
+          el = await resolveEl();
+          const isChecked = await el.isChecked().catch(() => false);
+          if (truthy !== isChecked) await setChecked(truthy);
+          filled.push(fieldId);
+        }
+        // Debug: dump what the control actually is and whether it stuck
+        const dbg = await (async () => {
+          const cur = await resolveEl();
+          return cur.evaluate((e) => {
+            const label = (e.id ? document.querySelector(`label[for="${CSS.escape(e.id)}"]`) : null) || e.closest('label') || null;
+            const fs = e.closest('fieldset');
+            const legend = fs ? fs.querySelector('legend')?.textContent?.trim() : '';
+            const ov = e.closest('.checkbox__input, .radio__input, [class*="checkbox__input"], [class*="radio__input"], [class*="checkbox-container"], [class*="radio-container"], [class*="custom-checkbox"], [class*="custom-radio"], [class*="toggle-input"]');
+            const reactKeys = Object.keys(e).filter(k => k.startsWith('__reactProps') || k.startsWith('_react'));
+            let onChange = false;
+            for (const k of reactKeys) {
+              const v = e[k];
+              if (v && typeof v.onChange === 'function') onChange = true;
+            }
+            return {
+              tag: e.tagName,
+              type: e.getAttribute('type'),
+              name: e.getAttribute('name'),
+              value: e.getAttribute('value'),
+              checked: e.checked,
+              ariaInvalid: e.getAttribute('aria-invalid'),
+              overlayClass: ov ? String(ov.className).slice(0, 80) : null,
+              overlayTag: ov ? ov.tagName : null,
+              labelTag: label ? label.tagName : null,
+              labelText: label ? label.textContent.replace(/\s+/g, ' ').trim().slice(0, 60) : '',
+              legend: legend || '',
+              reactKeys,
+              onChange,
+              parentHtml: fs ? fs.outerHTML.slice(0, 1200) : (label ? label.outerHTML.slice(0, 1200) : e.outerHTML.slice(0, 1200)),
+              html: e.outerHTML.slice(0, 300),
+            };
+          }).catch(() => null);
+        })();
+        if (dbg) console.error('[fill-debug] ' + JSON.stringify({ id: fieldId, ...dbg }));
+      } else if (tag === 'select') {
+        // Match by exact value, exact text, text-contains, reverse-contains,
+        // then by any distinctive word (e.g. "Engineering" → "Bachelor of Engineering").
         const matched = await el.evaluate((sel, val) => {
+          const v = String(val).trim();
+          const vl = v.toLowerCase();
           const opts = Array.from(sel.options);
-          const match = opts.find(o => o.text.toLowerCase().includes(val.toLowerCase()));
-          if (match) { sel.value = match.value; return true; }
+          const text = (o) => (o.text || '').trim().toLowerCase();
+          const pick = (o) => { sel.value = o.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return true; };
+          let m = opts.find(o => (o.value || '').trim().toLowerCase() === vl);
+          if (m) return pick(m);
+          m = opts.find(o => text(o) === vl);
+          if (m) return pick(m);
+          m = opts.find(o => text(o).includes(vl));
+          if (m) return pick(m);
+          m = opts.find(o => vl.includes(text(o)));
+          if (m) return pick(m);
+          m = opts.find(o => vl.split(/\s+/).some(w => w.length > 2 && text(o).includes(w)));
+          if (m) return pick(m);
           return false;
         }, value);
         if (matched) filled.push(fieldId);
         else skipped.push(fieldId);
-      } else if (tag === 'input' || tag === 'textarea') {
-        await el.click();
-        await el.fill('');
-        await el.fill(String(value));
+      } else if (tag === 'input' && await el.evaluate((e) => e.getAttribute('role') === 'combobox' || e.getAttribute('aria-autocomplete') === 'list' || /select__input/i.test(e.className || '') || !!e.closest('.select__control, [class*="select__control"]')).catch(() => false)) {
+        // React-Select style combobox (Greenhouse, SmartRecruiters, Lever, …):
+        // typing into the search box alone never commits an option. Trusted
+        // keyboard interaction is the reliable path — focus the real input,
+        // type the value to filter the menu, then Enter selects the top hit.
+        // Fallback: click the control to open the menu, then click the option
+        // whose text matches the value (same cascade as the native select).
+        let picked = false;
+        let typedOpts = [];
+        try {
+          await el.evaluate((e) => { e.scrollIntoView({ block: 'center' }); e.focus(); });
+          await page.waitForTimeout(250);
+          await page.keyboard.type(String(value));
+          await page.waitForTimeout(650);
+          typedOpts = await page.evaluate(() =>
+            Array.from(document.querySelectorAll('.select__option, [role="option"]'))
+              .filter((e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; })
+              .map((e) => (e.textContent || '').trim().slice(0, 40))
+          ).catch(() => []);
+          await page.keyboard.press('Enter');
+          await page.waitForTimeout(350);
+          const committed = await el.evaluate((e) => {
+            const ctl = e.closest('.select__control, [class*="select__control"]');
+            const t = ctl ? (ctl.textContent || '').replace(/\s+/g, ' ').trim() : '';
+            return { invalid: e.getAttribute('aria-invalid'), ctlText: t };
+          }).catch(() => null);
+          picked = !!(committed && committed.ctlText && !/select\.\.\./i.test(committed.ctlText) && committed.ctlText.length > 0);
+          if (!picked) await page.keyboard.press('Escape');
+          console.error(`[fill-debug] combobox id=[${fieldId}] val=[${String(value).slice(0,30)}] opts=[${typedOpts.join(' | ').slice(0,80)}] ctl=[${committed ? committed.ctlText.slice(0,40) : 'null'}] picked=${picked}`);
+        } catch (e) {
+          console.error(`[fill-debug] combobox-err id=[${fieldId}] err=${String(e.message).slice(0, 100)}`);
+          picked = false;
+        }
+        if (!picked) {
+          try {
+            const ctlHandle = await el.evaluateHandle((e) => e.closest('.select__control, [class*="select__control"]') || e.parentElement || e);
+            const ctlEl = ctlHandle.asElement();
+            if (ctlEl) await ctlEl.click({ force: true });
+            await page.waitForTimeout(600);
+            const opts = await page.$$('.select__option, [role="option"]');
+            const target = String(value).trim().toLowerCase();
+            let best = null, bestScore = 0;
+            for (const o of opts) {
+              const t = ((await o.innerText().catch(() => '')) || '').trim();
+              if (!t) continue;
+              const tlo = t.toLowerCase();
+              let s = 0;
+              if (tlo === target) s = 4;
+              else if (tlo.includes(target)) s = 3;
+              else if (target.includes(tlo)) s = 2;
+              else if (target.split(/\s+/).some((w) => w.length > 2 && tlo.includes(w))) s = 1;
+              if (s > bestScore) { best = o; bestScore = s; }
+            }
+            if (best) {
+              await best.click({ force: true });
+              await page.waitForTimeout(300);
+              picked = true;
+            }
+          } catch { picked = false; }
+        }
+        if (picked) filled.push(fieldId); else skipped.push(fieldId);
+      } else if (tag === 'input' && /iti__tel-input/i.test(await el.evaluate((e) => e.className || '').catch(() => ''))) {
+        // intl-tel-input (country-coded phone widgets): filling the value WITH
+        // the country code double-counts it (widget adds +91 on top of +91)
+        // and the number comes back "too long". Feed the LOCAL number only,
+        // ideally through the widget's own instance so its internal state
+        // (which the ATS validation reads) stays in sync.
+        const digits = String(value).replace(/\D/g, '');
+        const local = digits.length > 10 ? digits.slice(-10) : digits;
+        await el.evaluate((e, n) => {
+          const g = window.intlTelInputGlobals;
+          const iti = (g && g.getInstance) ? g.getInstance(e) : null;
+          if (iti && iti.setNumber) iti.setNumber('+91' + n);
+          else {
+            e.value = n;
+            e.dispatchEvent(new Event('input', { bubbles: true }));
+            e.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        }, local).catch(() => {});
+        await page.waitForTimeout(200);
         filled.push(fieldId);
+      } else if (tag === 'input' || tag === 'textarea') {
+        try {
+          await el.click();
+          await el.fill('');
+          await el.fill(String(value));
+          filled.push(fieldId);
+        } catch (e) {
+          console.error(`[fill-debug] input-fail id=[${fieldId}] type=[${type}] err=${String(e.message).slice(0, 120)}`);
+          skipped.push(fieldId);
+        }
+      } else {
+        skipped.push(fieldId);
       }
     } catch {
       skipped.push(fieldId);
@@ -1128,6 +1376,149 @@ async function fillForm(page, answers) {
   }
 
   return { filled, skipped };
+}
+
+// ── Submit step (--submit) ─────────────────────────────────────────
+// HITL: only runs when --submit is passed explicitly (app asks the user
+// before sending it). Locates the form's submit button, clicks it, then
+// reports validation errors or success — never a false green check.
+
+async function clickSubmitButton(page) {
+  // Use a TRUSTED Playwright click (CDP mouse events) — ATS boards like
+  // Greenhouse ignore untrusted in-page .click() calls (isTrusted === false)
+  // and never run their submit/validation logic, leaving the form untouched.
+  // IMPORTANT: must NOT pick header/sticky "Apply" links — only buttons that
+  // live INSIDE a <form> actually submit the application. Prefer explicit
+  // input[type=submit]/button[type=submit] within the application form, then
+  // any in-form submit-capable control, and only as a last resort a global
+  // text match (still <button>/<input>, never an <a>).
+  const btnHandle = await page.evaluateHandle(() => {
+    const vis = (el) => {
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    };
+    const textMatch = (e) => {
+      const t = (e.textContent || e.value || '').trim().toLowerCase();
+      return /^\s*(submit( application)?|apply( now)?|send application|send|finish|confirm|review (and )?submit)\b/i.test(t);
+    };
+    const isSubmit = (e) => e.getAttribute('type') === 'submit' || e.tagName === 'BUTTON' || e.getAttribute('type') === 'button';
+    // 1) Explicit submit inside a <form> (Greenhouse: #application-form / .application--form)
+    const inForm = Array.from(document.querySelectorAll('form button[type="submit"], form input[type="submit"], #application-form button, #application_form button, .application--form button, .application-form button'))
+      .filter((e) => vis(e) && !e.disabled && isSubmit(e));
+    const inFormByText = inForm.find(textMatch);
+    if (inFormByText) return inFormByText;
+    // 2) Any in-form submit-capable element (do not pick the form's last button blindly)
+    const inFormCapable = inForm.length ? inForm : Array.from(document.querySelectorAll('form button:not([type="button"]), form input[type="submit"]'))
+      .filter((e) => vis(e) && !e.disabled);
+    if (inFormCapable.length) return inFormCapable[inFormCapable.length - 1];
+    // 3) Global fallback: explicit submit types anywhere (last one wins)
+    const explicit = Array.from(document.querySelectorAll('input[type="submit"], button[type="submit"]'))
+      .filter((e) => vis(e) && !e.disabled);
+    if (explicit.length) return explicit[explicit.length - 1];
+    // 4) Last resort: text match on button/input only (exclude <a> header links)
+    const cands = Array.from(document.querySelectorAll('button, input[type="button"], [role="button"]'))
+      .filter((e) => vis(e) && !e.disabled);
+    return cands.find(textMatch) || null;
+  }).catch(() => null);
+  const btnEl = btnHandle ? btnHandle.asElement() : null;
+  if (!btnEl) return { found: false, text: '' };
+  const text = await btnEl.evaluate((e) => (e.textContent || e.value || '').trim().slice(0, 60)).catch(() => '');
+  await btnEl.click({ force: true }).catch(() => {});
+  return { found: true, text: text || 'submit-button' };
+}
+
+async function collectFormErrors(page) {
+  return page.evaluate(() => {
+    const errs = new Set();
+    const vis = (el) => {
+      const r = el.getBoundingClientRect();
+      const s = window.getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+    };
+    const fieldLabel = (el) => {
+      const field = el.closest('.field, fieldset, .form-item');
+      const lbl = field?.querySelector?.('.label, legend, label');
+      if (lbl && lbl.textContent.trim()) return lbl.textContent.replace(/\s+/g, ' ').trim().slice(0, 80);
+      return '';
+    };
+    document.querySelectorAll('[class*="error"], [role="alert"], .field-error, .field_error, li.error, .error-message, [aria-invalid="true"]').forEach((el) => {
+      if (!vis(el)) return;
+      const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!t || t.length >= 250) return;
+      const lbl = fieldLabel(el);
+      errs.add(lbl ? `${lbl}: ${t}` : t);
+    });
+    // NOTE: required *asterisk* markers (`.required`/`.reqd` spans in legends)
+    // are NOT errors — Greenhouse/ATS print them on every required field, so
+    // counting them here produced false "validation errors" after every submit.
+    // Only actual error elements (above) are treated as failures.
+    return [...errs].slice(0, 25);
+  }).catch(() => []);
+}
+
+// Diagnostic: list required form controls that are STILL empty/invalid after
+// filling — pinpoints exactly what blocks a submission. Handles radio groups
+// (one checked member satisfies the whole group), checkboxes, selects and
+// custom role=combobox dropdowns.
+async function collectEmptyRequired(page) {
+  return page.evaluate(() => {
+    const out = [];
+    const vis = (el) => {
+      const r = el.getBoundingClientRect();
+      const s = window.getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+    };
+    const labelOf = (el) => {
+      const aria = el.getAttribute('aria-label');
+      if (aria && aria.trim()) return aria.trim().slice(0, 80);
+      if (el.id) {
+        const l = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+        if (l && l.textContent.trim()) return l.textContent.replace(/\s+/g, ' ').trim().slice(0, 80);
+      }
+      const wrap = el.closest('.field');
+      if (wrap) {
+        const l = wrap.querySelector('.label');
+        if (l && l.textContent.trim()) return l.textContent.replace(/\s+/g, ' ').trim().slice(0, 80);
+      }
+      const fs = el.closest('fieldset');
+      if (fs) {
+        const leg = fs.querySelector('legend');
+        if (leg && leg.textContent.trim()) return leg.textContent.replace(/\s+/g, ' ').trim().slice(0, 80);
+      }
+      return el.name || el.id || el.tagName;
+    };
+    document.querySelectorAll('input, select, textarea, [role="combobox"]').forEach((el) => {
+      if (!vis(el)) return;
+      if (el.type === 'submit' || el.type === 'button' || el.type === 'hidden' || el.type === 'file') return;
+      const required = el.required || el.getAttribute('aria-required') === 'true';
+      if (!required) return;
+      let empty = null;
+      if (el.type === 'radio') {
+        if (el.name) {
+          const any = Array.from(document.querySelectorAll(`input[type="radio"][name="${CSS.escape(el.name)}"]`)).some(r => r.checked);
+          if (any) return;
+          empty = true;
+        } else {
+          if (el.checked) return;
+          empty = true;
+        }
+      } else if (el.type === 'checkbox') {
+        if (el.checked) return;
+        empty = true;
+      } else if (el.tagName === 'SELECT') {
+        empty = !el.value;
+      } else if (el.tagName === 'DIV') {
+        empty = (el.getAttribute('aria-expanded') !== null && (el.textContent || '').trim() === '');
+      } else {
+        empty = !(el.value || '').trim();
+      }
+      if (empty) {
+        const desc = labelOf(el);
+        if (!out.includes(desc)) out.push(desc);
+      }
+    });
+    return out.slice(0, 40);
+  }).catch(() => []);
 }
 
 // ── Browserless fallback (no Playwright/browser) ────────────────────
@@ -1590,23 +1981,27 @@ async function main() {
         process.exit(0);
       }
 
-      // If we didn't have answers from file, generate from profile
-      if (Object.keys(fillAnswers).length === 0) {
-        fillAnswers = generateAnswers(fields, profile, formAnswers).answers;
-      }
+      // Explicit answers (from the app / answers JSON) layer ON TOP of
+      // profile-generated answers — so the JSON only needs the fields the
+      // candidate answered, while name/email/phone still fill automatically.
+      const generated = generateAnswers(fields, profile, formAnswers).answers;
+      fillAnswers = { ...generated, ...fillAnswers };
 
-      // Fill the form
-      const result = await fillForm(formPage, fillAnswers);
-
-      // Attach CV if available — distinguish "no CV file" from "no upload field"
+      // Attach CV FIRST — before filling the rest of the form. ATS boards
+      // (Greenhouse et al.) re-render heavily while fields are filled (react-
+      // select menus, checkbox toggles), which can unmount/replace the file
+      // inputs. Uploading while the DOM is fresh avoids attaching the CV to
+      // the wrong upload (e.g. a later "passport photo" field). Prefer the
+      // resume input by id/name, then fall back to the first file input.
       const cvPath = resolveTailoredCv(company);
       let cvAttached = false;
       let cvNote = '';
       if (cvPath) {
         try {
-          const fileInput = await formPage.$('input[type="file"]');
+          const fileInput = await formPage.$('input[type="file"]#resume, input[type="file"][name="resume"], input[type="file"]');
           if (fileInput) {
             await fileInput.setInputFiles(cvPath);
+            await formPage.waitForTimeout(900);
             cvAttached = true;
             cvNote = 'CV attached.';
           } else {
@@ -1619,11 +2014,71 @@ async function main() {
         cvNote = 'No CV PDF found — run "Generate CV" first, then retry.';
       }
 
+      // Fill the form
+      const result = await fillForm(formPage, fillAnswers);
+
       // Take screenshot
       const screenshotDir = join(userDir, 'data', 'uploads');
       if (!existsSync(screenshotDir)) mkdirSync(screenshotDir, { recursive: true });
       const screenshotPath = join(screenshotDir, `fill-${Date.now()}.png`);
       await formPage.screenshot({ path: screenshotPath, fullPage: true });
+
+      // ── SUBMIT STEP (only with --submit — user-initiated, HITL) ──
+      let submitState = null;
+      if (submitMode) {
+        const clicked = await clickSubmitButton(formPage);
+        await formPage.waitForTimeout(5000);
+        const afterUrl = formPage.url();
+        const errs = await collectFormErrors(formPage);
+        const emptyRequired = await collectEmptyRequired(formPage);
+        const pageText = await formPage.evaluate(() => document.body?.innerText || '').catch(() => '');
+        const successText = /thank you for (your )?(application|interest)|application (has been )?(received|submitted)|your application has been submitted|successfully applied/i;
+        const errorDetail = await formPage.evaluate(() => {
+          const vis = (el) => {
+            const r = el.getBoundingClientRect();
+            const s = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+          };
+          const out = [];
+          document.querySelectorAll('[class*="error"], [class*="success"], [role="alert"], [aria-invalid="true"], .notice, .job-application-success, .thank_you').forEach((el) => {
+            if (!vis(el)) return;
+            const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+            out.push({
+              tag: el.tagName.toLowerCase(),
+              id: el.id || '',
+              cls: String(el.className || '').slice(0, 60),
+              text: t.slice(0, 120),
+              invalid: el.getAttribute('aria-invalid'),
+            });
+          });
+          const forms = Array.from(document.forms).map((f) => ({
+            id: f.id || '', cls: String(f.className || '').slice(0, 40), action: (f.action || '').slice(0, 80),
+          }));
+          const checkboxes = Array.from(document.querySelectorAll('input[type="checkbox"]')).filter(vis).length;
+          const bodyStart = (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+          const thanks = (document.body?.innerText || '').match(/thank you|application submitted|has been received|successfully/i);
+          return { els: out.slice(0, 30), forms, checkboxes, thanks: thanks ? thanks[0] : null, bodyStart };
+        }).catch(() => null);
+        // Truthful success check: a real error element or a genuine validation
+        // error string means FAILURE, even if some success text slipped in.
+        // Success = explicit thank-you text, a success-class banner, OR no real
+        // errors AND the form left the page (replaced by a thank-you / navigated).
+        const realErrEls = (errorDetail?.els || []).filter((e) => /error/i.test(e.cls) || e.invalid === 'true' || /error|invalid/i.test(e.text));
+        const successEls = (errorDetail?.els || []).filter((e) => /success|thank/i.test(e.cls) || /thank you|received|successfully/i.test(e.text));
+        const formGone = (errorDetail?.forms || []).length === 0;
+        const submissionOk = successText.test(pageText) || successEls.length > 0 ||
+          (clicked.found && errs.length === 0 && realErrEls.length === 0 &&
+            (errorDetail?.thanks || formGone || afterUrl !== jobUrl));
+        submitState = {
+          clicked: clicked.found,
+          buttonText: clicked.text || '',
+          validationErrors: errs,
+          emptyRequired,
+          submissionOk,
+          errorDetail,
+          pageAfter: afterUrl.slice(0, 200),
+        };
+      }
 
       await browser.close();
 
@@ -1643,6 +2098,7 @@ async function main() {
           cvAttached,
           screenshotPath,
           loginVia,
+          submit: submitState,
           error: `Could not fill any of ${fields.length} detected field(s) — answer keys did not match the form controls.`,
           message: `⚠️ Could not fill form — 0 of ${fields.length} fields filled. ${cvNote} Manual apply required.`,
           manualUrl: jobUrl,
@@ -1666,9 +2122,14 @@ async function main() {
         cvNote,
         screenshotPath,
         loginVia,
-        message: cvAttached
-          ? `Form filled (${result.filled.length}/${fields.length} fields) and CV attached. Review and submit manually.`
-          : `Form filled (${result.filled.length}/${fields.length} fields). ${cvNote} Review and submit manually.`,
+        submit: submitState,
+        message: submitState?.clicked
+          ? (submitState.submissionOk
+              ? `Form filled (${result.filled.length}/${fields.length} fields), CV attached, and application submitted.`
+              : `Form filled (${result.filled.length}/${fields.length} fields), CV attached, and the submit button was clicked — but the site returned ${submitState.validationErrors.length} validation error(s): ${submitState.validationErrors.slice(0, 5).join('; ')}`)
+          : (cvAttached
+              ? `Form filled (${result.filled.length}/${fields.length} fields) and CV attached. Review and submit manually.`
+              : `Form filled (${result.filled.length}/${fields.length} fields). ${cvNote} Review and submit manually.`),
         manualUrl: jobUrl,
       }, null, 2));
 

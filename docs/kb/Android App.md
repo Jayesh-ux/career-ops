@@ -1,7 +1,7 @@
 ---
 type: component
 tags: [component, android, compose]
-updated: 2026-08-03
+updated: 2026-08-04
 ---
 
 # Android App
@@ -36,6 +36,27 @@ down it routes to `ONBOARDING_PORTAL` rather than straight to Chat.
 every cold start (splash + retry while it resolves) and cache-busts the saved
 start destination, so reopening from Recents never silently skips an un-resolved
 portal dependency.
+
+## Apply routing (email-first)
+
+`ChatViewModel.draftApplication()` is the single Apply entry point from job
+cards and scan results. It runs:
+
+1. **Dedup gate** — `getTracker()` + `isSpammed()`: skip if the company already
+   has a tracker row in Applied/Interview/Offer/Responded.
+2. **Email draft first (proven CLI path)** — always calls `POST /email/draft`
+   with the job URL. The bridge's `fetchJdAndContact` scrapes the posting page
+   for a real application email (many Indian portals like Naukri/Internshala/
+   Shine/foundit expose one). This is the proven email-first strategy from the
+   CLI (the 81-application run was mostly email applications).
+3. **Email found** → `EmailDraft` card → user confirms → `sendEmail()` →
+   `POST /email/send` (per-user OAuth, per-user CV attached) → tracker row
+   `Applied` with notes `Emailed {to} via career-ops app` + `contactEmail`.
+4. **No email found** → fall back to Playwright auto-fill (`startAutoFill` /
+   `/apply/open` + `/apply/fill`) or a manual-apply message.
+
+Never auto-sends: the email is always shown for review first
+([[Security & Human-in-the-loop]]).
 
 ## Related files
 

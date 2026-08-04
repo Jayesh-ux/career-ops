@@ -5893,6 +5893,13 @@ app.post('/chat/stream', async (req, res) => {
       return finish();
     }
 
+    // Detect workflow phase from message (used for progress + fallback)
+    const isApply = lowerMsg.includes('apply') || lowerMsg.includes('follow');
+    const isScan = lowerMsg.includes('scan') || lowerMsg.includes('find job') || lowerMsg.includes('search');
+    const isEmail = lowerMsg.includes('email') || lowerMsg.includes('inbox');
+    const isCv = lowerMsg.includes('cv') || lowerMsg.includes('resume') || lowerMsg.includes('pdf');
+    const isInterview = lowerMsg.includes('interview');
+
     // Poll opencode until idle, then fetch the response
     const POLL_MS = 1000;
     const MAX_WAIT = isScan ? 120000 : 300000; // 2 min for scan, 5 min otherwise
@@ -5903,13 +5910,6 @@ app.post('/chat/stream', async (req, res) => {
     let lastStreamedLen = 0; // Track how much text we've already streamed
     let lastToolName = '';
     let completedTools = 0;
-
-    // Detect workflow phase from message (used for progress + fallback)
-    const isApply = lowerMsg.includes('apply') || lowerMsg.includes('follow');
-    const isScan = lowerMsg.includes('scan') || lowerMsg.includes('find job') || lowerMsg.includes('search');
-    const isEmail = lowerMsg.includes('email') || lowerMsg.includes('inbox');
-    const isCv = lowerMsg.includes('cv') || lowerMsg.includes('resume') || lowerMsg.includes('pdf');
-    const isInterview = lowerMsg.includes('interview');
 
     while (Date.now() < deadline && !settled) {
       await new Promise(r => setTimeout(r, POLL_MS));
@@ -6463,6 +6463,41 @@ function parseActionBlocks(text) {
   return { text: cleanText, actions };
 }
 
+// Robust JSON extraction for apply-job.mjs stdout. The scripts print one JSON
+// object, but a browser/stealth lib can occasionally leak a banner line onto
+// stdout — find the first balanced JSON object instead of requiring pure output.
+function extractJsonPayload(text) {
+  if (!text) return null;
+  const trimmed = text.trim();
+  try { return JSON.parse(trimmed); } catch {}
+  const start = trimmed.indexOf('{');
+  if (start < 0) return null;
+  let depth = 0;
+  for (let i = start; i < trimmed.length; i++) {
+    if (trimmed[i] === '{') depth++;
+    else if (trimmed[i] === '}') {
+      depth--;
+      if (depth === 0) {
+        try { return JSON.parse(trimmed.slice(start, i + 1)); } catch { return null; }
+      }
+    }
+  }
+  return null;
+}
+
+function parseApplyOutput(r, url, label) {
+  const stdout = (r.stdout || '').trim();
+  const stderr = (r.stderr || '').trim();
+  const parsed = extractJsonPayload(stdout);
+  if (parsed) {
+    if (stderr) console.log(`[apply:${label}] stderr: ${stderr.slice(0, 400)}`);
+    return parsed;
+  }
+  console.log(`[apply:${label}] non-JSON stdout (${stdout.length}B): ${stdout.slice(0, 500)}`);
+  console.log(`[apply:${label}] stderr (${stderr.length}B): ${stderr.slice(0, 500)}`);
+  return { error: `Failed to parse ${label} result`, manualUrl: url, raw: stdout.slice(0, 500) };
+}
+
 // ── POST /apply/open — Open Chrome, extract form fields ─────────────
 app.post('/apply/open', async (req, res) => {
   try {
@@ -6475,7 +6510,7 @@ app.post('/apply/open', async (req, res) => {
     const r = spawnSync('node', scriptArgs, {
       cwd: userDir,
       encoding: 'utf-8',
-      timeout: 60_000,
+      timeout: 120_000,
       env: { ...process.env, FORCE_COLOR: '0' },
     });
 
@@ -6483,12 +6518,7 @@ app.post('/apply/open', async (req, res) => {
       return res.json({ error: r.stderr || 'Apply script failed', manualUrl: url });
     }
 
-    try {
-      const result = JSON.parse(r.stdout.trim());
-      res.json(result);
-    } catch {
-      res.json({ error: 'Failed to parse apply result', manualUrl: url });
-    }
+    res.json(parseApplyOutput(r, url, 'open'));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -6497,7 +6527,7 @@ app.post('/apply/open', async (req, res) => {
 // ── POST /apply/fill — Fill form with user answers + CV ────────────
 app.post('/apply/fill', async (req, res) => {
   try {
-    const { url, answers, company, stealth } = req.body;
+    const { url, answers, company, stealth, submit } = req.body;
     if (!url) return res.status(400).json({ error: 'url required' });
 
     const userDir = req.userCtx?.userDir || __dirname;
@@ -6512,11 +6542,12 @@ app.post('/apply/fill', async (req, res) => {
     if (stealth) scriptArgs.push('--stealth');
     if (answers) scriptArgs.push('--answers-json', answersPath);
     if (company) scriptArgs.push('--company', company);
+    if (submit) scriptArgs.push('--submit');
 
     const r = spawnSync('node', scriptArgs, {
       cwd: userDir,
       encoding: 'utf-8',
-      timeout: 90_000,
+      timeout: 150_000,
       env: { ...process.env, FORCE_COLOR: '0' },
     });
 
@@ -6527,12 +6558,7 @@ app.post('/apply/fill', async (req, res) => {
       return res.json({ error: r.stderr || 'Apply fill failed', manualUrl: url });
     }
 
-    try {
-      const result = JSON.parse(r.stdout.trim());
-      res.json(result);
-    } catch {
-      res.json({ error: 'Failed to parse fill result', manualUrl: url });
-    }
+    res.json(parseApplyOutput(r, url, 'fill'));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -6581,12 +6607,7 @@ app.post('/apply/guide', async (req, res) => {
       return res.json({ error: r.stderr || 'Guide generation failed', manualUrl: url });
     }
 
-    try {
-      const result = JSON.parse(r.stdout.trim());
-      res.json(result);
-    } catch {
-      res.json({ error: 'Failed to parse guide result', manualUrl: url });
-    }
+    res.json(parseApplyOutput(r, url, 'guide'));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

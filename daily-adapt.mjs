@@ -55,7 +55,7 @@ function loadTracker() {
 
 // ── Load profile ────────────────────────────────────────────────────
 
-function loadProfile() {
+async function loadProfile() {
   const profilePath = join(userDir, 'config', 'profile.yml');
   if (!existsSync(profilePath)) return {};
   try {
@@ -176,9 +176,9 @@ function suggestChanges(metrics, profile) {
 
 // ── Main ────────────────────────────────────────────────────────────
 
-function main() {
+async function main() {
   const entries = loadTracker();
-  const profile = loadProfile();
+  const profile = await loadProfile();
   const metrics = computeMetrics(entries);
   const changes = suggestChanges(metrics, profile);
 
@@ -190,4 +190,7 @@ function main() {
   }, null, 2));
 }
 
-main();
+main().catch((e) => {
+  console.error(`daily-adapt.mjs failed: ${e.message}`);
+  process.exit(1);
+});

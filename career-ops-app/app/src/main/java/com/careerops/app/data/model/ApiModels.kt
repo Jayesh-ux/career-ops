@@ -601,7 +601,17 @@ data class ApplyFillRequest(
     val url: String,
     val answers: Map<String, String> = emptyMap(),
     val company: String? = null,
-    val stealth: Boolean = false
+    val stealth: Boolean = false,
+    val submit: Boolean = false
+)
+
+data class ApplySubmitState(
+    val clicked: Boolean = false,
+    val buttonText: String = "",
+    val validationErrors: List<String> = emptyList(),
+    val emptyRequired: List<String> = emptyList(),
+    val submissionOk: Boolean = false,
+    val pageAfter: String = ""
 )
 
 data class ApplyFillResponse(
@@ -618,7 +628,9 @@ data class ApplyFillResponse(
     val loginWall: Boolean = false,
     val loginVia: String? = null,
     val message: String = "",
-    val error: String? = null
+    val error: String? = null,
+    val submit: ApplySubmitState? = null,
+    val manualUrl: String = ""
 )
 
 data class ManualApplyGuide(

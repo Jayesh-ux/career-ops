@@ -145,6 +145,24 @@ sealed class ChatMessage {
         val onDiscard: (() -> Unit)? = null
     ) : ChatMessage()
 
+    data class SubmitConfirmation(
+        override val id: Long = nextId(),
+        val company: String = "",
+        val atsType: String = "",
+        val fieldsFilled: Int = 0,
+        val fieldsTotal: Int = 0,
+        val cvAttached: Boolean = false,
+        val onSubmit: (() -> Unit)? = null,
+        val onReview: (() -> Unit)? = null
+    ) : ChatMessage()
+
+    data class ManualApplyCard(
+        override val id: Long = nextId(),
+        val company: String = "",
+        val url: String = "",
+        val onMarkApplied: (() -> Unit)? = null
+    ) : ChatMessage()
+
     companion object {
         private var counter = 0L
         fun nextId(): Long = ++counter
@@ -1611,14 +1629,35 @@ class ChatViewModel @Inject constructor(
                     fillResponse.cvNote.isNotBlank() -> "⚠️ ${fillResponse.cvNote}"
                     else -> "⚠️ No CV found to attach"
                 }
+                // Show field summary
                 messages.add(ChatMessage.System(
-                    "\u2705 **Form filled for $_pendingAutoFillCompany**\n" +
+                    "✅ **Form filled for $_pendingAutoFillCompany**\n" +
                     "ATS: ${fillResponse.atsType ?: "Unknown"}\n" +
                     "Fields filled: ${fillResponse.filled.size}\n" +
                     "Skipped: ${fillResponse.skipped.size}\n" +
-                    "$cvStatus\n\n" +
-                    "\u26A0\uFE0F **Review the form in the browser and submit manually.** " +
-                    "I never auto-submit applications."
+                    cvStatus
+                ))
+                // Show submit confirmation card — proven CLI pattern:
+                // /apply/fill (no submit) → review → /apply/fill (submit=true)
+                val company = _pendingAutoFillCompany
+                val url = _pendingAutoFillUrl
+                val answers = _pendingAutoFillAnswers
+                messages.add(ChatMessage.SubmitConfirmation(
+                    company = company,
+                    atsType = fillResponse.atsType ?: "Unknown",
+                    fieldsFilled = fillResponse.filled.size,
+                    fieldsTotal = fillResponse.filled.size + fillResponse.skipped.size,
+                    cvAttached = fillResponse.cvAttached,
+                    onSubmit = {
+                        viewModelScope.launch {
+                            handleSubmitApplication(url, company, answers)
+                        }
+                    },
+                    onReview = {
+                        messages.add(ChatMessage.System(
+                            "Open this URL in your browser to review the filled form:\n${url}"
+                        ))
+                    }
                 ))
             } else {
                 val reason = fillResponse.message.ifBlank { fillResponse.error ?: "Unknown error" }
@@ -1649,6 +1688,133 @@ class ChatViewModel @Inject constructor(
             _pendingAutoFillCompany = ""
             _pendingAutoFillQuestions = emptyList()
         }
+    }
+
+    // Submit step: re-calls /apply/fill with submit=true. Same proven CLI pattern:
+    // fill (no submit) → review → fill (submit=true) → report result.
+    // Called from the SubmitConfirmation card's "Submit" button.
+    private suspend fun handleSubmitApplication(
+        url: String,
+        company: String,
+        answers: Map<String, String>
+    ) {
+        try {
+            ensureProcessingCard("Submitting application to $company...")
+            updateProcessingCard(detail = "Clicking submit on $company form...")
+
+            val fillResponse = withContext(Dispatchers.IO) {
+                api.applyFill(ApplyFillRequest(
+                    url = url,
+                    answers = answers,
+                    company = company,
+                    stealth = true,
+                    submit = true
+                ))
+            }
+
+            removeProcessing()
+            isProcessing = false
+
+            val submitState = fillResponse.submit
+            if (submitState?.submissionOk == true) {
+                messages.add(ChatMessage.System(
+                    "🎉 **Application submitted to $company!**\n" +
+                    "ATS: ${fillResponse.atsType ?: "Unknown"}\n" +
+                    "Fields filled: ${fillResponse.filled.size}\n" +
+                    "CV attached: ${if (fillResponse.cvAttached) "Yes" else "No"}\n\n" +
+                    "The application was successfully submitted. Check your email for a confirmation."
+                ))
+                updateTrackerToApplied(company, submitted = true)
+            } else if (submitState?.clicked == true && submitState.validationErrors.isNotEmpty()) {
+                // Form was submitted but validation blocked it — safe, nothing was sent
+                val errorList = submitState.validationErrors.joinToString("\n") { "• $it" }
+                val emptyList = submitState.emptyRequired.joinToString("\n") { "• $it" }
+                messages.add(ChatMessage.System(
+                    "⚠️ **Form validation blocked submission to $company**\n\n" +
+                    "The submit button was clicked but the form requires these fields:\n" +
+                    "$errorList\n\n" +
+                    if (emptyList.isNotBlank()) "Empty required fields:\n$emptyList\n\n" else "" +
+                    "The form did NOT submit — nothing was sent. " +
+                    "Fill the remaining fields on the site, then tap below to mark it applied."
+                ))
+                messages.add(ChatMessage.ManualApplyCard(
+                    company = company,
+                    url = url,
+                    onMarkApplied = {
+                        viewModelScope.launch { handleMarkApplied(company, url) }
+                    }
+                ))
+            } else {
+                messages.add(ChatMessage.System(
+                    "❌ **Submit failed for $company**\n" +
+                    "${fillResponse.message.ifBlank { fillResponse.error ?: "Submit button not found" }}\n\n" +
+                    "Please apply manually at this link:\n$url"
+                ))
+                messages.add(ChatMessage.ManualApplyCard(
+                    company = company,
+                    url = url,
+                    onMarkApplied = {
+                        viewModelScope.launch { handleMarkApplied(company, url) }
+                    }
+                ))
+            }
+        } catch (e: Exception) {
+            removeProcessing()
+            isProcessing = false
+            messages.add(ChatMessage.System(
+                "❌ **Submit failed for $company**: ${e.message}\n" +
+                "Please apply manually at this link:\n$url"
+            ))
+            messages.add(ChatMessage.ManualApplyCard(
+                company = company,
+                url = url,
+                onMarkApplied = {
+                    viewModelScope.launch { handleMarkApplied(company, url) }
+                }
+            ))
+        }
+    }
+
+    // Find the most recent tracker entry for a company (case-insensitive).
+    private suspend fun findTrackerId(company: String): String? {
+        return try {
+            val resp = withContext(Dispatchers.IO) { api.getTracker() }
+            resp.applications
+                .filter { it.company.equals(company, ignoreCase = true) }
+                .maxByOrNull { it.id.toIntOrNull() ?: 0 }
+                ?.id
+        } catch (_: Exception) { null }
+    }
+
+    // Set a tracker entry to "Applied" and report the outcome to the chat.
+    private suspend fun updateTrackerToApplied(company: String, submitted: Boolean) {
+        val id = findTrackerId(company)
+        if (id == null) {
+            messages.add(ChatMessage.System(
+                "📋 Note: no tracker entry found for $company — add it from your tracker view to keep the pipeline current."
+            ))
+            return
+        }
+        try {
+            withContext(Dispatchers.IO) {
+                api.updateStatus(id, mapOf("status" to ApplicationStatus.APPLIED.name))
+            }
+            messages.add(ChatMessage.System(
+                if (submitted)
+                    "📋 **Tracker updated**: $company → Applied"
+                else
+                    "✅ **Marked $company as Applied in your tracker.**"
+            ))
+        } catch (e: Exception) {
+            messages.add(ChatMessage.System(
+                "📋 Couldn't auto-update the tracker for $company (${e.message}). Update it from your tracker view."
+            ))
+        }
+    }
+
+    // Called from the ManualApplyCard's "I applied manually" button.
+    private suspend fun handleMarkApplied(company: String, url: String) {
+        updateTrackerToApplied(company, submitted = false)
     }
 
     // ── Direct follow-up via POST /followup/draft ──────────────────────────
@@ -2629,20 +2795,12 @@ class ChatViewModel @Inject constructor(
                 persistMessages(); return
             }
 
-            // Step 2: Route apply based on the job URL. Portal listings
-            // (LinkedIn/Shine/Internshala/etc.) never expose a contact email, so an
-            // email draft is pointless and can hallucinate details — go straight to
-            // the Playwright auto-fill flow instead.
-            if (url.isNotBlank() && isPortalListingUrl(url)) {
-                messages.add(ChatMessage.System(
-                    "\uD83D\uDCC6 **$company** \u2014 **$role** is a portal listing without a direct contact email.\n" +
-                    "I'll try auto-filling the application form on the job page instead."
-                ))
-                startAutoFill(url, company)
-                return
-            }
-
-            // Step 3: Draft the email
+            // Step 2: Draft the application email first. The bridge scrapes the
+            // posting page itself (fetchJdAndContact) to pull a real application
+            // email — many Indian portals (Naukri/Internshala/Shine/foundit)
+            // expose one even though a contact list is never visible. This is the
+            // proven email-first path from the CLI. Only when the page exposes no
+            // suitable email do we fall back to Playwright auto-fill.
             updateProcessingCard(detail = "Drafting application for $company — $role...")
             val response = withContext(Dispatchers.IO) {
                 api.draftEmail(EmailDraftRequest(company = company, role = role, type = "application", jd = url.ifEmpty { null }))
@@ -2656,7 +2814,7 @@ class ChatViewModel @Inject constructor(
                     } else ""
                     if (url.isNotBlank()) {
                         messages.add(ChatMessage.System(
-                            "\u26A0\uFE0F **Draft ready** for **$company** \u2014 **$role**, but no contact email was found.$phoneHint\n" +
+                            "\u26A0\uFE0F **Draft ready** for **$company** \u2014 **$role**, but no contact email was found on the posting page.$phoneHint\n" +
                             "I'll try auto-filling the application form on the job page instead."
                         ))
                         startAutoFill(url, company)
@@ -2709,7 +2867,11 @@ class ChatViewModel @Inject constructor(
             if ((response["success"] as? Boolean) == true) {
                 try {
                     withContext(Dispatchers.IO) {
-                        api.addTrackerEntry(TrackerAddRequest(company = company, role = role, notes = "Applied via career-ops app"))
+                        api.addTrackerEntry(TrackerAddRequest(
+                            company = company, role = role,
+                            contactEmail = to,
+                            notes = "Emailed $to via career-ops app"
+                        ))
                     }
                 } catch (_: Exception) {}
 

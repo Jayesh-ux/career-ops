@@ -1,7 +1,7 @@
 ---
 type: flow
 tags: [flow, apply, autofill]
-updated: 2026-08-03
+updated: 2026-08-04
 ---
 
 # Auto-fill Pipeline
@@ -9,6 +9,13 @@ updated: 2026-08-03
 How a job URL becomes a filled (never submitted) application form. This is the
 endgame of the whole [[Portal Session]] design: fill every login-gated portal
 with the same saved Google session.
+
+The auto-fill pipeline is the **fallback**, not the default. The app's Apply
+routing is **email-first** ([[Android App]]): it drafts an application email and
+scrapes the posting page for a real contact first; auto-fill only runs when no
+application email exists on the page. The email path is the proven CLI strategy
+(the 81-application run was mostly email applications); portal-form automation
+is the gap to be trained and validated portal-by-portal later.
 
 ## Flow
 

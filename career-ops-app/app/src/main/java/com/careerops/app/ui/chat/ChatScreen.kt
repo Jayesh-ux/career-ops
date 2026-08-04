@@ -300,6 +300,8 @@ fun ChatScreen(
                                  is ChatMessage.ScanActions -> ScanActionsCard(message)
                                  is ChatMessage.ScanResultsCard -> ScanResultsSummaryCard(message)
                                  is ChatMessage.FormQuestion -> FormQuestionCard(message)
+                                 is ChatMessage.SubmitConfirmation -> SubmitConfirmationCard(message)
+                                 is ChatMessage.ManualApplyCard -> ManualApplyCard(message)
                             }
                         }
                         // Live-updating streaming bubble
@@ -1076,8 +1078,115 @@ fun FormQuestionCard(message: ChatMessage.FormQuestion) {
 }
 
 @Composable
-fun ToolStatusBubble(message: ChatMessage.ToolStatus) {
-    Row(
+fun SubmitConfirmationCard(message: ChatMessage.SubmitConfirmation) {
+    Card(
+        modifier = Modifier.fillMaxWidth(0.92f),
+        shape = RoundedCornerShape(12.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f)
+        )
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Default.Send,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Form filled for ${message.company}",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = "ATS: ${message.atsType} · ${message.fieldsFilled}/${message.fieldsTotal} fields · CV ${if (message.cvAttached) "attached" else "not attached"}",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(12.dp))
+            Text(
+                text = "Ready to submit? The form is filled and your CV is attached. Submitting sends your application to the company.",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = { message.onSubmit?.invoke() },
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.primary
+                    )
+                ) {
+                    Icon(Icons.Default.Check, null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Submit Application", fontSize = 13.sp)
+                }
+                OutlinedButton(
+                    onClick = { message.onReview?.invoke() },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("Review in Browser", fontSize = 12.sp)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun ManualApplyCard(message: ChatMessage.ManualApplyCard) {
+    Card(
+        modifier = Modifier.fillMaxWidth(0.92f),
+        shape = RoundedCornerShape(12.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.45f)
+        )
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                text = "Manual apply — ${message.company}",
+                fontWeight = FontWeight.Bold,
+                fontSize = 14.sp,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = "Complete the form on the site (the automation couldn't finish it). Open this link in your browser:",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = message.url,
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.primary
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            Button(
+                onClick = { message.onMarkApplied?.invoke() },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.primary
+                )
+            ) {
+                Icon(Icons.Default.Check, null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("I applied manually — update tracker to Applied", fontSize = 12.sp)
+            }
+        }
+    }
+}
+
+@Composable
+fun ToolStatusBubble(message: ChatMessage.ToolStatus) {    Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.Start
     ) {
