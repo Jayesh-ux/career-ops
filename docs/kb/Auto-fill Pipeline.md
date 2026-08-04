@@ -15,7 +15,11 @@ routing is **email-first** ([[Android App]]): it drafts an application email and
 scrapes the posting page for a real contact first; auto-fill only runs when no
 application email exists on the page. The email path is the proven CLI strategy
 (the 81-application run was mostly email applications); portal-form automation
-is the gap to be trained and validated portal-by-portal later.
+is the fallback for postings with no reachable email.
+
+As of 2026-08-04 the auto-fill engine is **validated on the ATS boards the
+scanner actually surfaces** — Ashby, Lever, and Greenhouse — so a posting with
+no email gets a real, working apply path, not a dead end.
 
 ## Flow
 
@@ -24,7 +28,10 @@ Job URL → /apply/open → Playwright loads page
   → auth entry detected?
        yes → "Login with Google" → reuse saved session (no password needed)
        no  → straight to form
-  → form rendered? → extract fields → fill from cv.md + profile.yml
+  → click Apply button (may open a tab) → click "Application" tab (Ashby/SPA)
+  → form rendered?
+       yes → extract fields → fill from cv.md + profile.yml
+       no  → Ashby GraphQL API fallback (real labels + ids, drives fill-by-id)
   → attach CV (cvNote confirms) → report X/Y fields filled
   → STOP. No auto-submit ever.
 ```
@@ -43,8 +50,11 @@ Job URL → /apply/open → Playwright loads page
 
 ## Target battery
 
-The multi-portal test plan exercises: Internshala, Naukri, Shine, TimesJobs,
-iimjobs, Foundit, Instahyre (+ backups) — each with a per-portal report:
+Validated (2026-08-04): **Ashby** (`jobs.ashbyhq.com`) — tab-reveal + GraphQL
+API fallback; **Lever** (`jobs.lever.co`) — clean extract/fill; **Greenhouse**
+(`boards.greenhouse.io`) — standard field names. Remaining login-gated portals
+(Internshala, Naukri, Shine, ...) still need an account session in the vault
+([[Portal Session]]); the multi-portal test plan exercises those individually:
 login ✓/✗, fields X/Y, CV attached ✓/✗.
 
 ## Related files

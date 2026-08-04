@@ -98,8 +98,35 @@ Follow this order on every application task:
 4. **The user confirms and sends** from the app (`/email/send`). On success
    the bridge marks the tracker row `Applied` with the contact email noted.
 5. **Never** submit a Playwright form by default; portal form auto-fill is the
-   fallback for postings with no reachable email, and it is the path still
-   being validated portal-by-portal.
+   fallback for postings with no reachable email.
+
+## 7. Portal auto-fill reality (validated 2026-08-04)
+
+The Playwright auto-fill engine (`apply-job.mjs`) is now reliable on the ATS
+boards the scanner actually surfaces, so postings with no reachable email DO
+get a working apply path:
+
+- **Ashby** (`jobs.ashbyhq.com/<org>/<id>`) — the application form is tabbed
+  behind an **"Application" tab**, not an Apply button; the engine clicks it to
+  mount the form. If the SPA still won't mount (slow vendor CDN), the engine
+  falls back to Ashby's public non-user GraphQL endpoint
+  (`ApiJobPosting`) which returns the real field labels, types, required flags
+  and ids — so the app still shows proper questions + auto-answers instead of
+  "Type here...".
+- **Lever** (`jobs.lever.co/...`) — forms extract and fill cleanly. A stale
+  `cf_clearance` cookie in the reusable profile no longer false-positives as a
+  bot challenge (cookie presence alone never blocks a clean page; only a real
+  challenge widget or visible block text does).
+- **Greenhouse** (`boards.greenhouse.io/...`) — standard field names fill from
+  the profile.
+- Honest reporting: the engine only reports success when fields were actually
+  filled; 0-fields-filled is a FAILURE with a manual guide, never a false green
+  check.
+
+So the end-to-end loop — **scan → evaluate (score ≥ 4.0) → email-first apply →
+auto-fill fallback → tracker Applied** — is fully autonomous for the suggested
+portals; the app routes email-first and falls back to auto-fill automatically,
+and the only human step is the confirm-to-send / confirm-submit tap.
 
 ## 6. Output hygiene
 

@@ -1,7 +1,7 @@
 ---
 type: component
 tags: [component, playwright, browser]
-updated: 2026-08-03
+updated: 2026-08-04
 ---
 
 # Playwright Automation
@@ -49,6 +49,27 @@ every later run.
   (Greenhouse/Ashby/Lever). Now only a bot cookie whose domain matches the page
   being filled counts as a block. This was the "apply via app was broken" cause.
 - `cvNote` — confirmation that the CV file was attached, included in fill output.
+- **2026-08-04 fixes (the "job is not posting" batch):**
+  - `revealApplicationTab()` — Ashby (and tabbed SPA boards) put the form behind
+    an **"Application" tab**, not an Apply button; without a click the form never
+    mounts and extraction returns 0 fields. The engine now polls for and clicks
+    the tab (skipping Overview / already-submitted states) before extracting.
+  - `extractAshbyFormViaApi()` — browserless Ashby extraction via the public
+    non-user GraphQL endpoint (`ApiJobPosting`): returns real labels, types,
+    required flags, and ids that match the DOM input ids. Used as a fallback when
+    the SPA won't hydrate, and to drive fill-by-id in `--fill` mode.
+  - Label resolution priority — explicit labels (`aria-label`, `label[for]`,
+    wrapping label, sibling label in the field container) beat placeholders, so
+    Ashby's `placeholder="Type here..."` inputs stop producing bogus questions.
+  - Ashby `_systemfield_*` id mapping in `classifyField` — name/email/resume/
+    linkedin/github fields auto-answer from the profile.
+  - Unlabeled file inputs are skipped (Ashby renders an auxiliary unlabeled file
+    input next to the real Resume upload → phantom empty question).
+  - Bot-cookie **false positive** removed: a stale `cf_clearance` (which proves a
+    PREVIOUS successful Cloudflare pass) no longer blocks a clean page. Only a
+    real challenge widget in the DOM or visible block text counts as a block;
+    cookies only enrich the reason string when a real block is already detected.
+    This unblocked Lever (`jobs.lever.co`) applications.
 
 ## Stealth & anti-bot (2026-08-03)
 

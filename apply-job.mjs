@@ -530,6 +530,37 @@ async function clickApplyButton(page, context) {
   return page;
 }
 
+// SPA ATS boards (Ashby, and tabbed boards like Lever/Greenhouse portals) tab
+// the application form behind an "Application" tab instead of an "Apply"
+// button — with no Apply button the form never mounts and extraction returns
+// 0 fields even though the posting is live. Click the tab so the form renders.
+// Polls because the tab itself is client-rendered and appears after hydration.
+async function revealApplicationTab(page, timeoutMs = 10000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const clicked = await page.evaluate(() => {
+      const vis = (el) => {
+        const r = el.getBoundingClientRect();
+        const s = window.getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+      };
+      const els = Array.from(document.querySelectorAll('a, button, [role="tab"], [role="button"]'))
+        .filter((el) => {
+          if (!vis(el)) return false;
+          const t = (el.textContent || '').trim();
+          if (/submitted|already applied|thank you/i.test(t)) return false;
+          return /^\s*(application|apply)(?:\s|$)/i.test(t) && !/overview/i.test(t);
+        });
+      if (!els.length) return false;
+      els[0].click();
+      return true;
+    }).catch(() => false);
+    if (clicked) return true;
+    await page.waitForTimeout(1500);
+  }
+  return false;
+}
+
 // ── Extract fields (default mode) ───────────────────────────────────
 // Reads form controls from the main document AND every iframe — ATS
 // forms (Internshala, Naukri, Workday) are frequently embedded in an
@@ -556,13 +587,25 @@ async function extractFields(page) {
           const style = window.getComputedStyle(el);
           if (rect.width <= 0 || rect.height <= 0 || style.visibility === 'hidden' || style.display === 'none') continue;
 
-          // Resolve a human-readable label: aria-label > placeholder >
-          // explicit label[for] > wrapping label > fieldset legend > name.
+          // Resolve a human-readable label. Priority is: aria-label /
+          // aria-labelledby > explicit label[for] > wrapping label / fieldset
+          // legend > nearby label in the field container > placeholder. SPA
+          // ATS boards (Ashby, Lever, SmartRecruiters) put the real question
+          // text in a <label> sibling of the input while the input only has a
+          // generic placeholder ("Type here...") — so explicit labels MUST win
+          // over placeholder, otherwise every field classifies as unknown.
           const resolveLabel = (e) => {
             const aria = e.getAttribute('aria-label');
             if (aria && aria.trim()) return aria.trim();
-            const ph = e.getAttribute('placeholder');
-            if (ph && ph.trim()) return ph.trim();
+            const ariaLabelledby = e.getAttribute('aria-labelledby');
+            if (ariaLabelledby) {
+              const lb = document.getElementById(ariaLabelledby);
+              if (lb && lb.textContent.trim()) return lb.textContent.trim();
+            }
+            if (e.id) {
+              const forLabel = document.querySelector(`label[for="${CSS.escape(e.id)}"]`);
+              if (forLabel && forLabel.textContent.trim()) return forLabel.textContent.trim();
+            }
             const wrapLabel = e.closest('label');
             if (wrapLabel && wrapLabel.textContent.trim()) {
               // For radios/checkboxes the wrapping label is the option text,
@@ -573,24 +616,37 @@ async function extractFields(page) {
               const lblText = wrapLabel.textContent.trim().split('\n')[0];
               if (lblText) return lblText;
             }
-            if (e.id) {
-              const forLabel = document.querySelector(`label[for="${CSS.escape(e.id)}"]`);
-              if (forLabel && forLabel.textContent.trim()) return forLabel.textContent.trim();
-            }
             const fs2 = e.closest('fieldset');
             if (fs2) {
               const legend2 = fs2.querySelector('legend');
               if (legend2 && legend2.textContent.trim()) return legend2.textContent.trim();
             }
+            // Ashby/Lever render the label as a sibling of the input inside a
+            // field wrapper (label + input in the same container) — find that
+            // label before falling back to the placeholder.
+            const container = e.closest('.form-field, .field, [class*="field-container"], [class*="form-group"], [class*="form-field"], [class*="field-group"], [class*="form-item"], [class*="question"], li, .field, .row');
+            if (container) {
+              const inner = container.querySelector('label:not(label *)');
+              if (inner && inner.textContent.trim() && !inner.contains(e)) return inner.textContent.trim();
+            }
+            // Generic wrapper fallback — only when the div holds few controls.
             const wrapper = e.closest('div, li, p');
             if (wrapper) {
               const inner = wrapper.querySelector('label:not(label *)');
-              if (inner && inner.textContent.trim() && !inner.contains(e)) return inner.textContent.trim();
+              const controlCount = wrapper.querySelectorAll('input, textarea, select').length;
+              if (inner && inner.textContent.trim() && !inner.contains(e) && controlCount <= 2) return inner.textContent.trim();
             }
+            const ph = e.getAttribute('placeholder');
+            if (ph && ph.trim()) return ph.trim();
             return e.getAttribute('name') || '';
           };
 
           const label = resolveLabel(el);
+
+          // Skip auxiliary file uploads with no label (Ashby renders an
+          // unlabeled sibling file input next to the real "Resume" upload) —
+          // they'd surface as an empty phantom question in the app.
+          if (el.type === 'file' && !label.trim()) continue;
 
           result.push({
             id: el.id || el.name || `field_${result.length}`,
@@ -1012,6 +1068,42 @@ const FIELD_CATEGORIES = [
 ];
 
 function classifyField(field) {
+  // Ashby hosts its application form with reserved system-field ids
+  // (_systemfield_name, _systemfield_email, …) whose inputs only carry a
+  // generic placeholder ("Type here...") — the real meaning lives in the id,
+  // so map it before any label matching. Without this every Ashby system
+  // field falls through as "other" and the app asks the candidate for
+  // full name / email / resume that the profile already has.
+  const ASHBY_SYSTEM_FIELDS = {
+    '_systemfield_name': 'name',
+    '_systemfield_first_name': 'first_name',
+    '_systemfield_last_name': 'last_name',
+    '_systemfield_email': 'email',
+    '_systemfield_phone': 'phone',
+    '_systemfield_location': 'location',
+    '_systemfield_linkedin_url': 'linkedin',
+    '_systemfield_linkedin': 'linkedin',
+    '_systemfield_github_url': 'github',
+    '_systemfield_github': 'github',
+    '_systemfield_portfolio_url': 'portfolio',
+    '_systemfield_portfolio': 'portfolio',
+    '_systemfield_years_of_experience': 'experience_years',
+    '_systemfield_cover_letter': 'cover_letter',
+    '_systemfield_cv': 'resume',
+    '_systemfield_resume': 'resume',
+    '_systemfield_how_did_you_hear_about_the_job': 'how_heard',
+    '_systemfield_how_heard': 'how_heard',
+    '_systemfield_referral_source': 'referral',
+    '_systemfield_education_level': 'education',
+    '_systemfield_gender': 'gender',
+    '_systemfield_disability_status': 'disability',
+    '_systemfield_authorization_status': 'work_authorization',
+    '_systemfield_notice_period': 'notice_period',
+    '_systemfield_current_compensation': 'current_salary',
+    '_systemfield_expected_compensation': 'expected_salary',
+  };
+  const sys = ASHBY_SYSTEM_FIELDS[String(field.id || '').toLowerCase()];
+  if (sys) return sys;
   const l = (field.label || '').toLowerCase().trim();
   if (!l) return null;
   for (const f of FIELD_CATEGORIES) {
@@ -1613,6 +1705,86 @@ async function browserlessExtract(jobUrl, profile, formAnswers) {
   return { title, atsType, fields, answers, pendingQuestions, guide };
 }
 
+// ── Ashby browserless form extraction ───────────────────────────────
+// Ashby job pages mount their React application form asynchronously and the
+// vendor CDN can be slow, so DOM extraction can come back empty (0 fields)
+// even though the posting is live. Ashby's own job board fetches the form
+// definition — field ids (matching the DOM input ids), REAL question labels,
+// required flags, option lists — from its public non-user GraphQL endpoint.
+// Replicate that call so Ashby extraction is reliable regardless of SPA
+// hydration, and the app shows proper questions instead of "Type here...".
+const ASHBY_GRAPHQL_QUERY = `query ApiJobPosting($organizationHostedJobsPageName: String!, $jobPostingId: String!) {
+  jobPosting(organizationHostedJobsPageName: $organizationHostedJobsPageName, jobPostingId: $jobPostingId) {
+    title
+    locationName
+    applicationForm {
+      sections {
+        fieldEntries {
+          field
+          isRequired
+        }
+      }
+    }
+  }
+}`;
+
+async function extractAshbyFormViaApi(jobUrl) {
+  const m = /^https:\/\/(?:www\.)?jobs\.ashbyhq\.com\/([a-z0-9-]+)\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i.exec(jobUrl);
+  if (!m) return null;
+  const [, orgSlug, postingId] = m;
+  let res;
+  try {
+    res = await fetch('https://jobs.ashbyhq.com/api/non-user-graphql?op=ApiJobPosting', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Origin': 'https://jobs.ashbyhq.com',
+        'Referer': jobUrl,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+      },
+      body: JSON.stringify({
+        query: ASHBY_GRAPHQL_QUERY,
+        variables: { organizationHostedJobsPageName: orgSlug, jobPostingId: postingId },
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch {
+    return null;
+  }
+  if (!res.ok) return null;
+  const data = await res.json().catch(() => null);
+  const posting = data?.data?.jobPosting;
+  const form = posting?.applicationForm;
+  if (!form?.sections) return null;
+
+  const fields = [];
+  const seen = new Set();
+  for (const section of form.sections || []) {
+    for (const entry of section.fieldEntries || []) {
+      const f = entry?.field || {};
+      const path = String(f.path || '');
+      if (!path || seen.has(path)) continue;
+      seen.add(path);
+      const type = String(f.type || 'String');
+      const label = String(f.title || f.humanReadablePath || path).trim();
+      fields.push({
+        id: path,
+        type: type === 'File' ? 'file'
+          : (type === 'LongText' || type === 'RichText' ? 'textarea'
+          : (type === 'ValueSelect' || type === 'MultiValueSelect' ? 'select'
+          : 'text')),
+        label: label.slice(0, 120),
+        required: !!entry?.isRequired,
+        options: type === 'ValueSelect' || type === 'MultiValueSelect'
+          ? (Array.isArray(f.metadata?.options) ? f.metadata.options.map(o => String(o.label || o.value || o).trim()).slice(0, 20) : undefined)
+          : undefined,
+      });
+    }
+  }
+  if (fields.length === 0) return null;
+  return { title: posting.title || '', atsType: 'Ashby', fields };
+}
+
 // ── Main ────────────────────────────────────────────────────────────
 
 async function main() {
@@ -1820,6 +1992,11 @@ async function main() {
 
     // Detect blocks — real challenge widget in DOM, visible block text, or bot cookies.
     // Visible-text scan avoids false positives from hidden CSS (e.g. .grecaptcha-badge).
+    // NOTE: cookie presence alone is NOT a block signal. A stale cf_clearance / bm_sz
+    // from a PREVIOUS (successful) visit persists in the reusable profile and would
+    // otherwise false-positive a perfectly clean page (Lever, Ashby). Only a real
+    // challenge widget in the DOM or visible block text counts; cookies just enrich
+    // the reason string when a real block is already detected.
     let botDetected = false;
     let botReason = '';
     const botWidget = await detectBotWidget(page);
@@ -1835,17 +2012,17 @@ async function main() {
       botReason = `Challenge widget: ${botWidget}`;
     }
 
-    // Check for bot challenge cookies
+    // Check for bot challenge cookies (informational only — see note above)
     const challengeCookies = await checkBotCookies(page);
 
-    if (botDetected || challengeCookies.length > 0) {
+    if (botDetected) {
       const guide = generateManualGuide(atsType, jobUrl, profile, []);
       console.log(JSON.stringify({
         error: 'Bot challenge detected',
         atsType,
         manualUrl: jobUrl,
         reason: challengeCookies.length > 0
-          ? `Challenge cookies found: ${challengeCookies.join(', ')}`
+          ? `${botReason || 'Bot challenge detected'}. Challenge cookies found: ${challengeCookies.join(', ')}`
           : botReason || 'This site requires human verification (captcha/JS challenge)',
         instructions: 'Open the URL in your browser, complete the challenge, and apply manually.',
         manual_apply_guide: guide,
@@ -1903,12 +2080,37 @@ async function main() {
     // new tab — formPage is whichever page ends up hosting the real form.
     const formPage = await clickApplyButton(page, context);
 
+    // SPA boards (Ashby et al.) tab the application form behind an
+    // "Application" tab rather than an "Apply" button — click it so the form
+    // actually mounts before extraction/fill. Harmless no-op on other boards.
+    await revealApplicationTab(formPage);
+    await formPage.waitForTimeout(2500);
+
     if (fillMode) {
       // ── FILL MODE ──
       // Wait for the real form to render (SPA/dynamic forms hydrate after
-      // the Apply click), then extract fields across all frames.
+      // the Apply click), then extract fields across all frames. SPA boards
+      // can hydrate slowly — retry once with a longer window before deciding
+      // there's no form (prevents the flaky "0 fields" failure on Ashby/CDN).
       await waitForFormFields(formPage);
       let fields = await extractFields(formPage);
+      if (fields.length === 0) {
+        await waitForFormFields(formPage, 25000);
+        fields = await extractFields(formPage);
+      }
+
+      // Ashby API fallback: if the SPA never hydrated, use the GraphQL form
+      // definition. Its field ids match the Ashby DOM input ids exactly, so
+      // when the inputs finally mount they fill correctly — and the report
+      // stays accurate (real labels) instead of "no form fields detected".
+      let ashbyApiFields = null;
+      if (fields.length === 0 && atsType === 'Ashby') {
+        const apiForm = await extractAshbyFormViaApi(jobUrl);
+        if (apiForm && apiForm.fields.length > 0) {
+          ashbyApiFields = apiForm.fields;
+          fields = apiForm.fields; // ids === DOM ids; Ashby needs no login
+        }
+      }
 
       // NO FORM AT ALL → try to establish a portal session automatically
       // (Google OAuth preferred, stored creds fallback), then re-check. If a
@@ -1955,16 +2157,19 @@ async function main() {
         const shotPath = join(screenshotDir, `fill-${Date.now()}.png`);
         await formPage.screenshot({ path: shotPath, fullPage: true }).catch(() => {});
         await browser.close();
+        const guideFields = ashbyApiFields || [];
         const wallReason = loginWall
           ? `${atsType || 'This portal'} requires signing in before the application form renders (${loginWall}). Auto-fill needs an active account session — Google OAuth and stored portal login were attempted automatically. Log in on the site once (Google OAuth) and retry, or apply manually.`
-          : 'No form fields detected — the application may be multi-step or rendered after further interaction (e.g. an iframe the page hasn\u2019t mounted yet).';
+          : ashbyApiFields
+            ? `The Ashby application form (${ashbyApiFields.length} fields) exists but its JavaScript didn't render in the browser (slow vendor CDN). Retry, or apply manually using the guide below.`
+            : 'No form fields detected — the application may be multi-step or rendered after further interaction (e.g. an iframe the page hasn\u2019t mounted yet).';
         console.log(JSON.stringify({
           success: false,
           mode: 'fill',
           url: jobUrl,
           company,
           atsType,
-          fields: [],
+          fields: guideFields.map(f => ({ id: f.id, label: f.label, required: f.required })),
           filled: [],
           skipped: [],
           cvAttached: false,
@@ -1975,7 +2180,7 @@ async function main() {
           error: `Could not fill form — 0 fields detected. ${wallReason}`,
           message: `⚠️ Could not fill form — 0 fields detected. ${wallReason}`,
           manualUrl: jobUrl,
-          manual_apply_guide: generateManualGuide(atsType, jobUrl, profile, []),
+          manual_apply_guide: generateManualGuide(atsType, jobUrl, profile, guideFields),
           instructions: 'Open the URL in your browser and apply manually.',
         }, null, 2));
         process.exit(0);
@@ -2085,6 +2290,9 @@ async function main() {
       // 0 FIELDS FILLED → FAILURE, even though the form rendered. Looking
       // "done" when nothing was entered is worse than an honest error.
       if (result.filled.length === 0) {
+        const fillNote = ashbyApiFields
+          ? `The Ashby form definition was fetched from Ashby's API (${ashbyApiFields.length} fields), but the page's own JavaScript didn't mount the inputs, so nothing could be filled. Retry once, or apply manually with the guide below.`
+          : `Could not fill any of ${fields.length} detected field(s) — answer keys did not match the form controls.`;
         console.log(JSON.stringify({
           success: false,
           mode: 'fill',
@@ -2099,8 +2307,8 @@ async function main() {
           screenshotPath,
           loginVia,
           submit: submitState,
-          error: `Could not fill any of ${fields.length} detected field(s) — answer keys did not match the form controls.`,
-          message: `⚠️ Could not fill form — 0 of ${fields.length} fields filled. ${cvNote} Manual apply required.`,
+          error: fillNote,
+          message: `⚠️ Could not fill form — 0 of ${fields.length} fields filled. ${cvNote} ${fillNote}`,
           manualUrl: jobUrl,
           manual_apply_guide: generateManualGuide(atsType, jobUrl, profile, fields),
           instructions: 'Open the URL in your browser and apply manually.',
@@ -2136,7 +2344,33 @@ async function main() {
     } else {
       // ── EXTRACT MODE (default) ──
       await waitForFormFields(formPage);
-      const fields = await extractFields(formPage);
+      let fields = await extractFields(formPage);
+
+      // SPA ATS boards (Ashby, Lever, Workday) hydrate the application form
+      // AFTER their JS bundle settles, and the vendor CDN can be slow. The
+      // first wait can win the race against hydration, so when nothing
+      // rendered, wait longer (watching for the known form containers) and
+      // re-extract before reporting an empty form.
+      if (fields.length === 0) {
+        await waitForFormFields(formPage, 25000);
+        fields = await extractFields(formPage);
+      }
+
+      // Ashby API fallback: Ashby's React bundle can fail to hydrate entirely
+      // (slow vendor CDN), so DOM extraction yields 0 fields even though the
+      // posting is live. Ashby's public GraphQL endpoint returns the
+      // authoritative form — real labels, required flags, field types and ids
+      // matching the DOM inputs — so questions render properly instead of
+      // "Type here..." placeholders.
+      let source = 'dom';
+      if (fields.length === 0 && atsType === 'Ashby') {
+        const apiForm = await extractAshbyFormViaApi(jobUrl);
+        if (apiForm && apiForm.fields.length > 0) {
+          fields = apiForm.fields;
+          source = 'ashby-api';
+        }
+      }
+
       const { answers, pendingQuestions } = generateAnswers(fields, profile, formAnswers);
       const cvPath = resolveTailoredCv(company);
 
@@ -2155,6 +2389,7 @@ async function main() {
         title: title.slice(0, 200),
         company,
         atsType,
+        source,
         fields,
         answers,
         pending_questions: pendingQuestions,
@@ -2162,7 +2397,7 @@ async function main() {
         screenshotPath,
         manual_apply_guide: guide,
         message: pendingQuestions.length > 0
-          ? `Form extracted. ${pendingQuestions.length} field(s) need your input before filling.`
+          ? `Form extracted (${source === 'ashby-api' ? 'from Ashby\'s form API — the page\'s form didn\'t render in the browser, but the real questions were fetched' : 'from the rendered form'}). ${pendingQuestions.length} field(s) need your input before filling.`
           : 'Form extracted. Review answers, then fill via bridge-server /apply/fill endpoint.',
         manualUrl: jobUrl,
       }, null, 2));
