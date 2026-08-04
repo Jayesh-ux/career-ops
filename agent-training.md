@@ -66,7 +66,42 @@ Outputs must match the exact shapes the Android app consumes:
   experience from `data/cv.md` and `config/profile.yml`; never invent skills,
   metrics, or employment.
 
-## 5. Output hygiene
+## 5. Email-apply flow (profile-first, email-first)
+
+The proven CLI application path is EMAIL: draft a formal application email to a
+real recruiter/HR contact and send it with the user's CV attached — NOT the
+Playwright form auto-fill. The Bridge Server implements this as a multi-user
+backend: the requesting user is identified by `X-User-Id`, and every artifact
+(report, tracker row, sent email, CV) lands in that user's tree.
+
+Follow this order on every application task:
+
+1. **Read the user's profile FIRST** — `config/profile.yml` (name, email,
+   phone, target roles, skills, location) and `data/cv.md` (experience,
+   projects, metrics). The draft and any contact decision must be grounded in
+   these, never invented. The bridge already resolved these per-user; treat
+   them as authoritative.
+2. **Find a real application email** — the bridge pre-scrapes the posting
+   page (plain HTTP, then a headless-Chromium render fallback) and passes
+   contact emails/phones in the prompt. Prefer application-looking addresses
+   (apply/careers/hr/jobs/recruit). If none was found on the posting page, use
+   your `websearch` tool to look up the company's real application/HR email —
+   e.g. search "<company> careers email", "<company> HR email for
+   applications", "<company> contact email", or check the company website's
+   contact/careers page. Only return an address you actually verified from a
+   search result or the company site; never guess and never fabricate. If you
+   still cannot find a real address, `to` is `""` and the app falls back to
+   Playwright auto-fill.
+3. **Draft** a formal HR application email (subject + body), 150-250 words,
+   using profile/CV facts: role intent, 2-3 fit points, why this role.
+   `{"to","subject","body","contactBlock","phone"}` — nothing else.
+4. **The user confirms and sends** from the app (`/email/send`). On success
+   the bridge marks the tracker row `Applied` with the contact email noted.
+5. **Never** submit a Playwright form by default; portal form auto-fill is the
+   fallback for postings with no reachable email, and it is the path still
+   being validated portal-by-portal.
+
+## 6. Output hygiene
 
 - Return exactly the JSON/format the calling endpoint requested — no markdown
   fences, no conversational filler, no skill-wrapper artifacts.

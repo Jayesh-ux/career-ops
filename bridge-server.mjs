@@ -706,33 +706,54 @@ async function runOpencode(prompt, timeoutMs = 120000, cwd) {
   });
 
   const deadline = Date.now() + timeoutMs;
-  let sawBusy = false;
-  let idleCount = 0;
+  let lastBusyPoll = 0;
+  let msgsResult = { data: [] };
+  let msgs = [];
 
+  // Poll until we see assistant text OR the deadline/10s-idle grace expires.
+  // Previous loop broke on idleCount>=2 which raced the model's final text step
+  // (tool call finishes → status idle → loop breaks → final text not yet emitted).
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, 1000));
     const statusResult = await client.session.status({}).catch(() => ({ data: {} }));
     const st = statusResult.data?.[sessionId]?.type;
+    const isBusy = (st === 'busy' || st === 'retry');
+    if (isBusy) { lastBusyPoll = Date.now(); continue; }
 
-    if (st === 'busy' || st === 'retry') {
-      sawBusy = true;
-      idleCount = 0;
-      continue;
-    }
+    // Status idle — check messages for actual assistant text (not just tool calls).
+    msgsResult = await client.session.messages({
+      path: { id: sessionId },
+      query: { limit: 50 }
+    }).catch(() => ({ data: [] }));
+    msgs = Array.isArray(msgsResult.data) ? msgsResult.data : [];
 
-    if (sawBusy) {
-      idleCount++;
-      if (idleCount >= 2) break;
-    }
+    const hasAssistantText = msgs.some(m =>
+      m.info?.role === 'assistant' && (m.parts || []).some(p =>
+        p.type === 'text' && (p.text || p.content || '').trim().length > 10
+      )
+    );
+    if (hasAssistantText) break;
 
-    if (!sawBusy && Date.now() > (deadline - timeoutMs + 3000)) break;
+    // If never-busy case: break after 5s with no text (prompt likely rejected/error).
+    // If was-busy: break after 10s idle with no text (agent stuck on tool calls without
+    // producing a final answer — common when websearch returns but model doesn't emit text).
+    const idleMs = lastBusyPoll ? (Date.now() - lastBusyPoll) : (Date.now() - (deadline - timeoutMs));
+    if (idleMs > (lastBusyPoll ? 10000 : 5000)) break;
   }
 
-  const msgsResult = await client.session.messages({
-    path: { id: sessionId },
-    query: { limit: 50 }
-  }).catch(() => ({ data: [] }));
-  const msgs = Array.isArray(msgsResult.data) ? msgsResult.data : [];
+  // One final query if we don't have text yet (text may have arrived after last poll).
+  if (!msgs.some(m =>
+    m.info?.role === 'assistant' && (m.parts || []).some(p =>
+      p.type === 'text' && (p.text || p.content || '').trim().length > 10
+    )
+  )) {
+    await new Promise(r => setTimeout(r, 2000));
+    msgsResult = await client.session.messages({
+      path: { id: sessionId },
+      query: { limit: 50 }
+    }).catch(() => ({ data: [] }));
+    msgs = Array.isArray(msgsResult.data) ? msgsResult.data : [];
+  }
   const assistants = msgs.filter(m => m.info?.role === 'assistant');
 
   const textParts = [];
@@ -814,22 +835,67 @@ function extractJdContact(html, pageText) {
 }
 
 // Fetch a JD URL and return page text (for the LLM) + extracted contact info.
+// Email-first fallback: many Indian job boards (Internshala/Naukri/Shine/
+// Foundit/TimesJobs) render the contact/application email only in JS, so the
+// plain-HTTP fetch below sees nothing. When no application email is found, the
+// page is rendered with headless Chromium (contact-render.mjs — same stealth
+// engine as apply-job.mjs) and the visible text + DOM emails are re-extracted.
+// This is what keeps the app on the proven CLI email-apply path.
 async function fetchJdAndContact(url, { textLimit = 6000 } = {}) {
-  const resp = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-    },
-    signal: AbortSignal.timeout(15000),
-    redirect: 'follow',
-  });
-  const html = resp.ok ? await resp.text() : '';
-  const pageText = html ? html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() : '';
+  let html = '';
+  let pageText = '';
+  try {
+    const resp = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+      signal: AbortSignal.timeout(15000),
+      redirect: 'follow',
+    });
+    if (resp.ok) {
+      html = await resp.text();
+      pageText = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    }
+  } catch { /* fall through to renderer */ }
+
+  let contact = html ? extractJdContact(html, pageText) : { emails: [], phones: [], applicationEmails: [] };
+
+  // Playwright render fallback — only when the plain fetch found no usable
+  // email (the exact case where the app used to give up and fall to auto-fill).
+  const renderer = join(__dirname, 'contact-render.mjs');
+  if (existsSync(renderer) && (!html || (!contact.emails.length && !contact.applicationEmails.length))) {
+    try {
+      const r = spawnSync('node', [renderer, url, String(textLimit)], {
+        encoding: 'utf-8',
+        timeout: 45000,
+        env: { ...process.env, FORCE_COLOR: '0' },
+      });
+      if (r.status === 0) {
+        const parsed = parseJsonFromOutput(r.stdout || '');
+        if (parsed && !parsed.error && parsed.pageText && parsed.pageText.length > 50) {
+          const renderedText = (parsed.pageText || '').replace(/\s+/g, ' ').trim();
+          if (renderedText.length > pageText.length) pageText = renderedText;
+          const renderedContact = extractJdContact('', `${parsed.emails || []}\n${parsed.applicationEmails || []}\n${parsed.pageText || ''}`);
+          if (renderedContact.applicationEmails.length || renderedContact.emails.length) {
+            // Prefer application-looking emails, then any real email, then keep
+            // whatever the plain fetch found as a last resort.
+            contact = {
+              emails: renderedContact.emails.length ? renderedContact.emails : contact.emails,
+              phones: (parsed.phones || []).length ? parsed.phones : contact.phones,
+              applicationEmails: renderedContact.applicationEmails.length ? renderedContact.applicationEmails : contact.applicationEmails,
+            };
+          }
+        }
+      }
+    } catch { /* renderer failed — proceed with plain-fetch results */ }
+  }
+
   return {
     html,
     pageText: pageText.slice(0, textLimit),
-    contact: html ? extractJdContact(html, pageText) : { emails: [], phones: [], applicationEmails: [] },
+    contact,
   };
 }
 
@@ -4594,13 +4660,24 @@ app.post('/email/draft', async (req, res) => {
       } catch { /* fetch failed — the drafter proceeds on the URL alone */ }
     }
 
+    // Finding the "to" address: prefer application-looking emails from the
+    // posting page, else fall back to a websearch for the company's real
+    // application/HR email. Posting pages (Internshala et al.) often hide the
+    // company email behind their Apply flow, so the agent must be able to look
+    // it up — otherwise drafts keep coming back with no address.
+    const contactGuidance = contactHints
+      ? `${contactHints}\nUse one of these as "to" if it looks like a real hiring/application contact email.`
+      : 'No contact email was found on the posting page.';
+
     const prompt = `You are a job application email drafter. Generate a formal application email.
 Type: ${type || 'hr_application'}
 Company: ${company || 'Unknown'}
 Role: ${role || 'Unknown'}
 Contact: ${contactName || 'Hiring Team'}
 ${jdContext ? `JD: ${jdContext}` : ''}
-${contactHints ? `\n${contactHints}\nUse one of these as "to" only if it looks like a real hiring/application contact email. If none of them is suitable, return an empty string.` : ''}
+${contactHints ? `\n${contactHints}` : ''}
+
+Finding the "to" address: ${contactGuidance} If none of the given addresses is suitable, or none was found on the posting page, use your websearch tool to find the company's real application/HR email — e.g. search "<company> careers email", "<company> HR email for applications", "<company> contact email", or check the company website's contact/careers page. Only return an address you actually verified from a search result or the company site; never guess and never fabricate. If you still cannot find a real address, return "to" as an empty string.
 ${reportNum ? `Report: #${reportNum}` : ''}
 
 CV excerpt: ${cv}
@@ -4610,7 +4687,7 @@ Candidate phone: ${profile?.candidate?.phone || ''}
 
 Return JSON: {"to": "hiring contact email or empty string if unknown", "subject": "...", "body": "...", "contactBlock": "...", "phone": "recruiter contact phone or empty string if unknown"}`;
 
-    const result = await runOpencode(prompt, 120000, userCwd(req));
+    const result = await runOpencode(prompt, 180000, userCwd(req));
     const parsed = parseJsonFromOutput(result);
     res.json(parsed || { to: '', subject: '', body: result.trim().slice(0, 2000), contactBlock: '', phone: '' });
   } catch (e) {
