@@ -119,6 +119,29 @@ get a working apply path:
   challenge widget or visible block text does).
 - **Greenhouse** (`boards.greenhouse.io/...`) — standard field names fill from
   the profile.
+- **Workable** (`apply.workable.com/<org>/...`) — the scanner's public feed
+  emits description-only `/jobs/view/{id}` links with no form; the engine
+  normalizes them to the real `/j/{id}/apply` form before extracting, so
+  suggested Workable jobs fill instead of silently reporting 0 fields. Workable
+  option labels leak an "SVGs not supported by this browser." noscript fallback,
+  which the engine strips.
+- **Multi-option radio groups** (Workable, Lever, Greenhouse each render every
+  choice as its own radio input) are collapsed into ONE `radio-group` question
+  with its options — a YES/NO set no longer surfaces as two phantom required
+  fields. The app answers it by picking the matching option text; an unmatched
+  option in a multi-radio group is left for the user (never force-checked).
+- **Classifier guards:** name/first/last never resolve to referral / employee /
+  recruiter / "hiring manager" / contact questions (the candidate's own name
+  used to auto-fill "Who referred you?"); generic "years of experience" only
+  matches real experience questions (skill-specific ones like "Kubernetes
+  experience (years)" are left alone); `start date` no longer matches school /
+  degree / education month fields; phone country-code widgets are never
+  answered with a full number; location/resume now match on word boundaries so
+  "authentic**ity**" and "curricul**um** vitae" substrings can't misfire.
+- **Overlay-blocked fields:** Playwright's 30s actionability click is capped at
+  3s and, on failure, fields are filled via a JS native-setter + input/change
+  events (React state bindings pick it up). This fixed Workable's sticky
+  overlays stalling fills and blowing the bridge's fill timeout.
 - Honest reporting: the engine only reports success when fields were actually
   filled; 0-fields-filled is a FAILURE with a manual guide, never a false green
   check.

@@ -70,6 +70,29 @@ every later run.
     real challenge widget in the DOM or visible block text counts as a block;
     cookies only enrich the reason string when a real block is already detected.
     This unblocked Lever (`jobs.lever.co`) applications.
+  - **2026-08-04 second batch (Workable + field-reliability):**
+    - Workable URL normalization — the public feed emits description-only
+      `/jobs/view/{id}` links (no form → 0 fields); the engine rewrites them to
+      the real `/j/{id}/apply` form before extracting.
+    - Workable option labels leak an inline-SVG noscript fallback ("SVGs not
+      supported by this browser."); stripped in `extractFields`.
+    - Same-`name` radio inputs (each option is its own input on Workable, Lever,
+      Greenhouse) collapse into a single `radio-group` field with ≥2 visible
+      options; single-option groups stay as standalone consent radios.
+    - `clickRadioGroupOption()` — answers grouped radios by matching option
+      text, force-checks with a native-setter fallback for overlay-covered
+      radios (Workable); an unmatched option in a multi-radio group is left for
+      the user, never force-checked.
+    - Overlay-blocked text inputs: Playwright's 30s actionability click capped
+      at 3s; on failure a JS native-setter + input/change events fill the field
+      (this fixed Workable's sticky overlays stalling fills and blowing the
+      bridge's fill timeout).
+    - Classifier guards in `FIELD_CATEGORIES`/`classifyField`: name/first/last
+      exclude referral/recruit/employee/"hiring manager"/contact; generic
+      "years of experience" excludes skill-specific questions; `start date`
+      excludes school/degree/education fields; phone country-code widgets
+      excluded; `location` uses `\bcity\b` and `resume` uses `\bcv\b` so
+      "authenticity"/"curriculum" substrings can't misfire.
 
 ## Stealth & anti-bot (2026-08-03)
 

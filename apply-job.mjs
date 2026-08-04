@@ -92,6 +92,15 @@ for (let i = 0; i < args.length; i++) {
   if (args[i].startsWith('http')) jobUrl = args[i];
 }
 
+// Workable's public feed emits job links as /{slug}/jobs/view/{id} — that is a
+// description-only page with NO application form (extraction returns 0 fields).
+// The real form lives at /{slug}/j/{id}/apply. Normalize so suggested Workable
+// jobs extract and fill instead of silently yielding an empty form.
+const workableM = /^https:\/\/(apply\.workable\.com)\/([^/]+)\/jobs\/view\/([^/?#]+)\/?$/.exec(jobUrl || '');
+if (workableM) {
+  jobUrl = `https://${workableM[1]}/${workableM[2]}/j/${workableM[3]}/apply`;
+}
+
 // If a headed browser is requested but no display is available, fall back to
 // headless so auto-fill still works on servers/VMs without an X server.
 if (!headless && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
@@ -580,6 +589,7 @@ async function extractFields(page) {
     try {
       fields = await frame.evaluate(() => {
         const result = [];
+        const radioGroups = new Map();
         const inputs = document.querySelectorAll('input, textarea, select, [role="combobox"]');
         for (const el of inputs) {
           if (el.type === 'hidden' || el.type === 'submit' || el.type === 'button' || el.type === 'image') continue;
@@ -645,22 +655,78 @@ async function extractFields(page) {
 
           // Skip auxiliary file uploads with no label (Ashby renders an
           // unlabeled sibling file input next to the real "Resume" upload) —
-          // they'd surface as an empty phantom question in the app.
-          if (el.type === 'file' && !label.trim()) continue;
+          // they'd surface as an empty phantom question in the app. A file
+          // input whose only "label" is its own id/name is equally unlabeled;
+          // the fill step still attaches the CV to the first real file input.
+          if (el.type === 'file' && (!label.trim() || label === el.name || label === el.id)) continue;
+
+          // Workable paints its radio/checkbox option labels with an inline SVG
+          // whose noscript fallback leaks into the label text as "SVGs not
+          // supported by this browser." — strip it so labels stay readable.
+          const cleanLabel = label.replace(/SVGs? not supported by this browser\.?\s*/gi, '').trim();
+
+          // Track radios separately: same-`name` radios are one multiple-choice
+          // question (Workable, Greenhouse, Lever render each option as its own
+          // input). Collapsed into a single field below so a YES/NO set doesn't
+          // surface as two phantom required fields.
+          if (el.type === 'radio' && el.name) {
+            const nm = el.name;
+            const rect = el.getBoundingClientRect();
+            const st = window.getComputedStyle(el);
+            const visible = rect.width > 0 && rect.height > 0 && st.visibility !== 'hidden' && st.display !== 'none';
+            const req = !!(el.required || el.getAttribute('aria-required') === 'true');
+            result.push({ id: el.id || nm, type: 'radio', groupName: nm, label: cleanLabel.slice(0, 120), required: req, _visible: visible });
+            if (visible) {
+              if (!radioGroups.has(nm)) radioGroups.set(nm, { label: '', required: false, options: [] });
+              const g = radioGroups.get(nm);
+              g.required = g.required || req;
+              const opt = cleanLabel || el.value || '';
+              if (opt) g.options.push(opt.slice(0, 120));
+              if (!g.label) {
+                const fs = el.closest('fieldset');
+                const legend = fs ? fs.querySelector('legend') : null;
+                const legendText = legend && legend.textContent ? legend.textContent.replace(/\s+/g, ' ').trim() : '';
+                if (legendText) g.label = legendText.slice(0, 120);
+              }
+            }
+            continue;
+          }
 
           result.push({
             id: el.id || el.name || `field_${result.length}`,
             type: el.tagName.toLowerCase() === 'select' ? 'select' :
                   el.tagName.toLowerCase() === 'textarea' ? 'textarea' :
                   el.type || 'text',
-            label: label.slice(0, 120),
+            label: cleanLabel.slice(0, 120),
             required: el.required || el.getAttribute('aria-required') === 'true',
             options: el.tagName.toLowerCase() === 'select'
               ? Array.from(el.options).map(o => o.text).slice(0, 20)
               : undefined,
           });
         }
-        return result;
+        // Collapse multi-option radio groups into one multiple-choice field.
+        // Single-option groups stay as-is (a lone radio is usually a real
+        // consent/confirmation control, e.g. "I agree to the privacy policy").
+        const collapsed = [];
+        for (const f of result) {
+          if (f.type === 'radio' && f.groupName) {
+            const g = radioGroups.get(f.groupName);
+            if (g && g.options.length >= 2) {
+              if (!collapsed.some((x) => x.id === f.groupName)) {
+                collapsed.push({
+                  id: f.groupName,
+                  type: 'radio-group',
+                  label: g.label || 'Multiple choice',
+                  required: g.required,
+                  options: g.options.slice(0, 20),
+                });
+              }
+              continue;
+            }
+          }
+          collapsed.push(f);
+        }
+        return collapsed;
       });
     } catch {
       continue; // cross-origin or detached frame — skip
@@ -1042,23 +1108,26 @@ async function uploadResumeFirst(page, userDir, company) {
 // ask the candidate inline instead of silently skipping the field.
 
 const FIELD_CATEGORIES = [
-  { category: 'first_name', test: (l) => (l.includes('first name') || l.includes('given name')) && !l.includes('company') },
-  { category: 'last_name',  test: (l) => (l.includes('last name') || l.includes('surname') || l.includes('family name')) && !l.includes('company') },
-  { category: 'name',        test: (l) => l.includes('name') && !l.includes('company') && !l.includes('first') && !l.includes('last') },
+  // "Referral / employee / recruiter full name" questions must NEVER resolve to
+  // the candidate's own name — the candidate's identity classifiers would
+  // otherwise auto-fill their own name into "Who referred you?".
+  { category: 'first_name', test: (l) => (l.includes('first name') || l.includes('given name')) && !l.includes('company') && !/referr|recruit|employ(ee|ment)|hiring manager|contact/.test(l) },
+  { category: 'last_name',  test: (l) => (l.includes('last name') || l.includes('surname') || l.includes('family name')) && !l.includes('company') && !/referr|recruit|employ(ee|ment)|hiring manager|contact/.test(l) },
+  { category: 'name',        test: (l) => l.includes('name') && !l.includes('company') && !l.includes('first') && !l.includes('last') && !/referr|recruit|employ(ee|ment)|hiring manager|contact/.test(l) },
   { category: 'email',       test: (l) => l.includes('email') },
   { category: 'phone',       test: (l) => l.includes('phone') || l.includes('mobile') },
-  { category: 'location',    test: (l) => l.includes('location') || l.includes('city') || l.includes('address') },
+  { category: 'location',    test: (l) => l.includes('location') || /\bcity\b/.test(l) || l.includes('address') },
   { category: 'linkedin',    test: (l) => l.includes('linkedin') },
   { category: 'github',      test: (l) => l.includes('github') },
   { category: 'portfolio',   test: (l) => l.includes('portfolio') || l.includes('website') || l.includes('blog') },
-  { category: 'resume',      test: (l) => l.includes('resume') || l.includes('cv') },
+  { category: 'resume',      test: (l) => l.includes('resume') || /\bcv\b/.test(l) },
   { category: 'cover_letter',test: (l) => l.includes('cover') || l.includes('message') || l.includes('additional') || l.includes('comment') || l.includes('why') || l.includes('interest') },
-  { category: 'experience_years', test: (l) => (l.includes('experience') || l.includes('year') || l.includes('yoe')) && !l.includes('company') },
+  { category: 'experience_years', test: (l) => (l.includes('years of experience') || l.includes('total experience') || l.includes('overall experience') || (l.includes('experience') && /years?/.test(l))) && !/kubernetes|k8s|cloud|infrastructure|infra|devops|aws|gcp|azure|node|react|python|java|javascript|sql|docker|terraform|ci\/cd|observability|datadog|prometheus|nginx|linux|bash|sales|marketing|customer|support|testing|qa|mobile|frontend|backend|full.?stack/.test(l) && !l.includes('company') },
   { category: 'current_salary',   test: (l) => (l.includes('current') && (l.includes('salary') || l.includes('ctc') || l.includes('compensation'))) || l.includes('current ctc') },
   { category: 'expected_salary',  test: (l) => (l.includes('expected') || l.includes('desired') || l.includes('target')) && (l.includes('salary') || l.includes('ctc') || l.includes('compensation')) },
   { category: 'salary',      test: (l) => l.includes('salary') || l.includes('ctc') || l.includes('compensation') },
   { category: 'office_commute', test: (l) => (l.includes('office') && (l.includes('comfort') || l.includes('commute') || l.includes('willing') || l.includes('on-site') || l.includes('onsite') || l.includes('work from office'))) || l.includes('commute') || l.includes('relocation') || l.includes('willing to relocate') || l.includes('work from office') },
-  { category: 'notice_period', test: (l) => l.includes('notice') || l.includes('join') || l.includes('available') || l.includes('start date') },
+  { category: 'notice_period', test: (l) => l.includes('notice') || l.includes('join') || l.includes('available') || (l.includes('start date') && !/month|year|school|degree|education/.test(l)) },
   { category: 'work_authorization', test: (l) => l.includes('authorization') || l.includes('authorisation') || l.includes('visa') || l.includes('sponsor') || l.includes('right to work') || l.includes('work permit') || l.includes('citizen') },
   { category: 'education',   test: (l) => l.includes('degree') || l.includes('education') || l.includes('qualification') || l.includes('university') || l.includes('college') },
   { category: 'gender',      test: (l) => l.includes('gender') },
@@ -1106,6 +1175,10 @@ function classifyField(field) {
   if (sys) return sys;
   const l = (field.label || '').toLowerCase().trim();
   if (!l) return null;
+  // intl-tel-input country-code widgets (label "Telephone country code" etc.)
+  // are derived automatically from the phone widget — never answer them with a
+  // full number, which corrupts the widget's state.
+  if (/country.?code|country.?dial|dial.?code/i.test(l)) return null;
   for (const f of FIELD_CATEGORIES) {
     if (f.test(l)) return f.category;
   }
@@ -1207,14 +1280,64 @@ function buildQuestion(field, category, source) {
     category,
     label: field.label || field.id,
     required: !!field.required,
-    type: field.type === 'select' ? 'select' : 'text',
-    options: field.type === 'select' && Array.isArray(field.options) ? field.options : [],
+    type: field.type === 'select' || field.type === 'radio-group' ? 'select' : 'text',
+    options: (field.type === 'select' || field.type === 'radio-group') && Array.isArray(field.options) ? field.options : [],
     hint: hints[category] || '',
     source,
   };
 }
 
 // ── Fill form (--fill mode) ─────────────────────────────────────────
+
+// Collapsed radio groups are keyed by the shared group NAME and answered with
+// the chosen option text — click the radio whose label/value matches, and only
+// count it filled when a match actually sticks.
+async function clickRadioGroupOption(page, groupName, value) {
+  const target = String(value).trim().toLowerCase();
+  if (!target) return false;
+  const cssEscape = (v) => String(v).replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+  let radios = await page.$$(`input[type="radio"][name="${cssEscape(groupName)}"]`).catch(() => []);
+  if (!radios.length) {
+    const el = await page.$(`[id="${cssEscape(groupName)}"]`).catch(() => null);
+    if (el && (await el.evaluate((e) => e.getAttribute('type') === 'radio').catch(() => false))) radios = [el];
+  }
+  if (!radios.length) return false;
+  let best = null, bestScore = 0;
+  for (const r of radios) {
+    const info = await r.evaluate((e) => {
+      const label = (e.id ? document.querySelector(`label[for="${CSS.escape(e.id)}"]`) : null) || e.closest('label') || null;
+      const lbl = label ? (label.textContent || '').replace(/\s+/g, ' ').trim() : '';
+      return { val: (e.value || '').trim(), lbl: lbl.replace(/SVGs? not supported by this browser\.?\s*/gi, '') };
+    }).catch(() => null);
+    if (!info) continue;
+    const hay = `${info.val} ${info.lbl}`.toLowerCase().trim();
+    let s = 0;
+    if (hay === target) s = 5;
+    else if (hay.includes(target)) s = 4;
+    else if (target.includes(hay)) s = 3;
+    else if (target.split(/\s+/).some((w) => w.length > 2 && hay.includes(w))) s = 1;
+    if (s > bestScore) { best = r; bestScore = s; }
+  }
+  if (!best) return false;
+  await best.check({ force: true }).catch(() => best.click({ force: true }));
+  await page.waitForTimeout(180);
+  let stuck = await best.isChecked().catch(() => false);
+  if (!stuck) {
+    // Overlay-covered radios (Workable): force the native setter + events so
+    // the page's React/state bindings pick up the selection.
+    await best.evaluate((e) => {
+      e.click();
+      const proto = e.constructor?.prototype;
+      const desc = proto ? Object.getOwnPropertyDescriptor(proto, 'checked') : null;
+      if (desc?.set) desc.set.call(e, true); else e.checked = true;
+      e.dispatchEvent(new Event('click', { bubbles: true }));
+      e.dispatchEvent(new Event('change', { bubbles: true }));
+    }).catch(() => {});
+    await page.waitForTimeout(200);
+    stuck = await best.isChecked().catch(() => false);
+  }
+  return !!stuck;
+}
 
 async function fillForm(page, answers) {
   const filled = [];
@@ -1238,6 +1361,23 @@ async function fillForm(page, answers) {
       const type = await el.evaluate(e => (e.getAttribute('type') || '').toLowerCase());
       if (type === 'radio' || type === 'checkbox') {
         const truthy = value === true || /^(true|yes|1|on)$/i.test(String(value).trim());
+        // Grouped/option radios are answered by option text — click the matching
+        // radio. Standalone consent radios fall through to the boolean handler.
+        const rawVal = String(value).trim();
+        if (type === 'radio') {
+          if (await clickRadioGroupOption(page, fieldId, rawVal)) {
+            filled.push(fieldId);
+            continue;
+          }
+          // Unmatched option in a multi-radio group must NEVER be force-checked
+          // (the boolean handler would click the first radio). Leave it for the
+          // user instead.
+          const groupSize = await el.evaluate((e) => {
+            const nm = e.getAttribute('name');
+            return nm ? document.querySelectorAll(`input[type="radio"][name="${CSS.escape(nm)}"]`).length : 1;
+          }).catch(() => 1);
+          if (groupSize > 1) { skipped.push(fieldId); continue; }
+        }
         // Greenhouse and similar ATS boards re-render the form after a control
         // is clicked, which DETACHES our ElementHandle. Always re-resolve by
         // id/name before inspecting state so we never act on a stale handle.
@@ -1450,13 +1590,32 @@ async function fillForm(page, answers) {
         await page.waitForTimeout(200);
         filled.push(fieldId);
       } else if (tag === 'input' || tag === 'textarea') {
+        let ok = false;
         try {
-          await el.click();
+          // Overlay-blocked inputs (Workable, sticky headers, custom wrappers)
+          // make Playwright's default 30s actionability click the bottleneck —
+          // cap it and fall through to a native-setter fill instead.
+          await el.click({ timeout: 3000 });
           await el.fill('');
           await el.fill(String(value));
-          filled.push(fieldId);
-        } catch (e) {
-          console.error(`[fill-debug] input-fail id=[${fieldId}] type=[${type}] err=${String(e.message).slice(0, 120)}`);
+          ok = true;
+        } catch { ok = false; }
+        if (!ok) {
+          try {
+            await el.evaluate((e, v) => {
+              const proto = e.constructor?.prototype;
+              const desc = proto ? Object.getOwnPropertyDescriptor(proto, 'value') : null;
+              if (desc?.set) desc.set.call(e, v); else e.value = v;
+              e.dispatchEvent(new Event('input', { bubbles: true }));
+              e.dispatchEvent(new Event('change', { bubbles: true }));
+            }, String(value));
+            await page.waitForTimeout(150);
+            ok = true;
+          } catch { ok = false; }
+        }
+        if (ok) filled.push(fieldId);
+        else {
+          console.error(`[fill-debug] input-fail id=[${fieldId}] type=[${type}]`);
           skipped.push(fieldId);
         }
       } else {

@@ -18,8 +18,12 @@ application email exists on the page. The email path is the proven CLI strategy
 is the fallback for postings with no reachable email.
 
 As of 2026-08-04 the auto-fill engine is **validated on the ATS boards the
-scanner actually surfaces** — Ashby, Lever, and Greenhouse — so a posting with
-no email gets a real, working apply path, not a dead end.
+scanner actually surfaces** — Ashby, Lever, Greenhouse, and Workable — so a
+posting with no email gets a real, working apply path, not a dead end. Workable
+links come in as description-only `/jobs/view/{id}` URLs and are normalized to
+the real `/j/{id}/apply` form; multi-option radio sets are collapsed into single
+multiple-choice fields so a YES/NO group never surfaces as two phantom required
+fields.
 
 ## Flow
 
@@ -52,7 +56,9 @@ Job URL → /apply/open → Playwright loads page
 
 Validated (2026-08-04): **Ashby** (`jobs.ashbyhq.com`) — tab-reveal + GraphQL
 API fallback; **Lever** (`jobs.lever.co`) — clean extract/fill; **Greenhouse**
-(`boards.greenhouse.io`) — standard field names. Remaining login-gated portals
+(`boards.greenhouse.io`) — standard field names; **Workable**
+(`apply.workable.com`) — `/jobs/view/` → `/j/{id}/apply` normalization,
+overlay-safe fills, radio-group collapsing. Remaining login-gated portals
 (Internshala, Naukri, Shine, ...) still need an account session in the vault
 ([[Portal Session]]); the multi-portal test plan exercises those individually:
 login ✓/✗, fields X/Y, CV attached ✓/✗.
