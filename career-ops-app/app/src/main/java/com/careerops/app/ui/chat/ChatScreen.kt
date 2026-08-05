@@ -1199,7 +1199,7 @@ fun ManualApplyCard(message: ChatMessage.ManualApplyCard) {
             )
             Spacer(modifier = Modifier.height(6.dp))
             Text(
-                text = "Complete the form on the site (the automation couldn't finish it). Open this link in your browser:",
+                text = "Every automated method was tried and couldn't finish this application. Complete the form on the site. Open this link in your browser:",
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -1209,6 +1209,57 @@ fun ManualApplyCard(message: ChatMessage.ManualApplyCard) {
                 fontSize = 11.sp,
                 color = MaterialTheme.colorScheme.primary
             )
+            val guide = message.guide
+            if (guide != null) {
+                if (guide.manual_apply_url.isNotBlank() && guide.manual_apply_url != message.url) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "Direct apply link:",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = guide.manual_apply_url,
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+                if (guide.fields.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Fields to fill on the site:",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    guide.fields.take(12).forEach { f ->
+                        val req = if (f.required == true) " *" else ""
+                        val val_ = f.value.takeIf { it.isNotBlank() }?.let { " → $it" } ?: ""
+                        Text(
+                            text = "\u2022 ${f.field}$req$val_",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    if (guide.fields.size > 12) {
+                        Text(
+                            text = "... and ${guide.fields.size - 12} more",
+                            fontSize = 10.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                if (guide.notes.isNotBlank()) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = guide.notes,
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
             Spacer(modifier = Modifier.height(12.dp))
             Button(
                 onClick = { message.onMarkApplied?.invoke() },

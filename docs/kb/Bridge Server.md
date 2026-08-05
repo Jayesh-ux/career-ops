@@ -51,6 +51,15 @@ header.
   `readUserProfileRaw(req)` (2026-08-03 multi-user fix — they previously read
   the root profile with `readProfile()`, so results never matched a user's
   actual roles/locations/salary floor).
+- Filter scan links through `isJobDetailUrl` so results stay on real postings
+  (2026-08-05): the generic noise regex drops login/signup/blog/faq/search/
+  alert links, and portal-specific rules keep only true detail URLs. Extended
+  to close five gaps: **LinkedIn** requires `/jobs/view/` (drops `/jobs/`
+  search/collections), **hirist.tech** requires `/j/` (drops `/c/` category,
+  `/k/` keyword, `/job-search/`), **cutshort.io** requires `/job/` (drops
+  `/jobs/<category>-jobs` and `/company/`), and **apna.co** requires `/job/`
+  (drops `/jobs/...` category pages). Regression coverage lives in
+  `diag-urlfilter.mjs`.
 - Own the **seeded portal session**: `POST /login/session/seed` stores the
   WebView session cookies per-user at `<userDir>/google-cookies.json` (requires
   `X-User-Id`; rejected without it), which `seed-cookies.mjs` injects into every

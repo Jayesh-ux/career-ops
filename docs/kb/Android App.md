@@ -1,7 +1,7 @@
 ---
 type: component
 tags: [component, android, compose]
-updated: 2026-08-04
+updated: 2026-08-05
 ---
 
 # Android App
@@ -63,6 +63,25 @@ cards and scan results. It runs:
    company site's contact page) before giving up; only if still nothing does it
    fall back to Playwright auto-fill (`startAutoFill` / `/apply/open` +
    `/apply/fill`) or a manual-apply message.
+
+### Manual-apply fallback (2026-08-05)
+
+If every automated method is exhausted, the app pushes an explicit **apply
+manually** instruction instead of a dead end:
+
+- `startAutoFill` now treats a `/apply/open` **error OR an empty `fields`
+  list** (login-walled portal / SPA form that never rendered / multi-step
+  apply) as "every method tried" and immediately shows a `ManualApplyCard` —
+  with the bridge's `manual_apply_guide` (direct `manual_apply_url`, the
+  fields to fill with required markers, and any notes) plus an **"I applied
+  manually — update tracker to Applied"** button (`handleMarkApplied`).
+- The `/apply/fill` failure path in `handleConfirmFill` (login wall on the
+  fill step) also appends a `ManualApplyCard` instead of only a text message.
+- `ManualApplyCard` renders the guide's field map so the user can complete the
+  form in their browser with profile values pre-filled as hints. The manual
+  apply prompt is only reachable from apply-intent (score ≥ 4.0 evaluation
+  cards / batch "Apply" / scan-result apply), so "good fit" is implied by the
+  flow itself.
 
 Never auto-sends: the email is always shown for review first
 ([[Security & Human-in-the-loop]]).

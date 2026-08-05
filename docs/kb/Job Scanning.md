@@ -1,7 +1,7 @@
 ---
 type: flow
 tags: [flow, scan, discovery]
-updated: 2026-08-03
+updated: 2026-08-05
 ---
 
 # Job Scanning
@@ -28,6 +28,15 @@ possible, Playwright for auth-gated career pages.
   scan paths now read `readUserProfileRaw(req)`, so keywords, nearby-location
   terms, and scoring follow each user's `data/users/<id>/config/profile.yml`.
   See [[Bridge Server]].
+- **Scan results were inflated by non-posting noise.** Shine `/job-search/`,
+  Indeed `/q-...` + `/career/salaries`, Internshala `/jobs/` category pages,
+  courses, LinkedIn `/jobs/` lists, hirist `/c/` + `/k/` + `/job-search/`,
+  cutshort `/jobs/` + `/company/`, apna `/jobs/` category pages, and footer
+  links all surfaced as "jobs". Fixed in `bridge-server.mjs` (2026-08-05):
+  `isJobDetailUrl` now whitelists the real detail-URL shapes per portal
+  (LinkedIn `/jobs/view/`, hirist `/j/`, cutshort `/job/`, apna `/job/`, …)
+  and is applied by `/scan` + `/scan/stream`. Regression cases live in
+  `diag-urlfilter.mjs`.
 - **Shared `portals.yml` must not carry per-user filters.** The bridge is
   multi-user; title/location/salary filters that belong to one user would
   leak to everyone. Per-user alignment (target roles, cities, salary floor,
@@ -42,6 +51,7 @@ possible, Playwright for auth-gated career pages.
 ## Related files
 
 - `scan.mjs`, `providers/`
+- `diag-urlfilter.mjs` (junk-filter regression cases for `isJobDetailUrl`)
 - `check-liveness.mjs` (skip dead postings)
 - `probe-jd.mjs` (runtime tree — Playwright JD scrape for full-text scoring)
 

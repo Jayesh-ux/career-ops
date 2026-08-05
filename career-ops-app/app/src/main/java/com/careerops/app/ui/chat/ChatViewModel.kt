@@ -164,6 +164,7 @@ sealed class ChatMessage {
         override val id: Long = nextId(),
         val company: String = "",
         val url: String = "",
+        val guide: ManualApplyGuide? = null,
         val onMarkApplied: (() -> Unit)? = null
     ) : ChatMessage()
 
@@ -1463,17 +1464,44 @@ class ChatViewModel @Inject constructor(
                 api.applyOpen(ApplyOpenRequest(url = url, stealth = true))
             }
 
-            if (openResponse.error != null) {
+            val company = openResponse.company.ifEmpty { companyHint.ifEmpty { "Unknown" } }
+
+            // No error AND a real form → continue to the fill flow. If the open
+            // step errored, or it came back with ZERO fields (login-walled
+            // portal / SPA form that never rendered / multi-step apply), the
+            // email-first step already failed too — every method is exhausted.
+            // Push a clear "apply manually" instruction (fit is implied: Apply
+            // is only reachable for good-fit jobs) instead of a dead "confirm
+            // fill" dead-end.
+            if (openResponse.error != null || openResponse.fields.isEmpty()) {
                 removeProcessing()
                 isProcessing = false
+                val guide = openResponse.manual_apply_guide
+                val manualUrl = guide?.manual_apply_url?.takeIf { it.isNotBlank() }
+                    ?: openResponse.manualUrl.takeIf { it.isNotBlank() }
+                    ?: url
+                val reason = openResponse.error
+                    ?: openResponse.message.ifBlank {
+                        "The application form couldn't be reached automatically (login required or no visible form)."
+                    }
                 messages.add(ChatMessage.System(
-                    "\u26A0\uFE0F Auto-fill failed: ${openResponse.error}\n" +
-                    "Open the listing and apply manually:\n${openResponse.manualUrl.ifBlank { url }}"
+                    "\u26A0\uFE0F **Auto-fill couldn't complete for $company**\n" +
+                    "$reason\n\n" +
+                    "I tried every method — drafting an application email and auto-filling the form — " +
+                    "but this posting can't be submitted automatically. " +
+                    "Please apply manually at the link below."
+                ))
+                messages.add(ChatMessage.ManualApplyCard(
+                    company = company,
+                    url = manualUrl,
+                    guide = guide,
+                    onMarkApplied = {
+                        viewModelScope.launch { handleMarkApplied(company, manualUrl) }
+                    }
                 ))
                 return
             }
 
-            val company = openResponse.company.ifEmpty { companyHint.ifEmpty { "Unknown" } }
             val atsType = openResponse.atsType ?: "unknown"
             val fieldCount = openResponse.fields.size
             val answerCount = openResponse.answers.size
@@ -1691,10 +1719,20 @@ class ChatViewModel @Inject constructor(
                 } else if (loginVia == "portal-creds") {
                     "\n\n✅ Logged in using your saved portal credentials to reach the form."
                 } else ""
+                val manualUrl = fillResponse.manualUrl.ifBlank { _pendingAutoFillUrl }
                 messages.add(ChatMessage.System(
                     "\u274C **Form fill failed for $_pendingAutoFillCompany**\n" +
                     "$reason$loginHint\n\n" +
-                    "You can try again or apply manually: ${fillResponse.url.ifBlank { _pendingAutoFillUrl }}"
+                    "You can try again or apply manually: $manualUrl"
+                ))
+                val company = _pendingAutoFillCompany
+                messages.add(ChatMessage.ManualApplyCard(
+                    company = company,
+                    url = manualUrl,
+                    guide = null,
+                    onMarkApplied = {
+                        viewModelScope.launch { handleMarkApplied(company, manualUrl) }
+                    }
                 ))
             }
         } catch (e: Exception) {

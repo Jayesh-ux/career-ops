@@ -2902,6 +2902,18 @@ function isJobDetailUrl(urlStr) {
   if (host.endsWith('foundit.in') || host.endsWith('foundit.com')) return /\/job\//.test(path);
   if (host.endsWith('instahyre.com')) return /\/job\//.test(path);
   if (host.endsWith('indeed.com')) return /\/viewjob\b/.test(path);
+  // LinkedIn: only /jobs/view/ is a job detail page; /jobs/ (search,
+  // collections, gateway, recommended) are category noise.
+  if (host.endsWith('linkedin.com')) return /\/jobs\/view\//.test(path);
+  // hirist.tech: job details live under /j/<slug>-<id>; /c/ (category),
+  // /k/ (keyword) and /job-search/ are search-listing pages.
+  if (host.endsWith('hirist.tech')) return /^\/j\//.test(path);
+  // cutshort.io: job details live under /job/<slug>; /jobs/<category>-jobs
+  // and /company/<slug> are category/company pages.
+  if (host.endsWith('cutshort.io')) return /^\/job\//.test(path);
+  // apna.co: job details live under /job/<city>/<slug>-<id>; /jobs/... are
+  // category pages. /job/ vs /jobs/ keeps them distinct.
+  if (host.endsWith('apna.co')) return /^\/job\//.test(path);
   return true;
 }
 
