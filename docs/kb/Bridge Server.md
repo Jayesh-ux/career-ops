@@ -1,7 +1,7 @@
 ---
 type: component
 tags: [component, backend, api]
-updated: 2026-08-04
+updated: 2026-08-05
 ---
 
 # Bridge Server
@@ -84,6 +84,19 @@ header.
   backoff) and returns `url, score, company, role, reportNum, reportPath, fit,
   strengths, gaps, contactEmails, contactPhones`. The app renders one
   `BatchReviewCard` per result and passes `reportNum` straight to `/cv/tailor`.
+- Guard **opencode concurrency** (2026-08-05): every prompt runs through a FIFO
+  semaphore (`OPENCODE_MAX_CONCURRENT = 1` + `opencodeWaiters`) because the
+  `opencode serve` instance runs ONE prompt at a time — parallel stateless
+  calls (overlapping `/auto-pipeline`, `/batch`, email drafts, classifies)
+  previously contended on the same model slot, blew past the per-call timeout,
+  and returned N/A evals. `runOpencode` now computes a **deadline**, awaits the
+  slot, and delegates to `runOpencodePrompt`, which fails fast when the queue
+  wait consumed the deadline (a deep queue degrades gracefully instead of
+  stealing the model slot). Evaluation requests are also **coalesced + cached**
+  (`runAutoPipeline` wrapper over `runAutoPipelineInner`): in-flight evals for
+  the same `userId|url` share one promise, and results are cached for 10 min
+  (`EVAL_CACHE_TTL_MS`), so double-taps, client retries, and `/batch` never
+  re-run opencode or write duplicate tracker rows.
 
 ## Design notes
 

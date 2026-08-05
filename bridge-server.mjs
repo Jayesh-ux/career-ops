@@ -681,7 +681,54 @@ function runCli(script, args = []) {
   return { stdout: result.stdout || '', stderr: result.stderr || '', status: result.status, error: result.error };
 }
 
+// ── opencode concurrency guard (seat-serialization) ─────────────────
+// opencode serve runs ONE prompt at a time. When parallel stateless calls
+// (overlapping /auto-pipeline, /batch, email drafts, classifies) each send a
+// prompt to the same model slot, they contend and blow past the per-call
+// timeout — the bridge then reads a partial/empty session and returns N/A
+// evals. Serialize every prompt through a FIFO semaphore (max 1 in-flight);
+// queued callers keep their overall deadline so a deep queue fails fast
+// instead of silently overloading the model.
+const OPENCODE_MAX_CONCURRENT = 1;
+let opencodeInflight = 0;
+const opencodeWaiters = [];
+
+function acquireOpencodeSlot() {
+  return new Promise((resolve) => {
+    if (opencodeInflight < OPENCODE_MAX_CONCURRENT) {
+      opencodeInflight++;
+      resolve();
+    } else {
+      opencodeWaiters.push(resolve);
+    }
+  });
+}
+
+function releaseOpencodeSlot() {
+  const next = opencodeWaiters.shift();
+  if (next) {
+    next(); // pass the slot straight to the next waiter (inflight stays 1)
+  } else {
+    opencodeInflight--;
+  }
+}
+
 async function runOpencode(prompt, timeoutMs = 120000, cwd) {
+  const deadline = Date.now() + timeoutMs;
+  await acquireOpencodeSlot();
+  try {
+    return await runOpencodePrompt(prompt, deadline, cwd);
+  } finally {
+    releaseOpencodeSlot();
+  }
+}
+
+async function runOpencodePrompt(prompt, deadline, cwd) {
+  // Queue wait counts against the caller's deadline: a call that queued too
+  // long fails fast without stealing the model slot from a fresher caller.
+  const remaining = Math.max(0, deadline - Date.now());
+  if (remaining <= 0) throw new Error('opencode queue wait exceeded timeout');
+
   // Use SDK client (HTTP to opencode server) instead of spawning binary directly.
   // Spawning fails on Termux because the binary requires proot's dynamic linker.
   const userId = cwd ? basename(cwd) : undefined;
@@ -713,7 +760,7 @@ async function runOpencode(prompt, timeoutMs = 120000, cwd) {
           model: resolveModelForUser(userId)
         }
       }),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('opencode prompt timeout')), timeoutMs))
+      new Promise((_, rej) => setTimeout(() => rej(new Error('opencode prompt timeout')), remaining))
     ]);
   } catch (e) {
     // Timeout or transport error: salvage whatever the session already emitted
@@ -4251,7 +4298,31 @@ app.post('/email/spam/delete', async (req, res) => {
  // the response object. Used by POST /auto-pipeline (single URL) and POST /batch
  // (up to 5 URLs). Always resolves to a 200-shaped result — an evaluation
  // failure still lands a report so the outcome is attributable.
- async function runAutoPipeline(req, { url, company, role }) {
+// ── evaluation dedup (coalesce + cache) ─────────────────────────────
+// Identical /auto-pipeline and /batch evals (double-tap, client retry,
+// overlapping app calls) would each re-run opencode and re-write tracker
+// rows. Coalesce in-flight requests for the same URL+user onto one promise
+// and cache recent results (10 min TTL) so the opencode queue never carries
+// duplicates.
+const evalInflight = new Map();
+const evalRecentCache = new Map();
+const EVAL_CACHE_TTL_MS = 10 * 60 * 1000;
+
+async function runAutoPipeline(req, { url, company, role }) {
+  if (!url) throw new Error('url required');
+  const key = `${req.userCtx?.userId || '__root__'}|${url}`;
+  const cached = evalRecentCache.get(key);
+  if (cached && (Date.now() - cached.at) < EVAL_CACHE_TTL_MS) return cached.result;
+  const inflight = evalInflight.get(key);
+  if (inflight) return inflight;
+  const p = runAutoPipelineInner(req, { url, company, role })
+    .then((r) => { evalRecentCache.set(key, { result: r, at: Date.now() }); return r; })
+    .finally(() => { evalInflight.delete(key); });
+  evalInflight.set(key, p);
+  return p;
+}
+
+async function runAutoPipelineInner(req, { url, company, role }) {
   let evaluation = { score: 'N/A', fit: '', strengths: [], gaps: [] };
   let jdText = '';
   let contact = { emails: [], phones: [], applicationEmails: [] };
