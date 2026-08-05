@@ -93,7 +93,10 @@ header.
   failure re-runs the agent up to 3× with the rejected claims fed back
   ("REJECTED BY THE FACT GATE — remove every mention of these"). Paper format is
   `a4` unless the JD text clearly targets US/Canada. All artifacts land in the
-  requesting user's tree (`jds/`, `output/`, `data/pdf-index.tsv`).
+  requesting user's tree (`jds/`, `output/`, `data/pdf-index.tsv`). The gate
+  (2026-08-05) rejects metric-like claims **and** employer/education orgs absent
+  from the sources, and the bridge passes the user's `profile.yml` in as a
+  second source alongside `cv.md`.
 - Own the **batch evaluation** path (`POST /batch`, 2026-08-03): caps input at 5
   URLs and delegates each one to the shared `runAutoPipeline(req, {...})` helper
   that also backs `/auto-pipeline` — so every batch result is a **grounded**

@@ -1,7 +1,7 @@
 ---
 type: tool
 tags: [tool, cv, pdf]
-updated: 2026-08-03
+updated: 2026-08-05
 ---
 
 # CV & PDF Generation
@@ -20,7 +20,11 @@ files. Feeds the [[Auto-fill Pipeline]] and application emails.
   classifier, resolved template) into one focused opencode call that returns the
   render JSON; the bridge then runs `build-cv-html.mjs` → `verify-cv-facts.mjs`
   (hard **fact gate**) → `generate-pdf.mjs`, retrying up to 3× with rejected
-  claims fed back. Zero-LLM pieces: `jd-skill-gap.mjs` (skill classifier,
+  claims fed back. The gate (2026-08-05) rejects both **metric-like claims**
+  (%, $, counts absent from sources) and **employer/education orgs** that don't
+  trace back to the sources — a fabricated company in the rendered CV now fails
+  the gate and is fed back to be removed. Gate sources are `cv.md` + the user's
+  `profile.yml`. Zero-LLM pieces: `jd-skill-gap.mjs` (skill classifier,
   `--summary` only used when it found skills), `cv-templates.mjs resolve cv`
   (honors `CAREER_OPS_PROFILE`). Artifacts are per-user (`jds/`, `output/`,
   `data/pdf-index.tsv`); `--user-dir` must be the SPACED form and

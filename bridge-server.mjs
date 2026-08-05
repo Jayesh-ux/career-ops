@@ -5091,7 +5091,9 @@ ${rejectedClaims ? `\nREJECTED BY THE FACT GATE — these claims are NOT in cv.m
       }
 
       if (existsSync(dataDir) && existsSync(verifyScript)) {
-        const r2 = spawnSync('node', [verifyScript, htmlAbs, '--source', 'cv.md'], { cwd: dataDir, encoding: 'utf-8', timeout: 30000 });
+        const gateArgs = [verifyScript, htmlAbs, '--source', 'cv.md'];
+        if (existsSync(profilePath)) gateArgs.push('--source', profilePath);
+        const r2 = spawnSync('node', gateArgs, { cwd: dataDir, encoding: 'utf-8', timeout: 30000 });
         if (r2.status !== 0) {
           lastGateError = (r2.stderr || r2.stdout || '').slice(0, 1200);
           gateAttempts++;

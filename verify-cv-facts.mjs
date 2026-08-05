@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 /**
- * verify-cv-facts.mjs — Guard generated CVs against invented metrics.
+ * verify-cv-facts.mjs — Guard generated CVs against invented metrics and orgs.
+ * Rejects metric-like claims AND employer/education orgs absent from sources.
  *
  * Usage:
  *   node verify-cv-facts.mjs <generated-cv.html|md|tex>
@@ -77,6 +78,41 @@ function normalizeClaim(claim) {
   return claim.toLowerCase().replace(/[,\s]+/g, ' ').trim();
 }
 
+function htmlDecode(s) {
+  return s
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&#(\d+);/g, (m, d) => String.fromCharCode(parseInt(d, 10)));
+}
+
+// Suffix/stop words stripped before org matching so "Pvt. Ltd." vs "Pvt Ltd"
+// vs a fully-omitted suffix never causes a false mismatch.
+const ORG_STOP = /\b(pvt|private|limited|ltd|llc|inc|corp|corporation|co|company|companies|technologies|technology|tech|solutions|solution|services|service|systems|system|media|digital|ai|labs|lab|group|enterprise|enterprises|platform|platforms|gmbh|holding|holdings|and|the|of)\b/g;
+
+function normalizeOrg(name) {
+  return htmlDecode(name)
+    .toLowerCase()
+    .replace(ORG_STOP, ' ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Employers + education orgs as rendered by build-cv-html.mjs. Every one of
+// them must trace back to a source file — an org name absent from the resume
+// is a fabricated entry, no matter how well it fits the JD.
+function orgClaims(text) {
+  const raw = text.replace(/\n/g, ' ');
+  const matches = [
+    ...[...raw.matchAll(/class="job-company[^"]*">([^<]+)</g)],
+    ...[...raw.matchAll(/class="edu-org[^"]*">([^<]+)</g)],
+  ].map(m => normalizeOrg(m[1])).filter(n => n.length >= 3);
+  return [...new Set(matches)];
+}
+
 function metricClaims(text) {
   const clean = stripMarkup(text);
   const patterns = [
@@ -134,11 +170,22 @@ const allowed = new Set([
 ]);
 const targetClaims = metricClaims(targetText);
 const invented = [...targetClaims].filter(claim => !allowed.has(claim));
+
+// Org grounding: a company/edu-org in the CV must be traceable to a source.
+// Exact normalized match passes; otherwise every significant token must appear
+// in the sources (so "Averlon Technologies" still passes when the resume says
+// "Rajlaxmi Solutions Pvt. Ltd. & Averlon Technologies").
+const normSource = normalizeOrg(sourceText);
+const inventedOrgs = orgClaims(targetText).filter(org => {
+  if (normSource.includes(org)) return false;
+  const tokens = org.split(' ').filter(Boolean);
+  return !(tokens.length && tokens.every(t => normSource.includes(t)));
+});
 const forbidden = (config.forbidden_phrases || [])
   .filter(Boolean)
   .filter(phrase => stripMarkup(targetText).toLowerCase().includes(String(phrase).toLowerCase()));
 
-if (invented.length === 0 && forbidden.length === 0) {
+if (invented.length === 0 && inventedOrgs.length === 0 && forbidden.length === 0) {
   console.log(`CV fact check passed: ${basename(targetPath)}`);
   process.exit(0);
 }
@@ -147,6 +194,10 @@ console.error(`CV fact check failed: ${basename(targetPath)}`);
 if (invented.length > 0) {
   console.error('\nMetric-like claims absent from sources:');
   for (const claim of invented) console.error(`  - ${claim}`);
+}
+if (inventedOrgs.length > 0) {
+  console.error('\nEmployer/education orgs absent from sources:');
+  for (const org of inventedOrgs) console.error(`  - ${org}`);
 }
 if (forbidden.length > 0) {
   console.error('\nForbidden phrases found:');
