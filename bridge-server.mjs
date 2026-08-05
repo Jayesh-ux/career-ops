@@ -61,8 +61,16 @@ const { simpleParser } = require('mailparser');
 const nodemailer = require('nodemailer');
 let mammoth = null;
 try { mammoth = require('mammoth'); } catch { /* optional */ }
-let pdfParse = null;
-try { pdfParse = require('pdf-parse'); } catch { /* optional */ }
+// pdf-parse ships two shapes: v1 `require('pdf-parse')` returns a callable fn;
+// v2 (ESM-first, 2.x) returns { PDFParse: class }. Load both so the PDF text
+// fallback never calls a non-function.
+let pdfParseFn = null;
+let PDFParseCls = null;
+try {
+  const mod = require('pdf-parse');
+  if (typeof mod === 'function') pdfParseFn = mod;
+  else if (mod && typeof mod.PDFParse === 'function') PDFParseCls = mod.PDFParse;
+} catch { /* optional */ }
 
 let pdftotextAvailable = true;
 try { const r = spawnSync('which', ['pdftotext'], { encoding: 'utf-8' }); if (r.status !== 0) pdftotextAvailable = false; } catch { pdftotextAvailable = false; }
@@ -3544,10 +3552,19 @@ app.post('/resume/upload', upload.single('resume'), async (req, res) => {
         const r = spawnSync('pdftotext', [filePath, '-'], { encoding: 'utf-8', timeout: 30000 });
         text = (r.stdout || '').trim();
       }
-      if (!text && pdfParse) {
+      if (!text && (pdfParseFn || PDFParseCls)) {
         const buf = readFileSync(filePath);
-        const r = await pdfParse(buf);
-        text = (r.text || '').trim();
+        try {
+          if (PDFParseCls) {
+            const parser = new PDFParseCls({ data: buf });
+            const r = await parser.getText();
+            text = (r?.text || '').trim();
+            if (parser.destroy) { try { await parser.destroy(); } catch { /* */ } }
+          } else {
+            const r = await pdfParseFn(buf);
+            text = (r?.text || '').trim();
+          }
+        } catch { /* no text → falls through to the helpful error below */ }
       }
     } else if (ext.endsWith('.docx') && mammoth) {
       const buf = readFileSync(filePath);
@@ -3559,7 +3576,7 @@ app.post('/resume/upload', upload.single('resume'), async (req, res) => {
 
     try { unlinkSync(filePath); } catch { /* cleanup */ }
 
-    if (!text) return res.status(400).json({ error: 'Could not extract text from file' });
+    if (!text) return res.status(400).json({ error: 'No readable text found in this file — it looks like a scanned or image-only PDF. Please upload a text-based PDF or DOCX.' });
 
     // Write raw text to data/cv.md — the canonical CV file for career-ops (per-user or root)
     const cvDir = req.userCtx.dataDir || join(__dirname, 'data');

@@ -1,7 +1,7 @@
 ---
 type: flow
 tags: [flow, onboarding, ux]
-updated: 2026-08-03
+updated: 2026-08-05
 ---
 
 # Onboarding Flow
@@ -18,7 +18,11 @@ Google sign-in → Upload resume → Profile form → Portal login → Confirm �
 1. **Google sign-in** — **one** WebView login (`GoogleOAuthActivity`) that
    mints both the Gmail/IMAP token and the portal browser session. See
    [[Google OAuth]].
-2. **Upload resume** — pushes the CV to the per-user `data/cv.md`.
+2. **Upload resume** — pushes the CV to the per-user `data/cv.md` via
+   `UploadResumeScreen.kt` (2026-08-05: picker now accepts any file type, the
+   real MIME type is sent instead of a hardcoded `application/pdf`, and server
+   errors surface verbatim — a scanned/image-only PDF now tells the user to
+   upload a text-based PDF/DOCX instead of failing generically).
 3. **Profile form** — writes `config/profile.yml`.
 4. **Portal login** — "Connect your job portals": the same WebView Google login
    again (or reuse the session already captured at step 1 — the screen shows a
@@ -48,6 +52,7 @@ every sign-in until done". After a fresh sign-in the check retries briefly
 ## Related files
 
 - `career-ops-app/.../ui/navigation/Navigation.kt`
+- `career-ops-app/.../ui/onboarding/UploadResumeScreen.kt`
 - `career-ops-app/.../MainActivity.kt` (cold-start resolve)
 - `career-ops-app/.../ui/screens/settings/PortalLoginScreen.kt`
 - `career-ops-app/.../GoogleOAuthActivity.kt`

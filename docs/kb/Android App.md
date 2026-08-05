@@ -93,6 +93,7 @@ Never auto-sends: the email is always shown for review first
 - `career-ops-app/app/src/main/java/com/careerops/app/GoogleOAuthActivity.kt`
 - `career-ops-app/app/src/main/java/com/careerops/app/ui/screens/settings/PortalLoginScreen.kt`
 - `career-ops-app/app/src/main/java/com/careerops/app/ui/onboarding/GoogleSignInScreen.kt`
+- `career-ops-app/app/src/main/java/com/careerops/app/ui/onboarding/UploadResumeScreen.kt`
 - `career-ops-app/app/src/main/java/com/careerops/app/data/remote/CareerOpsApi.kt`
 - Build → `./gradlew :app:assembleDebug` → deploy to `/sdcard/Download`
 

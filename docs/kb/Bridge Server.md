@@ -17,6 +17,15 @@ header.
   `/login/session/*`, `/login/session/seed`, `/portal/session/status`,
   `/apply/open|fill`, `/cv`, `/resume/upload`, `/scan`, `/auto-pipeline`,
   `/batch`, `/cv/tailor` (2026-08-03 — tailored ATS-optimized CV PDF per role).
+- `/resume/upload` (2026-08-05 fix) extracts text via **pdftotext first**, then
+  a pdf-parse fallback. pdf-parse ships two shapes — v1 callable, v2
+  (ESM-first 2.x) `{ PDFParse: class }` — the fallback loaded the module and
+  called it as a function, so any scanned/image-only PDF (pdftotext yields
+  nothing) crashed with a 500 `pdfParse is not a function` and the onboarding
+  "attach your CV" step failed repeatedly. Now both shapes are loaded
+  (`pdfParseFn`/`PDFParseCls`) and text-less PDFs return a **clear 400**:
+  "scanned or image-only PDF — upload a text-based PDF or DOCX" instead of
+  crashing. OCR is intentionally not bundled.
 - Spawn the Node automation scripts (`apply-job.mjs`, `login-session.mjs`,
   `scan.mjs`, etc.) as child processes, passing `--user-dir` for the
   requesting user.

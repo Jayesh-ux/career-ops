@@ -97,7 +97,7 @@ fun UploadResumeScreen(
 
         if (selectedUri == null) {
             OutlinedButton(
-                onClick = { filePicker.launch("application/pdf") },
+                onClick = { filePicker.launch("*/*") },
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(56.dp)
@@ -179,7 +179,8 @@ fun UploadResumeScreen(
                         FileOutputStream(tempFile).use { out -> inputStream.copyTo(out) }
                         inputStream.close()
 
-                        val requestFile = tempFile.asRequestBody("application/pdf".toMediaTypeOrNull())
+                        val mimeType = context.contentResolver.getType(uri) ?: "application/pdf"
+                        val requestFile = tempFile.asRequestBody(mimeType.toMediaTypeOrNull())
                         val filePart = MultipartBody.Part.createFormData("resume", tempFile.name, requestFile)
                         val emailPart = email.toRequestBody("text/plain".toMediaTypeOrNull())
 
@@ -201,7 +202,7 @@ fun UploadResumeScreen(
                             } catch (e: Exception) {
                                 withContext(Dispatchers.Main) {
                                     isUploading = false
-                                    uploadResult = Pair(false, "Error: ${e.message}")
+                                    uploadResult = Pair(false, friendlyUploadError(e))
                                 }
                             }
                         }
@@ -226,5 +227,24 @@ fun UploadResumeScreen(
                 }
             }
         }
+    }
+}
+
+private fun friendlyUploadError(e: Exception): String {
+    val code = if (e is retrofit2.HttpException) e.code() else 0
+    val serverMsg = if (e is retrofit2.HttpException) {
+        try {
+            val body = e.response()?.errorBody()?.string()
+            org.json.JSONObject(body ?: "{}").optString("error", "")
+        } catch (_: Exception) { "" }
+    } else {
+        e.message ?: ""
+    }
+    return when {
+        serverMsg.contains("No readable text", ignoreCase = true) ->
+            "Scanned or image-only PDF detected — please upload a text-based PDF or DOCX."
+        serverMsg.isNotEmpty() -> "Upload failed: $serverMsg"
+        code > 0 -> "Upload failed (HTTP $code). Is the bridge server running?"
+        else -> "Upload failed: ${e.message}"
     }
 }
