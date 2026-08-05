@@ -4420,9 +4420,15 @@ ${(evaluation.gaps || []).map(g => `- ${g}`).join('\n') || '- None identified'}
   // Run merge-tracker from user dir or root
   try {
     const ud = req.userCtx?.userDir;
-    const mergeArgs = ud ? ['merge-tracker.mjs', '--user-dir', ud] : ['merge-tracker.mjs'];
-    spawnSync('node', mergeArgs, { cwd: userCwd(req), encoding: 'utf-8', timeout: 10000 });
-  } catch { /* non-fatal */ }
+    const mergeArgs = ud ? ['--user-dir', ud] : [];
+    const r = spawnSync('node', [join(__dirname, 'merge-tracker.mjs'), ...mergeArgs], {
+      cwd: ud || __dirname,
+      encoding: 'utf-8',
+      timeout: 120_000,
+      env: { ...process.env, FORCE_COLOR: '0' },
+    });
+    if (r.status !== 0 && r.status !== null) console.error(`[merge-tracker] ${r.stderr || r.error?.message || 'merge failed'}`);
+  } catch (e) { /* non-fatal */ }
 
   return {
     url,

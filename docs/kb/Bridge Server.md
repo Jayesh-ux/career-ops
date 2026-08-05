@@ -96,7 +96,12 @@ header.
   (`runAutoPipeline` wrapper over `runAutoPipelineInner`): in-flight evals for
   the same `userId|url` share one promise, and results are cached for 10 min
   (`EVAL_CACHE_TTL_MS`), so double-taps, client retries, and `/batch` never
-  re-run opencode or write duplicate tracker rows.
+  re-run opencode or write duplicate tracker rows. The eval's tracker write
+  also **merges via an absolute script path** (`join(__dirname,
+  'merge-tracker.mjs')` + `--user-dir`), fixing a bug where `node
+  merge-tracker.mjs` was spawned from the per-user cwd and silently failed to
+  find the module — leaving eval rows stranded in `batch/tracker-additions/`
+  and never merged into `data/applications.md`.
 
 ## Design notes
 
