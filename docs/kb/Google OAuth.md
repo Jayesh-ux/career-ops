@@ -56,6 +56,17 @@ endpoint failed with "No email auth configured" even though the user was
 sign-in and re-issues a refresh token. A stored credential is only usable when
 `hasUsableOAuth` sees a `refreshToken` (or an unexpired access token).
 
+## Scope requirements (spam-delete 403 fix 2026-08-06)
+
+`POST /email/spam/delete` deletes Gmail messages via the Gmail REST API, which
+requires the **`https://www.googleapis.com/auth/gmail.modify`** scope — the
+`gmail.send` + `gmail.readonly` pair is not enough and returns
+`403 Request had insufficient authentication scopes`. Both OAuth auth URLs
+(`GoogleSignInScreen.kt` and `PortalLoginScreen.kt`) therefore request
+`gmail.send gmail.readonly gmail.modify`. **A user who logged in before this fix
+must re-login** (the consent screen re-issues the token with the wider scope)
+before spam-delete succeeds.
+
 ## The rule
 
 An IMAP refresh token **cannot** log you into job portals. When a portal says

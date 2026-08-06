@@ -242,7 +242,7 @@ fun PortalLoginScreen(
             "client_id=$WEB_CLIENT_ID&" +
             "redirect_uri=https://career-ops.app&" +
             "response_type=code&" +
-            "scope=openid email https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly&" +
+            "scope=openid email https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.modify&" +
             "access_type=offline&" +
             "prompt=consent%20select_account"
         val intent = GoogleOAuthActivity.createIntent(context, authUri)
