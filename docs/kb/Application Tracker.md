@@ -26,6 +26,13 @@ brain; SQLite is only a derived index (see [[Data Contract]]).
 `verify-pipeline.mjs`, `reserve-report-num.mjs` keep the files consistent with
 atomic writes.
 
+`set-status.mjs` is the canonical single-row status/note writer. It must be
+run with `--user-dir <userDir>` in multi-user mode (the bridge's
+`PUT /tracker/{id}/status` does this); canonical states load from
+`templates/states.yml` relative to the script (shared infra, not per-user).
+Fixed 2026-08-06: the arg parser now skips `--user-dir` (it was crashing with
+"Unknown flag"), which had broken status updates from the app.
+
 ## Access from the app
 
 `GET /tracker`, `PUT /tracker/{id}/status`, `POST /tracker/add` on the

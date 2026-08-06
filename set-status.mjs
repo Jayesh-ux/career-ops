@@ -56,7 +56,7 @@ const _userDirIdx = process.argv.indexOf('--user-dir');
 if (_userDirIdx !== -1 && process.argv[_userDirIdx + 1]) {
   CAREER_OPS = process.argv[_userDirIdx + 1];
 }
-const STATES_FILE = join(CAREER_OPS, 'templates/states.yml');
+const STATES_FILE = join(dirname(fileURLToPath(import.meta.url)), 'templates/states.yml');
 
 const EXIT_OK = 0;
 const EXIT_USAGE = 1;
@@ -89,6 +89,11 @@ for (let i = 0; i < rawArgs.length; i++) {
       failUsage(`Missing value for ${a}`);
     }
     flags[a === '--note' ? 'note' : 'role'] = value;
+    i++;
+  }
+  else if (a === '--user-dir') {
+    // Resolved up front (CAREER_OPS override for multi-user isolation); the
+    // loop only needs to skip the flag and its value.
     i++;
   }
   else if (a === '--dry-run') { flags.dryRun = true; }
