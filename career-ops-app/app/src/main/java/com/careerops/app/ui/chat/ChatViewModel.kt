@@ -1454,7 +1454,7 @@ class ChatViewModel @Inject constructor(
     // Shared Playwright auto-fill flow: /apply/open → /apply/fill (never auto-submits).
     // Used by the typed "auto-fill <url>" command and by Apply when the job is a
     // portal listing or no contact email exists.
-    private suspend fun startAutoFill(url: String, companyHint: String = "") {
+    private suspend fun startAutoFill(url: String, companyHint: String = "", roleHint: String = "") {
         try {
             ensureProcessingCard("Opening application form...")
             updateProcessingCard(detail = "Opening application form...")
@@ -1465,6 +1465,7 @@ class ChatViewModel @Inject constructor(
             }
 
             val company = openResponse.company.ifEmpty { companyHint.ifEmpty { "Unknown" } }
+            _pendingAutoFillRole = roleHint
 
             // No error AND a real form → continue to the fill flow. If the open
             // step errored, or it came back with ZERO fields (login-walled
@@ -1491,12 +1492,13 @@ class ChatViewModel @Inject constructor(
                     "but this posting can't be submitted automatically. " +
                     "Please apply manually at the link below."
                 ))
+                val applyRole = _pendingAutoFillRole
                 messages.add(ChatMessage.ManualApplyCard(
                     company = company,
                     url = manualUrl,
                     guide = guide,
                     onMarkApplied = {
-                        viewModelScope.launch { handleMarkApplied(company, manualUrl) }
+                        viewModelScope.launch { handleMarkApplied(company, manualUrl, applyRole) }
                     }
                 ))
                 return
@@ -1511,12 +1513,9 @@ class ChatViewModel @Inject constructor(
 
             // Show field summary
             messages.add(ChatMessage.System(
-                "\uD83E\uDD16 **Auto-Fill: $company**\n" +
-                "ATS Platform: **$atsType**\n" +
-                "Fields detected: **$fieldCount**\n" +
-                "Auto-answers generated: **$answerCount**\n\n" +
-                "I'll fill in the form with your profile data and attach your CV. " +
-                "**I will NOT submit** — you review and click Submit manually."
+                "\uD83E\uDD16 **Got it — I can fill the $company form** ($atsType).\n" +
+                "Found **$fieldCount** fields ($answerCount auto-answered from your profile).\n\n" +
+                "I'll attach your CV and **won't submit anything** — you review the form, then tap Submit."
             ))
 
             // Show fields that will be filled
@@ -1560,11 +1559,11 @@ class ChatViewModel @Inject constructor(
                     ))
                 }
                 messages.add(ChatMessage.System(
-                    "Answer the question${if (questions.size != 1) "s" else ""} above, then say **'confirm fill'** to auto-fill the form for **$company**."
+                    "Answer the question${if (questions.size != 1) "s" else ""} above, then say **'confirm fill'** and I'll fill the form for **$company**."
                 ))
             } else {
                 messages.add(ChatMessage.System(
-                    "Say **'confirm fill'** to proceed with auto-filling the form for **$company**."
+                    "All set — say **'confirm fill'** and I'll fill the form for **$company**."
                 ))
             }
 
@@ -1634,6 +1633,7 @@ class ChatViewModel @Inject constructor(
     private var _pendingAutoFillUrl: String = ""
     private var _pendingAutoFillAnswers: Map<String, String> = emptyMap()
     private var _pendingAutoFillCompany: String = ""
+    private var _pendingAutoFillRole: String = ""
 
     // Confirm and execute auto-fill
     private suspend fun handleConfirmFill() {
@@ -1678,10 +1678,8 @@ class ChatViewModel @Inject constructor(
                 }
                 // Show field summary
                 messages.add(ChatMessage.System(
-                    "✅ **Form filled for $_pendingAutoFillCompany**\n" +
-                    "ATS: ${fillResponse.atsType ?: "Unknown"}\n" +
-                    "Fields filled: ${fillResponse.filled.size}\n" +
-                    "Skipped: ${fillResponse.skipped.size}\n" +
+                    "✅ **Form filled for $_pendingAutoFillCompany** — review it before submitting.\n" +
+                    "Filled ${fillResponse.filled.size}/${fillResponse.filled.size + fillResponse.skipped.size} fields\n" +
                     cvStatus
                 ))
                 // Show submit confirmation card — proven CLI pattern:
@@ -1689,6 +1687,7 @@ class ChatViewModel @Inject constructor(
                 val company = _pendingAutoFillCompany
                 val url = _pendingAutoFillUrl
                 val answers = _pendingAutoFillAnswers
+                val role = _pendingAutoFillRole
                 messages.add(ChatMessage.SubmitConfirmation(
                     company = company,
                     atsType = fillResponse.atsType ?: "Unknown",
@@ -1697,7 +1696,7 @@ class ChatViewModel @Inject constructor(
                     cvAttached = fillResponse.cvAttached,
                     onSubmit = {
                         viewModelScope.launch {
-                            handleSubmitApplication(url, company, answers)
+                            handleSubmitApplication(url, company, answers, role)
                         }
                     },
                     onReview = {
@@ -1726,12 +1725,13 @@ class ChatViewModel @Inject constructor(
                     "You can try again or apply manually: $manualUrl"
                 ))
                 val company = _pendingAutoFillCompany
+                val role = _pendingAutoFillRole
                 messages.add(ChatMessage.ManualApplyCard(
                     company = company,
                     url = manualUrl,
                     guide = null,
                     onMarkApplied = {
-                        viewModelScope.launch { handleMarkApplied(company, manualUrl) }
+                        viewModelScope.launch { handleMarkApplied(company, manualUrl, role) }
                     }
                 ))
             }
@@ -1743,6 +1743,7 @@ class ChatViewModel @Inject constructor(
             _pendingAutoFillUrl = ""
             _pendingAutoFillAnswers = emptyMap()
             _pendingAutoFillCompany = ""
+            _pendingAutoFillRole = ""
             _pendingAutoFillQuestions = emptyList()
         }
     }
@@ -1753,7 +1754,8 @@ class ChatViewModel @Inject constructor(
     private suspend fun handleSubmitApplication(
         url: String,
         company: String,
-        answers: Map<String, String>
+        answers: Map<String, String>,
+        role: String = ""
     ) {
         try {
             ensureProcessingCard("Submitting application to $company...")
@@ -1774,14 +1776,13 @@ class ChatViewModel @Inject constructor(
 
             val submitState = fillResponse.submit
             if (submitState?.submissionOk == true) {
+                val cvLine = if (fillResponse.cvAttached) " · CV attached" else ""
                 messages.add(ChatMessage.System(
                     "🎉 **Application submitted to $company!**\n" +
-                    "ATS: ${fillResponse.atsType ?: "Unknown"}\n" +
-                    "Fields filled: ${fillResponse.filled.size}\n" +
-                    "CV attached: ${if (fillResponse.cvAttached) "Yes" else "No"}\n\n" +
-                    "The application was successfully submitted. Check your email for a confirmation."
+                    "${fillResponse.filled.size} fields filled$cvLine\n" +
+                    "I'll watch your inbox and track their reply."
                 ))
-                updateTrackerToApplied(company, submitted = true)
+                markCompanyApplied(company, role, notes = "Submitted via auto-fill ($url)")
             } else if (submitState?.clicked == true && submitState.validationErrors.isNotEmpty()) {
                 // Form was submitted but validation blocked it — safe, nothing was sent
                 val errorList = submitState.validationErrors.joinToString("\n") { "• $it" }
@@ -1798,7 +1799,7 @@ class ChatViewModel @Inject constructor(
                     company = company,
                     url = url,
                     onMarkApplied = {
-                        viewModelScope.launch { handleMarkApplied(company, url) }
+                        viewModelScope.launch { handleMarkApplied(company, url, role) }
                     }
                 ))
             } else {
@@ -1811,7 +1812,7 @@ class ChatViewModel @Inject constructor(
                     company = company,
                     url = url,
                     onMarkApplied = {
-                        viewModelScope.launch { handleMarkApplied(company, url) }
+                        viewModelScope.launch { handleMarkApplied(company, url, role) }
                     }
                 ))
             }
@@ -1826,7 +1827,7 @@ class ChatViewModel @Inject constructor(
                 company = company,
                 url = url,
                 onMarkApplied = {
-                    viewModelScope.launch { handleMarkApplied(company, url) }
+                    viewModelScope.launch { handleMarkApplied(company, url, role) }
                 }
             ))
         }
@@ -1843,35 +1844,50 @@ class ChatViewModel @Inject constructor(
         } catch (_: Exception) { null }
     }
 
-    // Set a tracker entry to "Applied" and report the outcome to the chat.
-    private suspend fun updateTrackerToApplied(company: String, submitted: Boolean) {
-        val id = findTrackerId(company)
-        if (id == null) {
-            messages.add(ChatMessage.System(
-                "📋 Note: no tracker entry found for $company — add it from your tracker view to keep the pipeline current."
-            ))
-            return
-        }
+    // Mark a company as Applied in the tracker. If a tracker entry already
+    // exists for the company (case-insensitive) its status is updated to
+    // Applied; otherwise a new entry is added as Applied. Every apply path
+    // (email send, auto-fill submit, manual apply) funnels through here so the
+    // tracker always reflects what was actually done — no duplicate rows, no
+    // stale "Evaluated" entries left behind.
+    private suspend fun markCompanyApplied(
+        company: String,
+        role: String = "",
+        contactEmail: String = "",
+        notes: String = ""
+    ) {
         try {
-            withContext(Dispatchers.IO) {
-                api.updateStatus(id, mapOf("status" to ApplicationStatus.APPLIED.name))
+            val existingId = findTrackerId(company)
+            if (existingId != null) {
+                withContext(Dispatchers.IO) {
+                    api.updateStatus(existingId, mapOf("status" to ApplicationStatus.APPLIED.name))
+                }
+                messages.add(ChatMessage.System(
+                    "\uD83D\uDCCB **Tracker updated**: $company → Applied"
+                ))
+            } else {
+                withContext(Dispatchers.IO) {
+                    api.addTrackerEntry(TrackerAddRequest(
+                        company = company,
+                        role = role.ifBlank { "Applied via career-ops app" },
+                        contactEmail = contactEmail,
+                        notes = notes
+                    ))
+                }
+                messages.add(ChatMessage.System(
+                    "\uD83D\uDCCB **Added $company to your tracker as Applied**"
+                ))
             }
-            messages.add(ChatMessage.System(
-                if (submitted)
-                    "📋 **Tracker updated**: $company → Applied"
-                else
-                    "✅ **Marked $company as Applied in your tracker.**"
-            ))
         } catch (e: Exception) {
             messages.add(ChatMessage.System(
-                "📋 Couldn't auto-update the tracker for $company (${e.message}). Update it from your tracker view."
+                "\uD83D\uDCCB Couldn't update the tracker for $company (${e.message}). Update it from your tracker view."
             ))
         }
     }
 
     // Called from the ManualApplyCard's "I applied manually" button.
-    private suspend fun handleMarkApplied(company: String, url: String) {
-        updateTrackerToApplied(company, submitted = false)
+    private suspend fun handleMarkApplied(company: String, url: String, role: String = "") {
+        markCompanyApplied(company, role, notes = "Marked applied manually — $url")
     }
 
     // ── Direct follow-up via POST /followup/draft ──────────────────────────
@@ -2875,7 +2891,7 @@ class ChatViewModel @Inject constructor(
                             "\u26A0\uFE0F **Draft ready** for **$company** \u2014 **$role**, but no contact email was found on the posting page.$phoneHint\n" +
                             "I'll try auto-filling the application form on the job page instead."
                         ))
-                        startAutoFill(url, company)
+                        startAutoFill(url, company, role)
                     } else {
                         messages.add(ChatMessage.System(
                             "\u26A0\uFE0F **Draft ready** for **$company** \u2014 **$role**, but no contact email was found.$phoneHint\n" +
@@ -2929,15 +2945,12 @@ class ChatViewModel @Inject constructor(
             if ((response["success"] as? Boolean) == true) {
                 if (draftId != null) sentDraftIds.add(draftId)
                 setDraftSendState(draftId, sending = false, sent = true)
-                try {
-                    withContext(Dispatchers.IO) {
-                        api.addTrackerEntry(TrackerAddRequest(
-                            company = company, role = role,
-                            contactEmail = to,
-                            notes = "Emailed $to via career-ops app"
-                        ))
-                    }
-                } catch (_: Exception) {}
+                markCompanyApplied(
+                    company = company,
+                    role = role,
+                    contactEmail = to,
+                    notes = "Emailed $to via career-ops app"
+                )
 
                 messages.add(ChatMessage.System(
                     "\u2705 **Step 3/3** — Application sent to **$company**!\n" +

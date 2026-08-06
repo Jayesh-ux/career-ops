@@ -70,8 +70,9 @@ cards and scan results. It runs:
    Shine/foundit expose one). This is the proven email-first strategy from the
    CLI (the 81-application run was mostly email applications).
 3. **Email found** → `EmailDraft` card → user confirms → `sendEmail()` →
-   `POST /email/send` (per-user OAuth, per-user CV attached) → tracker row
-   `Applied` with notes `Emailed {to} via career-ops app` + `contactEmail`.
+   `POST /email/send` (per-user OAuth, per-user CV attached) →
+   `markCompanyApplied()` (tracker set to `Applied`, notes `Emailed {to} via
+   career-ops app` + `contactEmail`).
    The draft card carries `sending`/`sent` state: while `POST /email/send` is
    in flight the Send button shows a spinner and is disabled ("Sending…"), then
    flips to a disabled "Sent" state. `sendEmail()` also guards against repeat
@@ -102,6 +103,20 @@ manually** instruction instead of a dead end:
   apply prompt is only reachable from apply-intent (score ≥ 4.0 evaluation
   cards / batch "Apply" / scan-result apply), so "good fit" is implied by the
   flow itself.
+
+### Unified tracker update (2026-08-06)
+
+Every apply-completion path funnels through `ChatViewModel.markCompanyApplied()`:
+
+- **Email send** (`sendEmail` success), **auto-fill submit**
+  (`handleSubmitApplication` success), and **manual apply**
+  (`handleMarkApplied`) all call it.
+- It finds the company's existing tracker row (case-insensitive) and sets it
+  to **Applied**; if no row exists it **adds a new one** as Applied (role
+  threaded through the auto-fill flow via `_pendingAutoFillRole`). This kills
+  two bugs at once: no more duplicate rows when a job was already tracked as
+  Evaluated, and no more "no tracker entry found" dead-ends when the job was
+  never tracked. Scan/dedup (`isSpammed`) then correctly skips it next time.
 
 Never auto-sends: the email is always shown for review first
 ([[Security & Human-in-the-loop]]).
