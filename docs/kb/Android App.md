@@ -1,7 +1,7 @@
 ---
 type: component
 tags: [component, android, compose]
-updated: 2026-08-05
+updated: 2026-08-06
 ---
 
 # Android App
@@ -36,6 +36,24 @@ down it routes to `ONBOARDING_PORTAL` rather than straight to Chat.
 every cold start (splash + retry while it resolves) and cache-busts the saved
 start destination, so reopening from Recents never silently skips an un-resolved
 portal dependency.
+
+### Re-login gate on expired Gmail token (2026-08-06)
+
+Before the portal check, `resolveStartDestination()` calls
+`GET /users/{email}/oauth/status`. If the bridge reports the token as
+`configured && isExpired && !hasRefreshToken` (access token dead and no refresh
+token to recover it), the user is routed straight back to `ONBOARDING_GOOGLE`
+instead of Chat — inbox/reply/email features would otherwise fail silently while
+the user sits in Chat. Tokens with a usable refresh token are left alone: the
+bridge refreshes them automatically.
+
+### Onboarding LinkedIn capture
+
+`ONBOARDING_PROFILE` (`ProfileFormScreen`) collects the LinkedIn URL alongside
+name/roles/location/salary and persists it to `profile.yml candidate.linkedin`
+via `PUT /profile`. Combined with the `linkedin` fallback in [[Auto-fill Pipeline]]
+`answerField` (form-answers.yml first, then profile), LinkedIn is asked exactly
+once and never re-surfaced on application forms.
 
 ## Apply routing (email-first)
 

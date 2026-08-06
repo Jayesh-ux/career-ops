@@ -1,7 +1,7 @@
 ---
 type: flow
 tags: [flow, apply, autofill]
-updated: 2026-08-04
+updated: 2026-08-06
 ---
 
 # Auto-fill Pipeline
@@ -51,6 +51,31 @@ Job URL → /apply/open → Playwright loads page
 3. **HITL gate** — filling and clicking are separated; the app shows the filled
    form and the user confirms before any submit action. See
    [[Security & Human-in-the-loop]].
+
+## Pending questions — what the app may still ask
+
+`/apply/open` returns `answers` plus `pending_questions` for fields that cannot
+be auto-filled. The app renders them as inline cards and persists each answer to
+`config/form-answers.yml` **keyed by category**, so a question is asked once and
+reused across every future form.
+
+Rules that keep the candidate from being re-asked for data they already gave
+(`answerField` + `generateAnswers` in `apply-job.mjs`):
+
+- **Resume** (`category 'resume'`): never guessed. If a resume **URL** was
+  answered once (`form-answers.yml: resume`), text-box resume fields are filled
+  with it; otherwise the field is `source: 'file'` and **no question is asked** —
+  file inputs are filled by the CV-attach step with the JD-tailored PDF
+  ([[CV & PDF Generation]]). A required resume field can no longer spawn a
+  question when the CV is on file.
+- **LinkedIn** (`category 'linkedin'`): resolved from `form-answers.yml` first,
+  then `profile.yml candidate.linkedin` — never re-asked once either holds a
+  value.
+- **Candidate-confirmation categories** (experience, salaries, commute, notice,
+  authorization, education): always surfaced as a question when empty, because
+  guessing them would fabricate candidate data.
+- Unknown required fields surface as `category: 'other'`.
+
 
 ## Target battery
 

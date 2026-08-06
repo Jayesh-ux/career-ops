@@ -32,6 +32,7 @@ fun ProfileFormScreen(
     var targetRoles by remember { mutableStateOf("") }
     var location by remember { mutableStateOf("") }
     var compensation by remember { mutableStateOf("") }
+    var linkedin by remember { mutableStateOf("") }
     var isSaving by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -45,6 +46,7 @@ fun ProfileFormScreen(
                 if (targetRoles.isEmpty()) targetRoles = profile.targetRoles.joinToString(", ")
                 if (location.isEmpty()) location = profile.location
                 if (compensation.isEmpty()) compensation = profile.compensation
+                if (linkedin.isEmpty()) linkedin = profile.linkedin
             }
         } catch (e: Exception) {
             // Profile may not exist yet during onboarding — ignore
@@ -153,6 +155,17 @@ fun ProfileFormScreen(
 
         Spacer(modifier = Modifier.height(24.dp))
 
+        OutlinedTextField(
+            value = linkedin,
+            onValueChange = { linkedin = it },
+            label = { Text("LinkedIn Profile URL") },
+            placeholder = { Text("e.g. https://www.linkedin.com/in/jayesh-singh") },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true
+        )
+
+        Spacer(modifier = Modifier.height(24.dp))
+
         if (error != null) {
             Card(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
@@ -187,7 +200,8 @@ fun ProfileFormScreen(
                                 email = email,
                                 targetRoles = roles,
                                 location = location,
-                                compensation = compensation
+                                compensation = compensation,
+                                linkedin = linkedin
                             )
                         )
                         api.setupUser(

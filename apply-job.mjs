@@ -1209,10 +1209,13 @@ function answerField(category, field, profile, formAnswers, coverText) {
     case 'email': return { value: c.email || '', source: 'profile' };
     case 'phone': return { value: c.phone || '', source: 'profile' };
     case 'location': return { value: profile.location?.city || profile.location || '', source: 'profile' };
-    case 'linkedin': return { value: c.linkedin || '', source: 'profile' };
+    case 'linkedin': return { value: formAnswers.linkedin || c.linkedin || '', source: formAnswers.linkedin ? 'form-answers' : 'profile' };
     case 'github': return { value: c.github || '', source: 'profile' };
     case 'portfolio': return { value: c.portfolio_url || c.portfolio || c.github || '', source: 'profile' };
-    case 'resume': return { value: '', source: 'file' }; // handled by CV attach
+    // File inputs are filled by the CV attach step; a required *text* resume
+    // field is filled from a resume URL the candidate answered once. Never
+    // guess a resume here — but only surface a question when neither path works.
+    case 'resume': return { value: formAnswers.resume || '', source: formAnswers.resume ? 'form-answers' : 'file' };
     case 'cover_letter': return { value: coverText, source: 'profile' };
     case 'experience_years': return { value: formAnswers.experience_years || c.experience_years || '', source: 'form-answers' };
     case 'current_salary': return { value: formAnswers.current_salary || '', source: 'form-answers' };
@@ -1252,7 +1255,9 @@ function generateAnswers(fields, profile, formAnswers) {
     const { value, source } = answerField(category, field, profile, formAnswers, coverText);
     if (value && value.trim()) {
       answers[field.id] = value;
-    } else if (CANDIDATE_CONFIRMATION.has(category) || field.required) {
+    } else if (CANDIDATE_CONFIRMATION.has(category) || (field.required && source !== 'file')) {
+      // 'file' source (resume with a CV on file) is handled by the CV attach
+      // step — a required resume field must never re-ask the candidate.
       pendingQuestions.push(buildQuestion(field, category, source));
     }
   }

@@ -82,6 +82,22 @@ class MainActivity : ComponentActivity() {
 
     private suspend fun resolveStartDestination(): String {
         if (!userPrefs.isOnboarded || !userPrefs.isLoggedIn) return Routes.ONBOARDING_GOOGLE
+        // Push back to login when the Gmail token is expired and cannot be
+        // refreshed (no refresh token on file) — otherwise inbox / reply / email
+        // features silently fail while the user stays stuck in Chat.
+        val email = userPrefs.userEmail
+        if (email.isNotEmpty()) {
+            for (attempt in 0 until 2) {
+                try {
+                    val oauth = api.getOAuthStatus(email)
+                    if (oauth.configured && oauth.isExpired && !oauth.hasRefreshToken) {
+                        return Routes.ONBOARDING_GOOGLE
+                    }
+                    break
+                } catch (_: Exception) { }
+                delay(1000)
+            }
+        }
         // Give the bridge a moment if it is still starting up.
         repeat(4) {
             try {
