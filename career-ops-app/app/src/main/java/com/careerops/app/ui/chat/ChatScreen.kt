@@ -302,6 +302,7 @@ fun ChatScreen(
                                  is ChatMessage.FormQuestion -> FormQuestionCard(message)
                                  is ChatMessage.SubmitConfirmation -> SubmitConfirmationCard(message)
                                  is ChatMessage.ManualApplyCard -> ManualApplyCard(message)
+                                 is ChatMessage.SpamConfirm -> SpamConfirmCard(message)
                             }
                         }
                         // Live-updating streaming bubble
@@ -1177,6 +1178,109 @@ fun SubmitConfirmationCard(message: ChatMessage.SubmitConfirmation) {
                 }
             }
         }
+    }
+}
+
+@Composable
+fun SpamConfirmCard(message: ChatMessage.SpamConfirm) {
+    var showConfirm by remember { mutableStateOf(false) }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(0.92f),
+        shape = RoundedCornerShape(12.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.35f)
+        )
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Default.Delete,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Column {
+                    Text(
+                        text = "Delete ${message.count} spam email${if (message.count == 1) "" else "s"}?",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp
+                    )
+                    Text(
+                        text = "This permanently deletes them from your Gmail.",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            if (message.senders.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "From:",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                message.senders.forEach { s ->
+                    Text(
+                        text = "\u2022 $s",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(12.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = { message.onCancel?.invoke() },
+                    enabled = !message.deleting,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("Cancel")
+                }
+                Button(
+                    onClick = { if (!message.deleting) showConfirm = true },
+                    enabled = !message.deleting,
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error
+                    )
+                ) {
+                    if (message.deleting) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Deleting...")
+                    } else {
+                        Icon(Icons.Default.Delete, null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Delete")
+                    }
+                }
+            }
+        }
+    }
+
+    if (showConfirm) {
+        AlertDialog(
+            onDismissRequest = { showConfirm = false },
+            title = { Text("Delete Spam?") },
+            text = { Text("This permanently deletes ${message.count} email${if (message.count == 1) "" else "s"} from your Gmail. This cannot be undone. Continue?") },
+            confirmButton = {
+                Button(onClick = {
+                    showConfirm = false
+                    message.onConfirm?.invoke()
+                }) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = { showConfirm = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 }
 

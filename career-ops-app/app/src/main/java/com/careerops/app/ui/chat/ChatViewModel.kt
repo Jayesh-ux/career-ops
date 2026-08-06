@@ -168,6 +168,15 @@ sealed class ChatMessage {
         val onMarkApplied: (() -> Unit)? = null
     ) : ChatMessage()
 
+    data class SpamConfirm(
+        override val id: Long = nextId(),
+        val count: Int = 0,
+        val senders: List<String> = emptyList(),
+        val deleting: Boolean = false,
+        val onConfirm: (() -> Unit)? = null,
+        val onCancel: (() -> Unit)? = null
+    ) : ChatMessage()
+
     companion object {
         private var counter = 0L
         fun nextId(): Long = ++counter
@@ -1011,6 +1020,9 @@ class ChatViewModel @Inject constructor(
     }
 
     // ── Direct spam delete via POST /email/spam/delete ───────────────────
+    // HITL: "delete spam" never deletes immediately. It fetches the flagged
+    // messages, shows a SpamConfirm card with count + senders, and only deletes
+    // after the user taps Delete and confirms in the dialog.
     private suspend fun handleDirectSpam() {
         try {
             val email = prefs.userEmail
@@ -1023,7 +1035,8 @@ class ChatViewModel @Inject constructor(
             val inbox = withContext(Dispatchers.IO) {
                 api.getInbox(email = email, daysBack = 14, maxEmails = 50, includeSpam = true)
             }
-            val spamIds = inbox.emails.filter { it.isSpam }.mapNotNull {
+            val spamEmails = inbox.emails.filter { it.isSpam }
+            val spamIds = spamEmails.mapNotNull {
                 it.gmailId.ifEmpty { it.uid.ifEmpty { it.id } }.takeIf { id -> id.isNotEmpty() && id != "0" }
             }
             if (spamIds.isEmpty()) {
@@ -1033,17 +1046,67 @@ class ChatViewModel @Inject constructor(
                 return
             }
 
-            withContext(Dispatchers.IO) {
-                api.deleteSpam(mapOf("messageIds" to spamIds, "markAsRead" to true))
-            }
+            _pendingSpamIds = spamIds
+            _pendingSpamSenders = spamEmails
+                .map { it.from.ifBlank { it.subject.ifBlank { "(no sender)" } } }
+                .distinct()
+                .take(12)
             removeProcessing()
             isProcessing = false
-            messages.add(ChatMessage.System("Deleted ${spamIds.size} spam emails."))
+
+            val cardId = ChatMessage.nextId()
+            _pendingSpamCardId = cardId
+            messages.add(ChatMessage.SpamConfirm(
+                id = cardId,
+                count = spamIds.size,
+                senders = _pendingSpamSenders,
+                onConfirm = { viewModelScope.launch { performSpamDelete() } },
+                onCancel = {
+                    _pendingSpamCardId = null
+                    _pendingSpamIds = emptyList()
+                    _pendingSpamSenders = emptyList()
+                    val idx = messages.indexOfFirst { it.id == cardId }
+                    if (idx >= 0) messages.removeAt(idx)
+                }
+            ))
             persistMessages()
         } catch (e: Exception) {
             removeProcessing()
             isProcessing = false
+            messages.add(ChatMessage.System("Couldn't check your inbox right now. Please try again."))
+        }
+    }
+
+    // Pending spam-delete state (filled by handleDirectSpam, cleared by the
+    // confirm/cancel handlers).
+    private var _pendingSpamCardId: Long? = null
+    private var _pendingSpamIds: List<String> = emptyList()
+    private var _pendingSpamSenders: List<String> = emptyList()
+
+    private suspend fun performSpamDelete() {
+        val cardId = _pendingSpamCardId ?: return
+        val ids = _pendingSpamIds
+        if (ids.isEmpty()) return
+        val idx = messages.indexOfFirst { it.id == cardId }
+        if (idx >= 0 && messages[idx] is ChatMessage.SpamConfirm) {
+            messages[idx] = (messages[idx] as ChatMessage.SpamConfirm).copy(deleting = true)
+        }
+        try {
+            val response = withContext(Dispatchers.IO) {
+                api.deleteSpam(mapOf("messageIds" to ids, "markAsRead" to true))
+            }
+            val deletedCount = (response["deleted"] as? Number)?.toInt() ?: ids.size
+            messages.add(ChatMessage.System("Deleted $deletedCount spam email${if (deletedCount == 1) "" else "s"}."))
+        } catch (e: Exception) {
             messages.add(ChatMessage.System("Couldn't clean your inbox right now. Please try again."))
+        } finally {
+            _pendingSpamCardId = null
+            _pendingSpamIds = emptyList()
+            _pendingSpamSenders = emptyList()
+            val i = messages.indexOfFirst { it.id == cardId }
+            if (i >= 0) messages.removeAt(i)
+            isProcessing = false
+            persistMessages()
         }
     }
 
