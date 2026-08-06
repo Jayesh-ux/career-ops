@@ -79,15 +79,17 @@ class DailyAutomationWorker @AssistedInject constructor(
             try {
                 val inbox = api.getInbox(
                     email = userPrefs.userEmail,
-                    daysBack = 1,
-                    maxEmails = 20
+                    daysBack = 7,
+                    maxEmails = 100
                 )
                 val recruiterReplies = inbox.emails.filter { email ->
                     val from = (email.from ?: "").lowercase()
                     val isDigest = listOf(
                         "quora.com", "indeed.com", "hirist", "linkedin.com", "naukri",
                         "monster.com", "glassdoor", "buzzfeed", "medium.com", "substack",
-                        "newsletter", "digest", "no-reply", "noreply", "updates@"
+                        "newsletter", "digest", "no-reply", "noreply", "updates@", "donotreply",
+                        "pinterest", "instahyre", "foundit", "github", "havells",
+                        "stackoverflow", "render.com", "edureka"
                     ).any { from.contains(it) }
                     !isDigest && !email.isSpam && (
                         email.subject.contains(Regex("(?i)(interview|phone screen|next round|screening)")) ||
@@ -98,7 +100,8 @@ class DailyAutomationWorker @AssistedInject constructor(
                 }
 
                 if (recruiterReplies.isNotEmpty()) {
-                    Log.i(TAG, "Found ${recruiterReplies.size} recruiter replies — classifying via opencode...")
+                    Log.i(TAG, "Found ${recruiterReplies.size} candidate replies — confirming via classifier...")
+                    var notified = 0
                     for (reply in recruiterReplies) {
                         try {
                             val classification = api.classifyEmail(ClassifyRequest(
@@ -106,17 +109,20 @@ class DailyAutomationWorker @AssistedInject constructor(
                                 subject = reply.subject,
                                 preview = reply.body.take(500)
                             ))
-                            sendDraftNotification(
-                                "[${classification.classification.uppercase()}] ${reply.from}",
-                                "Subject: ${reply.subject}\n${classification.reason}"
-                            )
+                            if (classification.classification == "job_reply" && classification.confidence >= 0.6) {
+                                notified++
+                                sendDraftNotification(
+                                    "RECRUITER REPLY: ${reply.from}",
+                                    "Subject: ${reply.subject}\n${classification.reason}"
+                                )
+                            } else {
+                                Log.i(TAG, "Rejected as ${classification.classification} (${classification.confidence}): ${reply.subject}")
+                            }
                         } catch (e: Exception) {
-                            sendDraftNotification(
-                                "Reply from: ${reply.from}",
-                                "Subject: ${reply.subject}"
-                            )
+                            Log.e(TAG, "Classify failed for ${reply.subject}: ${e.message}")
                         }
                     }
+                    if (notified == 0) Log.i(TAG, "No confirmed recruiter replies after classification")
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Inbox check failed: ${e.message}")

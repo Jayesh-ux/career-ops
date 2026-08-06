@@ -85,7 +85,8 @@ interface CareerOpsApi {
         @Query("email") email: String,
         @Query("daysBack") daysBack: Int = 14,
         @Query("maxEmails") maxEmails: Int = 30,
-        @Query("includeSpam") includeSpam: Boolean = false
+        @Query("includeSpam") includeSpam: Boolean = false,
+        @Query("query") query: String? = null
     ): InboxResponse
 
     @POST("email/reply")

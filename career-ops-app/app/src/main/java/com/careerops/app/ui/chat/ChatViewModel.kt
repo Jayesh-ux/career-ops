@@ -308,6 +308,7 @@ class ChatViewModel @Inject constructor(
 
     private var currentSessionId: String? = null
     private var inboxPollJob: kotlinx.coroutines.Job? = null
+    private val classifiedEmailIds = mutableSetOf<String>()
     private var processingCardId: Long? = null
 
     /** The currently-running operation so the persistent HITL "Stop" can cancel it. */
@@ -395,28 +396,48 @@ class ChatViewModel @Inject constructor(
                         daysBack = 14,
                         maxEmails = 50
                     )
-                    val replies = inbox.emails.filter { email ->
-                        !email.isSpam && looksLikeRecruiterReply(email)
+                    // Cheap pre-filter first, then confirm via the classifier so
+                    // job-board digests never masquerade as recruiter replies.
+                    val candidates = inbox.emails.filter { email ->
+                        !email.isSpam && !isClassified(email) && looksLikeRecruiterReply(email)
                     }
-                    for (reply in replies) {
-                        val alreadyNotified = messages.any { msg ->
-                            msg is ChatMessage.System && msg.text.contains(reply.subject)
-                        }
-                        if (!alreadyNotified) {
-                            Toast.makeText(app, "Possible reply: ${reply.from} — ${reply.subject}", Toast.LENGTH_LONG).show()
-                            // NOTIFY ONLY. Never auto-draft or auto-send from polling —
-                            // the user must explicitly ask to draft a reply.
-                            messages.add(ChatMessage.System(
-                                "\uD83D\uDCE8 **Possible recruiter reply:**\n" +
-                                "From: ${reply.from}\n" +
-                                "Subject: ${truncateIfNeeded(reply.subject)}\n\n" +
-                                "_Nothing was drafted or sent. To reply, say **'reply to {company}'** and I'll prepare a draft for your review._"
+                    for (candidate in candidates) {
+                        markClassified(candidate)
+                        try {
+                            val cls = api.classifyEmail(ClassifyRequest(
+                                from = candidate.from,
+                                subject = candidate.subject,
+                                preview = candidate.body.take(500)
                             ))
-                        }
+                            if (cls.classification != "job_reply" || cls.confidence < 0.6) continue
+                            val alreadyNotified = messages.any { msg ->
+                                msg is ChatMessage.System && msg.text.contains(candidate.subject)
+                            }
+                            if (!alreadyNotified) {
+                                Toast.makeText(app, "Recruiter reply: ${candidate.from} — ${candidate.subject}", Toast.LENGTH_LONG).show()
+                                // NOTIFY ONLY. Never auto-draft or auto-send from polling —
+                                // the user must explicitly ask to draft a reply.
+                                messages.add(ChatMessage.System(
+                                    "\uD83D\uDCE8 **Recruiter reply:**\n" +
+                                    "From: ${candidate.from}\n" +
+                                    "Subject: ${truncateIfNeeded(candidate.subject)}\n\n" +
+                                    "_Nothing was drafted or sent. To reply, say **'reply to {company}'** and I'll prepare a draft for your review._"
+                                ))
+                            }
+                        } catch (_: Exception) {}
                     }
                 } catch (_: Exception) {}
             }
         }
+    }
+
+    private fun emailKey(email: InboxEmail): String =
+        email.gmailId.takeIf { it.isNotBlank() } ?: "${email.from}|${email.subject}"
+
+    private fun isClassified(email: InboxEmail): Boolean = classifiedEmailIds.contains(emailKey(email))
+
+    private fun markClassified(email: InboxEmail) {
+        classifiedEmailIds.add(emailKey(email))
     }
 
     /**
@@ -432,6 +453,7 @@ class ChatViewModel @Inject constructor(
                     val baseUrl = prefs.bridgeServerUrl.trimEnd('/')
                     val request = okhttp3.Request.Builder()
                         .url("$baseUrl/notifications/check")
+                        .header("X-User-Id", prefs.userEmail)
                         .post("{}".toRequestBody("application/json".toMediaType()))
                         .build()
                     client.newCall(request).execute()
@@ -3128,7 +3150,9 @@ class ChatViewModel @Inject constructor(
             "glassdoor", "simplyhired", "jobrapido", "buzzfeed", "medium.com", "substack",
             "youtube.com", "internshala", "timesjobs", "shine.com", "foundit.com",
             "freshersworld", "apna.co", "teamlease", "zoho", "newsletter", "digest",
-            "mailer", "notifications", "updates@", "no-reply", "noreply"
+            "mailer", "notifications", "updates@", "no-reply", "noreply", "donotreply",
+            "pinterest", "instahyre", "github", "havells", "stackoverflow", "render.com",
+            "edureka"
         )
         return digestDomains.any { f.contains(it) }
     }

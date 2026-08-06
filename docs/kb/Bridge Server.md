@@ -1,7 +1,7 @@
 ---
 type: component
 tags: [component, backend, api]
-updated: 2026-08-05
+updated: 2026-08-06
 ---
 
 # Bridge Server
@@ -123,6 +123,27 @@ header.
   merge-tracker.mjs` was spawned from the per-user cwd and silently failed to
   find the module — leaving eval rows stranded in `batch/tracker-additions/`
   and never merged into `data/applications.md`.
+- Own the **email-inbox scan** (`fetchGmailInboxREST`, 2026-08-06 hardening):
+  the Gmail REST list previously capped at 50 messages (`Math.min(maxEmails,
+  50)` on a single page) — roughly two days of inbox volume — so older recruiter
+  outreach was invisible to the app, the worker, and `/notifications/check`.
+  It now **paginates with `nextPageToken`** up to a 250-message cap and fetches
+  message bodies in bounded chunks (20 at a time) to avoid Gmail rate limits.
+  `/email/inbox` also accepts a **`query`** param passed straight to the Gmail
+  API. Detection in `/notifications/check` and `/interview/detect` is now
+  **classifier-gated**: after a cheap keyword pre-filter, each candidate email
+  is sent to the opencode-backed `/email/classify` via the shared
+  `classifyEmailViaBridge` helper, and only `job_reply` messages with
+  confidence ≥ 0.7 — that also pass the shared `DIGEST_SENDERS` blocklist
+  (job boards + digest/newsletter/no-reply senders, expanded with pinterest,
+  instahyre, foundit, github, havells, stackoverflow, render.com, edureka) —
+  can surface as recruiter replies, offers, or interview records. This replaced
+  the regex-only detection that was writing fake interviews (Quora/Indeed/
+  Internshala digests, Edureka bootcamps) into `interviews.json`; the file was
+  purged to `[]` and stays empty. The Android app (`ChatViewModel.startInboxPolling`,
+  `DailyAutomationWorker`) mirrors the same gate against `/email/classify`.
+  Note: `/email/classify` runs opencode per candidate, so the keyword
+  pre-filter keeps each check bounded.
 
 ## Design notes
 

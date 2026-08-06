@@ -2101,36 +2101,52 @@ async function fetchGmailInboxREST(email, userId, { daysBack = 30, maxEmails = 5
   const accessToken = await resolveGmailAccessToken(userId, email);
   const headers = { Authorization: `Bearer ${accessToken}` };
   const q = query || `in:inbox newer_than:${Math.max(daysBack, 1)}d`;
-  const listUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=${Math.min(Math.max(maxEmails, 1), 50)}&q=${encodeURIComponent(q)}`;
-  const listResp = await fetch(listUrl, { headers });
-  if (!listResp.ok) {
-    const errText = await listResp.text().catch(() => '');
-    throw new Error(`Gmail API list failed: ${listResp.status} ${errText.slice(0, 200)}`);
+  const cap = Math.min(Math.max(maxEmails, 1), 250);
+
+  // Gmail lists newest-first and pages via nextPageToken. Collect up to `cap` ids
+  // across pages so windows larger than the old 50-message cap actually work.
+  const ids = [];
+  let pageToken = null;
+  while (ids.length < cap) {
+    const params = new URLSearchParams({ q, maxResults: String(Math.min(500, cap - ids.length)) });
+    if (pageToken) params.set('pageToken', pageToken);
+    const listResp = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?${params.toString()}`, { headers });
+    if (!listResp.ok) {
+      const errText = await listResp.text().catch(() => '');
+      throw new Error(`Gmail API list failed: ${listResp.status} ${errText.slice(0, 200)}`);
+    }
+    const listData = await listResp.json();
+    ids.push(...(listData.messages || []).map(m => m.id));
+    pageToken = listData.nextPageToken || null;
+    if (!pageToken || (listData.messages || []).length === 0) break;
   }
-  const listData = await listResp.json();
-  const ids = (listData.messages || []).slice(0, maxEmails).map(m => m.id);
 
   const emails = [];
-  await Promise.all(ids.map(async (id) => {
-    try {
-      const msgResp = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`, { headers });
-      if (!msgResp.ok) return;
-      const msg = await msgResp.json();
-      const headersMap = {};
-      for (const h of (msg.payload?.headers || [])) headersMap[h.name.toLowerCase()] = h.value;
-      const bodyText = extractGmailBody(msg);
-      const parsedDate = new Date(headersMap.date || parseInt(msg.internalDate || 0, 10));
-      emails.push({
-        gmailId: msg.id,
-        from: headersMap.from || '',
-        fromEmail: parseFromEmail(headersMap.from || ''),
-        subject: headersMap.subject || '',
-        date: isNaN(parsedDate.getTime()) ? new Date(0).toISOString() : parsedDate.toISOString(),
-        preview: (msg.snippet || '').substring(0, 200),
-        body: bodyText.substring(0, 5000),
-      });
-    } catch { /* skip individual message failures */ }
-  }));
+  // Fetch bodies in bounded chunks to avoid hammering the Gmail API on wide windows.
+  const CONCURRENCY = 20;
+  for (let i = 0; i < ids.length; i += CONCURRENCY) {
+    const chunk = ids.slice(i, i + CONCURRENCY);
+    await Promise.all(chunk.map(async (id) => {
+      try {
+        const msgResp = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`, { headers });
+        if (!msgResp.ok) return;
+        const msg = await msgResp.json();
+        const headersMap = {};
+        for (const h of (msg.payload?.headers || [])) headersMap[h.name.toLowerCase()] = h.value;
+        const bodyText = extractGmailBody(msg);
+        const parsedDate = new Date(headersMap.date || parseInt(msg.internalDate || 0, 10));
+        emails.push({
+          gmailId: msg.id,
+          from: headersMap.from || '',
+          fromEmail: parseFromEmail(headersMap.from || ''),
+          subject: headersMap.subject || '',
+          date: isNaN(parsedDate.getTime()) ? new Date(0).toISOString() : parsedDate.toISOString(),
+          preview: (msg.snippet || '').substring(0, 200),
+          body: bodyText.substring(0, 5000),
+        });
+      } catch { /* skip individual message failures */ }
+    }));
+  }
 
   emails.sort((a, b) => new Date(b.date) - new Date(a.date));
   emails.forEach((e, i) => { e.id = i + 1; });
@@ -2139,6 +2155,39 @@ async function fetchGmailInboxREST(email, userId, { daysBack = 30, maxEmails = 5
 
 // ── Spam filter for inbox emails ──────────────────────────────────
 // Flags obvious spam/non-recruiter mail without auto-deleting
+
+// Job-board alerts / digest senders that are never direct recruiter replies.
+// Shared by /notifications/check and /interview/detect so both stay consistent.
+const DIGEST_SENDERS = ['naukri', 'indeed', 'linkedin', 'glassdoor', 'monster', 'hirist', 'quora', 'buzzfeed', 'medium', 'substack', 'newsletter', 'digest', 'no-reply', 'noreply', 'updates@', 'donotreply', 'pinterest', 'instahyre', 'foundit', 'github', 'havells', 'stackoverflow', 'render.com', 'edureka'];
+
+function isDigestSenderL(email) {
+  const fromL = (email.fromEmail || email.from || '').toLowerCase();
+  return DIGEST_SENDERS.some(d => fromL.includes(d));
+}
+
+// Classify an email via the bridge's own /email/classify endpoint
+// (opencode-backed). Returns null when classification is unavailable.
+async function classifyEmailViaBridge(userId, email) {
+  try {
+    const headers = { 'Content-Type': 'application/json' };
+    if (userId) headers['X-User-Id'] = userId;
+    const resp = await fetch('http://127.0.0.1:8787/email/classify', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        from: email.from || '',
+        fromEmail: email.fromEmail || '',
+        subject: email.subject || '',
+        preview: (email.preview || email.body || '').slice(0, 500),
+      }),
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    if (!data || typeof data.classification !== 'string') return null;
+    return data;
+  } catch { return null; }
+}
+
 function classifyEmailSpam(email) {
   const from = (email.fromEmail || '').toLowerCase();
   const subject = (email.subject || '').toLowerCase();
@@ -2221,6 +2270,7 @@ app.get('/email/inbox', async (req, res) => {
   try {
     const daysBack = parseInt(req.query.daysBack, 10) || 30;
     const maxEmails = parseInt(req.query.maxEmails, 10) || 50;
+    const query = (req.query.query || '').trim();
 
     // OAuth users get Gmail REST (reliable; IMAP crashes on large mailboxes).
     // App-password users keep IMAP. On REST failure, fall back to IMAP.
@@ -2228,7 +2278,7 @@ app.get('/email/inbox', async (req, res) => {
     let method;
     if (hasUserOAuth2 || hasLegacyOAuth2) {
       try {
-        allEmails = await fetchGmailInboxREST(email, req.userCtx.userId, { daysBack, maxEmails });
+        allEmails = await fetchGmailInboxREST(email, req.userCtx.userId, { daysBack, maxEmails, query: query || undefined });
         method = hasUserOAuth2 ? 'per_user_oauth2_rest' : 'legacy_oauth2_rest';
       } catch (restErr) {
         logRestError('email/inbox', email, restErr);
@@ -3911,8 +3961,8 @@ app.post('/interview/detect', async (req, res) => {
     if (hasUserOAuth2 || hasLegacyOAuth2) {
       try {
         allEmails = await fetchGmailInboxREST(user, userId, {
-          daysBack: parseInt(daysBack, 10) || 14,
-          maxEmails: parseInt(maxEmails, 10) || 40,
+          daysBack: parseInt(daysBack, 10) || 30,
+          maxEmails: parseInt(maxEmails, 10) || 100,
         });
       } catch (restErr) {
         logRestError('interview/detect', email, restErr);
@@ -3928,17 +3978,23 @@ app.post('/interview/detect', async (req, res) => {
     const found = [];
 
     for (const e of (allEmails || [])) {
-      const fromL = (e.fromEmail || e.from || '').toLowerCase();
       // Skip job-board alerts / digests — they're not interview invites
-      const digestFrom = ['naukri', 'indeed', 'linkedin', 'glassdoor', 'monster', 'hirist', 'quora', 'buzzfeed', 'medium', 'substack', 'newsletter', 'digest', 'no-reply', 'noreply', 'updates@', 'donotreply'];
-      if (digestFrom.some(d => fromL.includes(d))) continue;
+      if (isDigestSenderL(e)) continue;
 
       const subj = (e.subject || '').toLowerCase();
       const body = (e.body || e.preview || '').toLowerCase();
-      const isInterview =
+      const plausibleInterview =
         /interview|phone screen|next round|meeting with|screen(ing)? call|technical round|hr round|f2f|face.to.face/i.test(subj) ||
         /interview|phone screen|availability|next step|schedule(d)?|confirmed|we would like to meet|pleased to invite/i.test(body);
-      if (!isInterview) continue;
+      if (!plausibleInterview) continue;
+
+      // Classifier gate — only direct recruiter mail can carry an interview
+      // invite; job-board digests get filtered out here instead of polluting
+      // interviews.json.
+      const cls = await classifyEmailViaBridge(userId, e);
+      const classification = cls?.classification;
+      const confidence = typeof cls?.confidence === 'number' ? cls.confidence : 0;
+      if (classification !== 'job_reply' || confidence < 0.7) continue;
 
       const dt = extractInterviewDateTime(e.subject, e.body || e.preview);
       const key = `${e.fromEmail || e.from || ''}|${(e.subject || '').slice(0, 60)}`;
@@ -7283,9 +7339,10 @@ app.post('/notifications/check', async (req, res) => {
     const userDir = req.userCtx?.userDir || __dirname;
     const notifications = [];
 
-    // Check inbox for new recruiter emails
+    // Check inbox for new recruiter emails (7-day window so older recruiter
+    // outreach isn't invisible; the old 1-day/10-email cap missed them).
     try {
-      const inboxResp = await fetch(`http://127.0.0.1:8787/email/inbox?daysBack=1&maxEmails=10`, {
+      const inboxResp = await fetch(`http://127.0.0.1:8787/email/inbox?daysBack=7&maxEmails=100`, {
         headers: userId ? { 'X-User-Id': userId } : {},
       });
       if (inboxResp.ok) {
@@ -7293,11 +7350,22 @@ app.post('/notifications/check', async (req, res) => {
         for (const email of (inboxData.emails || [])) {
           const subj = (email.subject || '').toLowerCase();
           const body = (email.body || email.preview || '').toLowerCase();
-          const fromL = (email.fromEmail || email.from || '').toLowerCase();
-          const digestFrom = ['naukri', 'indeed', 'linkedin', 'glassdoor', 'monster', 'hirist', 'quora', 'buzzfeed', 'medium', 'substack', 'newsletter', 'digest', 'no-reply', 'noreply', 'updates@', 'donotreply'];
-          if (digestFrom.some(d => fromL.includes(d))) continue;
+          if (isDigestSenderL(email)) continue;
 
-          if (/interview|schedule|meeting/i.test(subj) || /schedule|availability/i.test(body)) {
+          // Cheap pre-filter first — only plausible recruiter mail reaches the
+          // classifier (each classify call runs opencode, so keep it bounded).
+          const plausible =
+            /interview|phone screen|next round|screen(ing)? call|schedule|meeting|recruiter|hiring|your application|opportunity|offer|selected|shortlist|re\s*:/i.test(subj) ||
+            /interview|schedule|availability|your application|your resume|recruiter|hiring manager|opportunity|position|offer|joining date|start date/i.test(body.slice(0, 400));
+          if (!plausible) continue;
+
+          // Classifier gate — only high-confidence direct recruiter mail counts.
+          const cls = await classifyEmailViaBridge(userId, email);
+          const classification = cls?.classification;
+          const confidence = typeof cls?.confidence === 'number' ? cls.confidence : 0;
+          if (classification !== 'job_reply' || confidence < 0.7) continue;
+
+          if (/interview|schedule|meeting|next round/i.test(subj) || /interview|schedule|availability|we would like to meet/i.test(body)) {
             const dt = extractInterviewDateTime(email.subject, email.body || email.preview);
             const when = dt ? `\n**When:** ${dt.human}` : '';
             notifications.push({
@@ -7335,18 +7403,17 @@ app.post('/notifications/check', async (req, res) => {
               }
               saveInterviews(req, interviews);
             } catch { /* persist non-fatal */ }
-          } else if (/recruiter|hiring|your application|opportunity/i.test(subj) ||
-                     /resume|application|profile|position/i.test(body)) {
-            notifications.push({
-              type: 'recruiter_reply',
-              title: 'Recruiter Reply',
-              message: `${email.from}: ${email.subject}`,
-              email,
-            });
           } else if (/offer|congratulations|pleased to inform/i.test(subj)) {
             notifications.push({
               type: 'offer',
               title: 'Offer Received!',
+              message: `${email.from}: ${email.subject}`,
+              email,
+            });
+          } else {
+            notifications.push({
+              type: 'recruiter_reply',
+              title: 'Recruiter Reply',
               message: `${email.from}: ${email.subject}`,
               email,
             });
