@@ -1,7 +1,7 @@
 ---
 type: boundary
 tags: [boundary, oauth, google]
-updated: 2026-08-03
+updated: 2026-08-06
 ---
 
 # Google OAuth
@@ -42,6 +42,19 @@ sign-in. That single interaction mints **both** credential families:
    persistent profile before any page loads.
 
 So one WebView sign-in produces both the API token **and** the browser session.
+
+## Refresh-token trap (fixed 2026-08-06)
+
+Google only mints a **refresh token on the first consent** for an app. A repeat
+sign-in with `prompt=select_account` returns just a 1-hour access token — which
+is exactly what happened: a re-login on 2026-08-06 stored `hasRefreshToken:
+false`, the access token expired an hour later, and every inbox/send/reply
+endpoint failed with "No email auth configured" even though the user was
+"logged in". Fix: both OAuth auth URLs
+(`GoogleSignInScreen.kt` and `PortalLoginScreen.kt`) now use
+`prompt=consent%20select_account`, which forces the consent screen on **every**
+sign-in and re-issues a refresh token. A stored credential is only usable when
+`hasUsableOAuth` sees a `refreshToken` (or an unexpired access token).
 
 ## The rule
 

@@ -1117,6 +1117,10 @@ const FIELD_CATEGORIES = [
   { category: 'email',       test: (l) => l.includes('email') },
   { category: 'phone',       test: (l) => l.includes('phone') || l.includes('mobile') },
   { category: 'location',    test: (l) => l.includes('location') || /\bcity\b/.test(l) || l.includes('address') },
+  // Country / nationality / passport fields resolve from profile.location.country
+  // (an Indian citizen's residence, passport country, and nationality all
+  // resolve to India) — never ask for what the profile already states.
+  { category: 'country',     test: (l) => (l.includes('country') || l.includes('nationality') || l.includes('passport')) && !l.includes('code') && !l.includes('dial') },
   { category: 'linkedin',    test: (l) => l.includes('linkedin') },
   { category: 'github',      test: (l) => l.includes('github') },
   { category: 'portfolio',   test: (l) => l.includes('portfolio') || l.includes('website') || l.includes('blog') },
@@ -1209,6 +1213,7 @@ function answerField(category, field, profile, formAnswers, coverText) {
     case 'email': return { value: c.email || '', source: 'profile' };
     case 'phone': return { value: c.phone || '', source: 'profile' };
     case 'location': return { value: profile.location?.city || profile.location || '', source: 'profile' };
+    case 'country': return { value: profile.location?.country || profile.location?.visa_status || '', source: 'profile' };
     case 'linkedin': return { value: formAnswers.linkedin || c.linkedin || '', source: formAnswers.linkedin ? 'form-answers' : 'profile' };
     case 'github': return { value: c.github || '', source: 'profile' };
     case 'portfolio': return { value: c.portfolio_url || c.portfolio || c.github || '', source: 'profile' };

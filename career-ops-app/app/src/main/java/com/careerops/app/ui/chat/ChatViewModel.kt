@@ -2956,7 +2956,8 @@ class ChatViewModel @Inject constructor(
         } catch (e: Exception) {
             setDraftSendState(draftId, sending = false, sent = false)
             messages.add(ChatMessage.System(
-                "\u274C Couldn't send the application to **$company**. Please check your connection and try again."
+                "\u274C Couldn't send the application to **$company**: ${describeError(e)}\n" +
+                "If Gmail is disconnected, open **Settings → Reconnect Gmail** and try again."
             ))
         }
         if (draftId != null) sendingDraftIds.remove(draftId)

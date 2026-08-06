@@ -244,7 +244,7 @@ fun PortalLoginScreen(
             "response_type=code&" +
             "scope=openid email https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly&" +
             "access_type=offline&" +
-            "prompt=select_account"
+            "prompt=consent%20select_account"
         val intent = GoogleOAuthActivity.createIntent(context, authUri)
         oauthLauncher.launch(intent)
     }

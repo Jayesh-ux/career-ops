@@ -45,7 +45,9 @@ Before the portal check, `resolveStartDestination()` calls
 token to recover it), the user is routed straight back to `ONBOARDING_GOOGLE`
 instead of Chat — inbox/reply/email features would otherwise fail silently while
 the user sits in Chat. Tokens with a usable refresh token are left alone: the
-bridge refreshes them automatically.
+bridge refreshes them automatically. The Gmail OAuth URLs force
+`prompt=consent%20select_account` so every sign-in re-mints a refresh token
+(see [[Google OAuth]] refresh-token trap).
 
 ### Onboarding LinkedIn capture
 

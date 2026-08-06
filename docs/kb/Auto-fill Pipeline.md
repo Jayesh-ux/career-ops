@@ -71,6 +71,10 @@ Rules that keep the candidate from being re-asked for data they already gave
 - **LinkedIn** (`category 'linkedin'`): resolved from `form-answers.yml` first,
   then `profile.yml candidate.linkedin` — never re-asked once either holds a
   value.
+- **Country / nationality / passport** (`category 'country'`): resolved from
+  `profile.yml location.country` (and `visa_status` as fallback). "Passport
+  Country", "Country of Residence", "Nationality" all resolve to India for an
+  Indian citizen — never asked when the profile states a country.
 - **Candidate-confirmation categories** (experience, salaries, commute, notice,
   authorization, education): always surfaced as a question when empty, because
   guessing them would fabricate candidate data.
