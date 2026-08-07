@@ -27,6 +27,17 @@ Historic findings (revalidate with the analyzer when in doubt):
   feeds first.
 - Never invent portals, feeds, or companies. Reuse the existing scan/apply
   scripts and bridge endpoints over ad-hoc logic.
+- **Scan iterates per profile role (do not constrict).** When a scan asks you
+  to search, iterate EVERY role in the user's `target_roles.primary`, each
+  combined with the profile's locations (`location.city` + commuting areas in
+  `location_flexibility`) and expected salary (`compensation.minimum`). Use the
+  bridge's `/scan/stream` role-search phase (it builds per-role portal search
+  URLs for Naukri, Indeed, Shine, Foundit, TimesJobs, Hirist, Internshala,
+  LinkedIn + more on "Scan again") rather than one generic OR keyword query.
+  If you add websearch/company searches, drive them off the profile's own
+  roles, cities, and domain terms — expand, never hardcode a fixed source list.
+  The end user is different every time; the profile is the only safe source of
+  truth.
 
 ## 2. Multi-user isolation
 

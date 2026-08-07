@@ -181,6 +181,34 @@ header.
   (3 LPA) form a hard gate: a **parseable** salary below the floor is dropped;
   unknown/negotiable salaries pass. Both filters update the `excludedSalary`
   counter in the summary and the "widening" step.
+  **Profile-driven source relevance (2026-08-07)**: `/scan` + `/scan/stream`
+  gate every enabled source through `isRelevantSource(entry, section)` before
+  it becomes a target. Genuine job boards — a portal with a region-scoped
+  `location`, an explicit `provider`, or a `search_queries` entry — always
+  scan; company career pages scan only when their `name + notes` match the
+  user's target-role terms (`kw` minus generic tokens like `engineer`) or
+  `domainTerms` extracted from `narrative` (exit_story + superpowers,
+  stop-word filtered: fintech/logistics/recruitment/...); remote-only boards
+  scan only when `candidate.location_flexibility` allows remote/hybrid. No
+  hardcoded company lists — `portals.yml` stays generic (this replaced the
+  earlier hardcoded source blocklist). Skipped sources bump the
+  `excludedSources` counter surfaced in the done summary and the "widening"
+  step; the per-user `data/blacklist.md` remains the explicit override.
+  **Per-role scan phase (2026-08-07)**: `/scan/stream` iterates every role in
+  `target_roles.primary` (from the requesting user's profile) in a dedicated
+  `phase: 'roles'` step between the portal websearch phase and the Playwright
+  phase. `buildRoleSearchSpecs()` builds per-role search URLs (portal URL
+  templates × the profile's commuting location from `location_flexibility`) and
+  per-role keyword sets; each URL is fetched (HTTP-first) with the profile's
+  salary floor + `isJobDetailUrl` applied in-phase, and anything the plain
+  fetch can't render joins Phase 3's Playwright retry carrying `_roleKw` so
+  matching stays per-role. Added genuine Indian portals to `portals.yml`
+  `job_boards` (Monster, TechGig, Jora, Jooble, Talent.com, Hirect, all Tier 2
+  `expand_on_rerun`) + free no-key API boards (Remotive, Arbeitnow via their
+  `providers/*`) which the `isRelevantSource` gate auto-skips for on-site
+  profiles and auto-includes for remote/hybrid ones. Per-role result cards use
+  a human-readable location label (slug → title case, e.g. `mumbai` → `Mumbai`);
+  the URL keeps the lowercase slug and location matching is case-insensitive.
 - Own **thread-aware recruiter replies** (`POST /email/reply` + `/email/reply/send`,
   2026-08-07 rewrite): `/email/reply` accepts `to`/`subject`/`originalBody`/`body`
   plus `inReplyTo`/`messageId`/`threadId` and returns

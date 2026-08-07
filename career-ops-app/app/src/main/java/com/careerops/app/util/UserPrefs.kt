@@ -93,4 +93,18 @@ class UserPrefs(context: Context) {
             context.openFileInput("chat_history.json").bufferedReader().use { it.readText() }
         } catch (_: Exception) { "" }
     }
+
+    fun saveSuggestedJobs(json: String, context: Context) {
+        try {
+            context.openFileOutput("suggested_jobs.json", Context.MODE_PRIVATE).use { out ->
+                out.write(json.toByteArray())
+            }
+        } catch (_: Exception) {}
+    }
+
+    fun loadSuggestedJobs(context: Context): String {
+        return try {
+            context.openFileInput("suggested_jobs.json").bufferedReader().use { it.readText() }
+        } catch (_: Exception) { "" }
+    }
 }

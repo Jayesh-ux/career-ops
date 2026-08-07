@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -372,6 +373,50 @@ class ChatViewModel @Inject constructor(
     fun removeAppliedFromSuggested(company: String) {
         if (company.isBlank()) return
         suggestedJobs = suggestedJobs.filterNot { it.company.equals(company, ignoreCase = true) }
+        persistSuggestedJobs()
+    }
+
+    // Persist the pinned suggested-jobs list to disk so it survives app
+    // restarts — the "Suggested (N)" button stays pinned across sessions.
+    private fun persistSuggestedJobs() {
+        try {
+            val arr = JSONArray()
+            for (job in suggestedJobs) {
+                arr.put(JSONObject()
+                    .put("company", job.company)
+                    .put("role", job.role)
+                    .put("url", job.url)
+                    .put("source", job.source)
+                    .put("location", job.location)
+                    .put("salary", job.salary)
+                    .put("score", job.score)
+                    .put("fit", job.fit))
+            }
+            prefs.saveSuggestedJobs(arr.toString(), app.applicationContext)
+        } catch (_: Exception) {}
+    }
+
+    private fun restoreSuggestedJobs() {
+        try {
+            val raw = prefs.loadSuggestedJobs(app.applicationContext)
+            if (raw.isBlank()) return
+            val arr = JSONArray(raw)
+            val restored = mutableListOf<ScanResult>()
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                restored.add(ScanResult(
+                    company = obj.optString("company", ""),
+                    role = obj.optString("role", ""),
+                    url = obj.optString("url", ""),
+                    source = obj.optString("source", ""),
+                    location = obj.optString("location", ""),
+                    salary = obj.optString("salary", ""),
+                    score = obj.optString("score", ""),
+                    fit = obj.optString("fit", "")
+                ))
+            }
+            suggestedJobs = restored.distinctBy { it.url.ifBlank { "${it.company}::${it.role}" } }
+        } catch (_: Exception) {}
     }
     fun applyFromScanResults(job: ScanResult) {
         // Close the overlay so the draft steps are visible in the chat below.
@@ -409,6 +454,9 @@ class ChatViewModel @Inject constructor(
         // Show any pending automation events from background worker
         loadPendingEvents()
 
+        // Restore the pinned suggested-jobs list so it survives restarts.
+        restoreSuggestedJobs()
+
         debugLog.add(DebugEntry("init", "ViewModel created, session: none"))
 
         // Persist whenever the message list changes so chat survives process
@@ -418,6 +466,15 @@ class ChatViewModel @Inject constructor(
             snapshotFlow { messages.toList() }
                 .debounce(500)
                 .collect { persistMessages() }
+        }
+
+        // Persist the pinned suggested-jobs list whenever it changes, so the
+        // "Suggested (N)" button stays available across app restarts.
+        viewModelScope.launch {
+            snapshotFlow { suggestedJobs.toList() }
+                .drop(1)
+                .debounce(500)
+                .collect { persistSuggestedJobs() }
         }
 
         // Start inbox polling (check every 60s for new recruiter replies)
@@ -911,10 +968,13 @@ class ChatViewModel @Inject constructor(
                     val r = finalResults!!
 
                     // Collect into the pinned suggested-jobs list (auto-updates
-                    // as companies get applied).
+                    // as companies get applied). Persist immediately — not just
+                    // via the 500ms debounce — so the results survive the app
+                    // being killed from Recents right after a scan.
                     if (r.results.isNotEmpty()) {
                         suggestedJobs = (suggestedJobs + r.results)
                             .distinctBy { it.url.ifBlank { "${it.company}::${it.role}" } }
+                        persistSuggestedJobs()
                     }
 
                     // Show widening steps (honest match report)

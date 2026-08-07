@@ -1566,6 +1566,53 @@ job_boards:
     expand_on_rerun: true
     enabled: true
 
+  # -- Tier 2: more genuine Indian portals (join on "Scan again") --
+  - name: Monster India — Mumbai
+    careers_url: https://www.monsterindia.com/search/full-stack-developer-jobs-in-mumbai
+    location: Mumbai, Maharashtra, India
+    expand_on_rerun: true
+    enabled: true
+  - name: TechGig — Mumbai
+    careers_url: https://www.techgig.com/jobs/full-stack-developer-jobs-in-mumbai
+    location: Mumbai, Maharashtra, India
+    expand_on_rerun: true
+    enabled: true
+  - name: Jora India — Mumbai
+    careers_url: https://in.jora.com/j?q=full+stack+developer&l=Mumbai
+    location: Mumbai, Maharashtra, India
+    expand_on_rerun: true
+    enabled: true
+  - name: Jooble India — Mumbai
+    careers_url: https://in.jooble.org/SearchResult?ukw=full+stack+developer&rgns=Mumbai
+    location: Mumbai, Maharashtra, India
+    expand_on_rerun: true
+    enabled: true
+  - name: Talent.com India — Mumbai
+    careers_url: https://in.talent.com/jobs?k=full+stack+developer&l=Mumbai
+    location: Mumbai, Maharashtra, India
+    expand_on_rerun: true
+    enabled: true
+  - name: Hirect — India
+    careers_url: https://www.hirect.in/jobs?query=full+stack+developer
+    location: India
+    expand_on_rerun: true
+    enabled: true
+
+  # -- Tier 2: free no-key job APIs (no login wall). Remote-only boards are
+  #    auto-skipped for on-site profiles by the profile-relevance gate, and
+  #    included automatically for remote/hybrid profiles — no per-user edits. --
+  - name: Remotive API
+    provider: remotive
+    notes: Remote-first global board via free public API
+    expand_on_rerun: true
+    enabled: true
+  - name: Arbeitnow API
+    provider: arbeitnow
+    notes: Remote-first international board via free public API
+    max_pages: 2
+    expand_on_rerun: true
+    enabled: true
+
   # ── SolidJobs (Polish market) ──────────────────────────────────────
   # Public API — no auth needed. Division in URL path, campaign=career-ops for tracking.
   # Available divisions: it, engineering, marketing, sales, hr, logistics, finances, other

@@ -145,7 +145,13 @@ modal (`Dialog`) listing them with **Apply** (runs `draftApplication`) and
 **Open** (opens the posting in the system browser) buttons. Applying to a
 company removes it from the list, so it only ever shows unapplied
 opportunities. `JobCardBubble` and `ScanResultRow` also gained an **Open**
-button (`OpenJobUrlButton` helper).
+button (`OpenJobUrlButton` helper). The list is **persisted to disk**
+(`UserPrefs.saveSuggestedJobs` → `suggested_jobs.json`) and restored in the
+ViewModel `init`, so the pinned button survives app restarts — including being
+killed from Recents. It is written immediately at scan completion (in
+`handleDirectScan`, so a quick app-kill right after a scan can't lose the
+results) and also auto-persisted via a `snapshotFlow` (500ms debounce) on
+`suggestedJobs`.
 
 ## Scan stop is reliable (2026-08-07)
 

@@ -1803,7 +1803,7 @@ app.post('/email/send', async (req, res) => {
               Authorization: `Bearer ${accessToken}`,
               'Content-Type': 'application/json',
             },
-      body: JSON.stringify(sendBody),
+      body: JSON.stringify({ raw }),
     });
           if (sendResp.ok) {
             const sent = await sendResp.json();
@@ -2484,16 +2484,25 @@ app.post('/scan', async (req, res) => {
     }
     const kw = [...expandedKw];
 
-    // Build domain relevance terms from user's experience narrative
+    // Build domain relevance terms from the user's experience narrative +
+    // superpowers. These drive the profile-relevant source gate below: a
+    // company career page is only scanned when its name/notes/query mention one
+    // of the user's own domain terms (e.g. fintech, logistics, recruitment) —
+    // no hardcoded company lists, so this adapts to any profile.
     const domainTerms = new Set();
-    const storyStopWords = new Set(['and', 'the', 'for', 'with', 'from', 'that', 'this', 'three', 'core', 'production', 'now', 'seeking', 'full', 'time', 'role', 'build', 'scale', 'applications', 'built', 'end', 'across']);
-    const exitStory = (userProfile.narrative?.exit_story || '').toLowerCase();
-    for (const w of exitStory.split(/\W+/).filter(w => w.length >= 4 && !storyStopWords.has(w))) domainTerms.add(w);
+    const storyStopWords = new Set([
+      'and', 'the', 'for', 'with', 'from', 'that', 'this', 'three', 'core', 'production', 'now', 'seeking', 'full', 'time', 'role', 'build', 'scale', 'applications', 'built', 'end', 'across',
+      'platform', 'platforms', 'development', 'developer', 'developers', 'software', 'product', 'products', 'project', 'projects', 'technical', 'architecture', 'engineering', 'engineers', 'work', 'working', 'team', 'teams', 'live', 'zero', 'shipping', 'application', 'service', 'services', 'into', 'their', 'about', 'back', 'based', 'tech', 'jobs', 'job', 'using', 'used', 'high', 'new', 'one', 'two', 'may',
+      'stack', 'clients', 'decisions', 'coordination', 'cost', 'reduction', 'resolved', 'real', 'realtime', 'postgis', 'caching',
+    ]);
+    const storyText = [
+      userProfile.narrative?.exit_story || '',
+      ...(userProfile.narrative?.superpowers || []),
+    ].join(' ');
+    for (const w of storyText.toLowerCase().split(/\W+/).filter(w => w.length >= 4 && !storyStopWords.has(w))) domainTerms.add(w);
     for (const pp of (userProfile.narrative?.proof_points || [])) {
       for (const w of (pp.hero_metric || '').toLowerCase().split(/\W+/).filter(w => w.length >= 4 && !storyStopWords.has(w))) domainTerms.add(w);
     }
-
-    // Build location expansion dynamically from user's profile terms
     const LOCATION_EXPANSIONS = {};
     for (const term of nearbyTerms) {
       if (!LOCATION_EXPANSIONS[term]) LOCATION_EXPANSIONS[term] = [...nearbyTerms];
@@ -3121,6 +3130,103 @@ function isJobDetailUrl(urlStr) {
   return true;
 }
 
+// ── Per-role search spec builder (profile-driven role iteration) ─────
+// The Scan flow iterates EVERY role in the user's onboarding profile
+// (target_roles.primary), each role × profile locations × salary floor,
+// instead of one OR-combined keyword blob. Fully generic: any profile — any
+// number of roles, any city — gets a role-specific portal search. Portals are
+// real, searchable, per-role URL templates for genuine Indian job boards plus
+// a websearch proxy (DuckDuckGo HTML) for Google/Jobs listing discovery.
+const ROLE_SEARCH_PORTALS = [
+  // Tier 1 — every scan (highest-yield Indian boards).
+  { id: 'Naukri',       tier: 1, url: (slug, q, loc) => `https://www.naukri.com/${slug}-jobs-in-${loc}` },
+  { id: 'Indeed',       tier: 1, url: (slug, q, loc) => `https://in.indeed.com/jobs?q=${q}&l=${loc}` },
+  { id: 'Shine',        tier: 1, url: (slug, q, loc) => `https://www.shine.com/job-search/${slug}-jobs-in-${loc}` },
+  { id: 'Foundit',      tier: 1, url: (slug, q, loc) => `https://www.foundit.in/jobs/${slug}-in-${loc}` },
+  { id: 'TimesJobs',    tier: 1, url: (slug, q, loc) => `https://www.timesjobs.com/it-jobs/${slug}-jobs-in-${loc}` },
+  { id: 'Hirist',       tier: 1, url: (slug, q, loc) => `https://www.hirist.tech/job-search/${slug}-jobs-${loc}` },
+  { id: 'Internshala',  tier: 1, url: (slug, q, loc) => `https://internshala.com/jobs/${slug}-jobs-in-${loc}` },
+  { id: 'LinkedIn',     tier: 1, url: (slug, q, loc) => `https://www.linkedin.com/jobs/search?keywords=${q}&location=${loc}` },
+  // Tier 2 — more genuine Indian portals + free websearch (Google-jobs proxy
+  // via DuckDuckGo HTML) that join on "Scan again" (round >= 2).
+  { id: 'iimjobs',         tier: 2, url: (slug, q, loc) => `https://www.iimjobs.com/search/${slug}-jobs-in-${loc}` },
+  { id: 'Monster India',   tier: 2, url: (slug, q, loc) => `https://www.monsterindia.com/search/${slug}-jobs-in-${loc}` },
+  { id: 'TechGig',         tier: 2, url: (slug, q, loc) => `https://www.techgig.com/jobs/${slug}-jobs-in-${loc}` },
+  { id: 'Jora India',      tier: 2, url: (slug, q, loc) => `https://in.jora.com/j?q=${q}&l=${loc}` },
+  { id: 'Jooble India',    tier: 2, url: (slug, q, loc) => `https://in.jooble.org/SearchResult?ukw=${q}&rgns=${loc}` },
+  { id: 'Talent.com India', tier: 2, url: (slug, q, loc) => `https://in.talent.com/jobs?k=${q}&l=${loc}` },
+  { id: 'Hirect',          tier: 2, url: (slug, q, loc) => `https://www.hirect.in/jobs?query=${q}` },
+  { id: 'Websearch (Google/DDG)', tier: 2, url: (slug, q, loc) => `https://html.duckduckgo.com/html/?q=${q}+jobs+in+${loc}` },
+];
+
+const ROLE_TOKEN_STOP = new Set(['full', 'stack', 'the', 'and', 'for', 'with', 'from', 'role', 'roles', 'job', 'jobs', 'senior', 'junior', 'mid', 'level', 'sr']);
+const ROLE_LOC_SLUG_STOP = new Set(['onsite', 'site', 'on', 'in', 'at', 'area', 'near', 'around', 'hybrid', 'remote', 'work', 'or', 'and', 'the', 'from', 'office', 'for', 'within']);
+
+function roleSlug(name) {
+  return String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+function roleSearchQuery(name) {
+  return String(name).toLowerCase().trim().split(/\s+/).map(encodeURIComponent).join('+');
+}
+
+// Per-role keyword set: the exact role + common spelling variants + role
+// tokens, so a role-scoped search page ("Full Stack Developer") also catches
+// "Fullstack Developer" / "Full-Stack Developer" listings.
+function roleKwFor(role) {
+  const r = String(role).toLowerCase().trim();
+  const kw = new Set([r]);
+  const joined = r.replace(/[^a-z0-9]/g, '');
+  if (joined && joined !== r.replace(/\s+/g, '')) kw.add(joined);
+  for (const tok of r.split(/\s+/)) {
+    if (tok.length >= 4 && !ROLE_TOKEN_STOP.has(tok)) kw.add(tok);
+  }
+  const variants = { 'full stack': ['fullstack', 'full-stack'], 'front end': ['frontend', 'front-end'], 'back end': ['backend', 'back-end'] };
+  for (const [key, alts] of Object.entries(variants)) {
+    if (r.includes(key)) for (const a of alts) kw.add(a);
+  }
+  return [...kw].filter(Boolean);
+}
+
+// Build the per-role search plan from the user's own profile: one spec per
+// onboarding role, each with a role-specific keyword set and search-URL list
+// (portal templates × the profile's target location — the flexibility-named
+// commuting metro first, the profile city as fallback).
+function buildRoleSearchSpecs(userProfile, opts = {}) {
+  const expand = !!opts.expandPortals;
+  const profile = userProfile || {};
+  const roles = (profile.target_roles?.primary || []).map(r => String(r).trim()).filter(Boolean);
+  if (!roles.length) return [];
+  const country = String(profile.location?.country || '').toLowerCase().trim();
+  const city = String(profile.location?.city || '').toLowerCase().trim();
+  const flex = String((profile.candidate?.location_flexibility) || (profile.compensation?.location_flexibility) || '').toLowerCase();
+  const locSlugs = [];
+  const addLoc = (c) => {
+    const t = c.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').trim().toLowerCase();
+    // Compare against stop words with punctuation stripped, so "On-site" →
+    // "onsite" is filtered like "onsite" would be.
+    const norm = t.replace(/[^a-z]/g, '');
+    const countryNorm = country.replace(/[^a-z]/g, '');
+    if (t.length >= 3 && norm !== countryNorm && !ROLE_LOC_SLUG_STOP.has(norm) && !locSlugs.includes(t)) locSlugs.push(t);
+  };
+  // Commuting areas named in location_flexibility first (usually the real
+  // metro, e.g. "Mumbai"), then the profile city as fallback.
+  for (const tok of flex.split(/[\s,;&/]+/)) addLoc(tok);
+  addLoc(city);
+  const useLoc = locSlugs[0] || country || 'india';
+  // Human-readable label for result cards (the URL still uses the lowercase
+  // slug, e.g. 'mumbai' → card shows 'Mumbai').
+  const locLabel = useLoc.replace(/\b[a-z]/g, (c) => c.toUpperCase());
+  const portals = ROLE_SEARCH_PORTALS.filter(p => (expand ? true : p.tier === 1));
+  return roles.map((role, i) => {
+    const slug = roleSlug(role);
+    const q = roleSearchQuery(role);
+    const kw = roleKwFor(role);
+    const urls = portals.map(p => ({ portal: p.id, url: p.url(slug, q, useLoc), location: locLabel }));
+    return { label: role, kw, urls, index: i, total: roles.length };
+  });
+}
+
 // GET /scan/stream — SSE progress stream for portal scanning
 app.get('/scan/stream', async (req, res) => {
   res.writeHead(200, {
@@ -3163,14 +3269,38 @@ app.get('/scan/stream', async (req, res) => {
     const userLocFull = ((userProfile.candidate?.location) || '').toLowerCase().trim();
     const userLocFlex = ((userProfile.candidate?.location_flexibility) || '').toLowerCase().trim();
 
+    // Salary floor from profile (compensation.minimum, e.g. "3 LPA"). Applied
+    // at match time in every phase so title/salary/location gate together —
+    // a listing that clearly pays below the minimum is dropped immediately.
+    const salaryFloor = (() => {
+      const m = String(userProfile.compensation?.minimum || '').match(/([\d.]+)/);
+      return m ? parseFloat(m[1]) : null;
+    })();
+    const belowSalaryFloor = (salaryStr) => {
+      if (salaryFloor == null) return false;
+      const lpa = parseSalaryLpa(salaryStr);
+      return lpa != null && lpa < salaryFloor;
+    };
+
     // Dynamically extract nearby location terms from flexibility + full location
     const nearbyTerms = buildNearbyTerms(userProfile);
 
-    // Build domain relevance terms from user's experience narrative
+    // Build domain relevance terms from the user's experience narrative +
+    // superpowers. These drive the profile-relevant source gate below: a
+    // company career page is only scanned when its name/notes/query mention one
+    // of the user's own domain terms (e.g. fintech, logistics, recruitment) —
+    // no hardcoded company lists, so this adapts to any profile.
     const domainTerms = new Set();
-    const storyStopWords = new Set(['and', 'the', 'for', 'with', 'from', 'that', 'this', 'three', 'core', 'production', 'now', 'seeking', 'full', 'time', 'role', 'build', 'scale', 'applications', 'built', 'end', 'across']);
-    const exitStory = (userProfile.narrative?.exit_story || '').toLowerCase();
-    for (const w of exitStory.split(/\W+/).filter(w => w.length >= 4 && !storyStopWords.has(w))) domainTerms.add(w);
+    const storyStopWords = new Set([
+      'and', 'the', 'for', 'with', 'from', 'that', 'this', 'three', 'core', 'production', 'now', 'seeking', 'full', 'time', 'role', 'build', 'scale', 'applications', 'built', 'end', 'across',
+      'platform', 'platforms', 'development', 'developer', 'developers', 'software', 'product', 'products', 'project', 'projects', 'technical', 'architecture', 'engineering', 'engineers', 'work', 'working', 'team', 'teams', 'live', 'zero', 'shipping', 'application', 'service', 'services', 'into', 'their', 'about', 'back', 'based', 'tech', 'jobs', 'job', 'using', 'used', 'high', 'new', 'one', 'two', 'may',
+      'stack', 'clients', 'decisions', 'coordination', 'cost', 'reduction', 'resolved', 'real', 'realtime', 'postgis', 'caching',
+    ]);
+    const storyText = [
+      userProfile.narrative?.exit_story || '',
+      ...(userProfile.narrative?.superpowers || []),
+    ].join(' ');
+    for (const w of storyText.toLowerCase().split(/\W+/).filter(w => w.length >= 4 && !storyStopWords.has(w))) domainTerms.add(w);
     for (const pp of (userProfile.narrative?.proof_points || [])) {
       for (const w of (pp.hero_metric || '').toLowerCase().split(/\W+/).filter(w => w.length >= 4 && !storyStopWords.has(w))) domainTerms.add(w);
     }
@@ -3232,8 +3362,41 @@ app.get('/scan/stream', async (req, res) => {
     const providerTargets = [];
     const webSearchTargets = [];
 
+    // Profile-driven source relevance (no hardcoded lists — adapts to any user).
+    // A configured source is scanned only when it is a genuine job board (a
+    // region-scoped portal `location`, an explicit board/provider integration,
+    // or a search-query board) OR a company career page whose own descriptor
+    // (name + notes) matches THIS user's profile: a target-role term, a
+    // narrative domain term (fintech/logistics/...), and not remote-only when
+    // the profile is on-site. Irrelevant sources (e.g. non-Indian international
+    // career pages, food-delivery/gig/edtech pages) are skipped before they
+    // become scan targets, so time isn't wasted on them.
+    let excludedSources = 0;
+    const ROLE_TOKEN_STOP = new Set(['full', 'stack', 'engineer', 'engineers', 'engineering', 'the', 'and', 'for', 'job', 'jobs', 'role', 'roles', 'with', 'from']);
+    const remoteWanted = /\b(remote|hybrid|wfh|work\s*from\s*home|flexible)\b/.test(userLocFlex);
+    const isRelevantSource = (entry, section) => {
+      if (!entry) return false;
+      // Genuine job boards / regional portals are universal aggregators —
+      // relevant to any profile unless they are remote-only for an on-site user.
+      if (entry.location || entry.provider || section === 'boards') {
+        const q = [entry.name, entry.notes, entry.query, entry.scan_query].join(' ').toLowerCase();
+        if (/\bremote\b/.test(q) && !remoteWanted) return false;
+        return true;
+      }
+      // Company career page: require a specific role or domain match from the
+      // company's own descriptor (name + notes), and no remote-only mismatch.
+      const text = [entry.name, entry.notes].join(' ').toLowerCase();
+      if (/\bremote\b/.test(text) && !remoteWanted) return false;
+      const roleHits = kw.filter(k => !ROLE_TOKEN_STOP.has(k) && k.length >= 3 && text.includes(k));
+      if (roleHits.length >= 1) return true;
+      const domainHits = [...domainTerms].filter(d => d.length >= 4 && text.includes(d));
+      if (domainHits.length >= 1) return true;
+      return false;
+    };
+
     for (const entry of companies) {
       if (entry.enabled === false) continue;
+      if (!isRelevantSource(entry, 'companies')) continue;
       if (blacklist.has((entry.name || '').toLowerCase())) continue;
       const resolved = resolveProvider(entry, providers);
       if (resolved && !resolved.error) providerTargets.push({ entry, provider: resolved.provider });
@@ -3241,11 +3404,13 @@ app.get('/scan/stream', async (req, res) => {
     }
     for (const entry of boards) {
       if (entry.enabled === false) continue;
+      if (!isRelevantSource(entry, 'boards')) continue;
       const resolved = resolveProvider(entry, providers);
       if (resolved && !resolved.error) providerTargets.push({ entry, provider: resolved.provider, isBoard: true });
     }
     for (const entry of jobBoards) {
       if (entry.enabled === false) continue;
+      if (!isRelevantSource(entry, 'job_boards')) continue;
       // Second-tier boards (expand_on_rerun) only join on a re-scan so the
       // first pass stays fast and each "Scan again" widens coverage.
       if (entry.expand_on_rerun && !expandPortals) continue;
@@ -3254,7 +3419,7 @@ app.get('/scan/stream', async (req, res) => {
       else if (entry.careers_url) webSearchTargets.push(entry);
     }
 
-    const totalPortalCount = providerTargets.length + webSearchTargets.length;
+    let totalPortalCount = providerTargets.length + webSearchTargets.length;
     const phaseLabel = (label, count) => `${label} — ${count} source${count === 1 ? '' : 's'}`;
     let completed = 0;
 
@@ -3274,11 +3439,15 @@ app.get('/scan/stream', async (req, res) => {
           const title = (job.title || '').toLowerCase();
           const loc = (job.location || '').toLowerCase();
           const matchesKw = kw.length === 0 || kw.some(k => title.includes(k));
-          if (matchesKw) {
+          // Salary floor applied at match time (titles/salary/location all gate
+          // together) — a listing that clearly pays below the user's minimum is
+          // not even counted as a keyword match.
+          const belowFloor = salaryFloor != null && parseSalaryLpa(job.salary || title) != null && parseSalaryLpa(job.salary || title) < salaryFloor;
+          if (matchesKw && !belowFloor) {
             kwCount++;
             const SENIOR_TITLE_RE = /\b(senior|staff|principal|head of|vice president|vp[\s.]|director|sr\.?\s)/i;
             if (SENIOR_TITLE_RE.test(title)) continue;
-            const entry = { company: job.company || t.entry.name || '', role: job.title || '', location: job.location || '', url: job.url || '', matched: true, source: t.provider.id, notes: t.entry.notes || '' };
+            const entry = { company: job.company || t.entry.name || '', role: job.title || '', salary: job.salary || '', location: job.location || '', url: job.url || '', matched: true, source: t.provider.id, notes: t.entry.notes || '' };
             keywordMatched.push(entry);
             const matchesLoc = locs.length === 0 || locs.some(l => loc.includes(l));
             if (matchesLoc) {
@@ -3374,6 +3543,7 @@ app.get('/scan/stream', async (req, res) => {
           const title = link.title.toLowerCase();
           if (!joby.test(title)) continue;
           if (!isJobDetailUrl(link.url)) continue;
+          if (belowSalaryFloor(link.title)) continue;
           totalBeforeFilter++;
           if (kw.length === 0 || kw.some(k => title.includes(k))) {
             kwCount++;
@@ -3401,6 +3571,92 @@ app.get('/scan/stream', async (req, res) => {
       send('progress', { completed, total: phaseTotal, current: entry.name || 'web', found: results.length, keywordMatches: kwCount, exactMatches: exactCount, statusNote, phase: 'websearch', phaseLabel: phaseLabel('Phase 2/3 · job portals & boards', phaseTotal) });
     }
 
+    // ── Phase 2.5: role-based portal search (profile-driven role iteration) ──
+    // Iterates EVERY role in the user's onboarding profile, each role searched
+    // individually on the genuine Indian portals (per-role URL templates) with
+    // the profile's location + salary floor applied per role. Portals that the
+    // plain HTTP fetch can't render (blocked / empty / JS-only) are queued for
+    // the Phase 3 Playwright retry, which uses the same browser instance.
+    const rolePlaywrightFailed = [];
+    const roleSpecs = buildRoleSearchSpecs(userProfile, { expandPortals });
+    if (roleSpecs.length > 0) {
+      const roleUrls = roleSpecs.flatMap(s => s.urls.map(u => ({ spec: s, ...u })));
+      phaseTotal = roleUrls.length;
+      completed = 0;
+      totalPortalCount += roleUrls.length;
+      send('start', { totalPortals: phaseTotal, phase: 'roles', phaseLabel: phaseLabel('Role search · all onboarding roles', phaseTotal) });
+      for (const ru of roleUrls) {
+        const { spec, portal, url, location } = ru;
+        const current = `Role ${spec.index + 1}/${spec.total} · ${spec.label} — ${portal}`;
+        let kwCount = 0;
+        let exactCount = 0;
+        let statusNote = 'Searching...';
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), PORTAL_FETCH_TIMEOUT_MS);
+        try {
+          send('progress', { completed, total: phaseTotal, current, found: results.length, keywordMatches: 0, exactMatches: 0, statusNote, phase: 'roles', phaseLabel: phaseLabel('Role search · all onboarding roles', phaseTotal) });
+          const resp = await Promise.race([
+            fetch(url, {
+              signal: controller.signal,
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml',
+                'Accept-Language': 'en-IN,en;q=0.9',
+              },
+              redirect: 'follow',
+            }),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('portal fetch timed out')), PORTAL_FETCH_TIMEOUT_MS + 2000)),
+          ]);
+          const ok = resp && resp.ok;
+          const html = ok ? await resp.text() : '';
+          const usable = ok && html && html.length >= 100;
+          const links = usable ? extractHtmlJobLinks(html, url) : [];
+          if (usable && links.length > 0) {
+            for (const link of links) {
+              const title = link.title.toLowerCase();
+              if (!joby.test(title)) continue;
+              if (!isJobDetailUrl(link.url)) continue;
+              if (belowSalaryFloor(link.title)) continue;
+              totalBeforeFilter++;
+              // Role-specific matching first, then the profile's global keyword
+              // set — the URL is already role-scoped, so the global set only
+              // widens recall for near-role titles on that role's results page.
+              const matchesRole = spec.kw.length === 0 || spec.kw.some(k => title.includes(k)) || kw.some(k => title.includes(k));
+              if (matchesRole) {
+                kwCount++;
+                if (!keywordMatched.some(r => r.url === link.url)) {
+                  const matchesLoc = locs.length === 0 || locs.some(l => location.toLowerCase().includes(l));
+                  const entry2 = { company: portal, role: link.title, location, url: link.url, matched: true, source: 'role-search', notes: `role: ${spec.label}` };
+                  keywordMatched.push(entry2);
+                  if (matchesLoc && !results.some(r => r.url === link.url)) {
+                    exactCount++;
+                    results.push(entry2);
+                  }
+                }
+              }
+            }
+          }
+          if (!usable || links.length === 0) {
+            // Blocked / empty / JS-only → Phase 3 Playwright retry with the
+            // role-specific keyword set attached so matching stays per-role.
+            rolePlaywrightFailed.push({ entry: { name: portal, careers_url: url, location, notes: `role: ${spec.label}`, _roleKw: spec.kw } });
+            statusNote = usable ? 'no listings rendered — Playwright retry queued' : 'blocked/empty page — Playwright retry queued';
+          } else {
+            statusNote = kwCount > 0 ? `${kwCount} relevant title${kwCount !== 1 ? 's' : ''}` : `${links.length} listing(s) scanned, none matched`;
+          }
+          streamPortalResults.push({ company: current, status: usable && links.length > 0 ? (kwCount > 0 ? 'scanned' : 'no_matches') : 'queued_for_playwright', keywordMatches: kwCount, exactMatches: exactCount });
+        } catch (e) {
+          rolePlaywrightFailed.push({ entry: { name: portal, careers_url: url, location, notes: `role: ${spec.label}`, _roleKw: spec.kw } });
+          streamPortalResults.push({ company: current, status: 'queued_for_playwright', keywordMatches: 0, exactMatches: 0 });
+          statusNote = `failed (${(e.message || 'error').slice(0, 60)}) — Playwright retry queued`;
+        } finally {
+          clearTimeout(timeout);
+        }
+        completed++;
+        send('progress', { completed, total: phaseTotal, current, found: results.length, keywordMatches: kwCount, exactMatches: exactCount, statusNote, phase: 'roles', phaseLabel: phaseLabel('Role search · all onboarding roles', phaseTotal) });
+      }
+    }
+
     // Phase 3: Playwright deep scraping for portals that returned no results
     // Includes both web search failures AND provider targets that returned zero matches
     const providerZeroMatch = providerTargets
@@ -3417,8 +3673,16 @@ app.get('/scan/stream', async (req, res) => {
       ...providerZeroMatch.map(t => t.entry)
     ];
 
-    if (playwrightFailed.length > 0) {
-      phaseTotal = playwrightFailed.length;
+    // Per-role search URLs the plain fetch couldn't render join the same
+    // Playwright retry phase (browser reuse). Each carries its own _roleKw so
+    // title matching stays per-role even here.
+    const pwTargets = [
+      ...rolePlaywrightFailed,
+      ...playwrightFailed.map(e => ({ entry: e })),
+    ];
+
+    if (pwTargets.length > 0) {
+      phaseTotal = pwTargets.length;
       completed = 0;
       send('start', { totalPortals: phaseTotal, phase: 'playwright', phaseLabel: phaseLabel('Phase 3/3 · browser retry', phaseTotal) });
       
@@ -3439,7 +3703,8 @@ app.get('/scan/stream', async (req, res) => {
       // If Playwright isn't available locally, try remote proxy
       const remotePwUrl = process.env.REMOTE_PLAYWRIGHT_URL;
       if (!playwrightAvailable && remotePwUrl) {
-        for (const entry of playwrightFailed.slice(0, expandPortals ? playwrightFailed.length : 30)) {
+        for (const item of pwTargets.slice(0, expandPortals ? pwTargets.length : 30)) {
+          const entry = item.entry;
           const beforeKw = keywordMatched.length;
           const beforeExact = results.length;
           try {
@@ -3456,7 +3721,9 @@ app.get('/scan/stream', async (req, res) => {
                   const title = (link.title || '').toLowerCase();
                   const href = link.url;
                   if (!href || !isJobDetailUrl(href) || keywordMatched.some(r => r.url === href)) continue;
-                  const matchesKeyword = kw.length === 0 || kw.some(k => title.includes(k));
+                  if (belowSalaryFloor(link.title || '')) continue;
+                  const effKw = entry._roleKw || kw;
+                  const matchesKeyword = effKw.length === 0 || effKw.some(k => title.includes(k));
                   if (!matchesKeyword) continue;
                   const entry2 = { company: entry.name || '', role: link.title, location: entry.location || '', url: href, matched: true, source: 'remote-playwright', notes: entry.notes || '' };
                   keywordMatched.push(entry2);
@@ -3477,7 +3744,7 @@ app.get('/scan/stream', async (req, res) => {
           send('progress', { completed, total: phaseTotal, current: `${entry.name} (remote)`, found: results.length, keywordMatches: kwCount, exactMatches: exactCount, phase: 'playwright', phaseLabel: phaseLabel('Phase 3/3 · browser retry', phaseTotal) });
         }
       } else if (!playwrightAvailable) {
-        send('progress', { completed: playwrightFailed.length, total: playwrightFailed.length, current: 'Playwright not available', found: results.length, error: 'playwright not installed, set REMOTE_PLAYWRIGHT_URL in .bridge.env to use a remote server', phase: 'playwright', phaseLabel: phaseLabel('Phase 3/3 · browser retry', playwrightFailed.length) });
+        send('progress', { completed: pwTargets.length, total: pwTargets.length, current: 'Playwright not available', found: results.length, error: 'playwright not installed, set REMOTE_PLAYWRIGHT_URL in .bridge.env to use a remote server', phase: 'playwright', phaseLabel: phaseLabel('Phase 3/3 · browser retry', pwTargets.length) });
       }
       
       if (chromium) {
@@ -3486,11 +3753,12 @@ app.get('/scan/stream', async (req, res) => {
           browser = await withTimeout(chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-gpu-compositing'] }), 30000, 'chromium launch');
         } catch (e) {
           browser = null;
-          send('progress', { completed: playwrightFailed.length, total: playwrightFailed.length, current: 'Browser launch failed', found: results.length, error: (e.message || 'launch timed out').slice(0, 100), phase: 'playwright', phaseLabel: phaseLabel('Phase 3/3 · browser retry', playwrightFailed.length) });
+          send('progress', { completed: pwTargets.length, total: pwTargets.length, current: 'Browser launch failed', found: results.length, error: (e.message || 'launch timed out').slice(0, 100), phase: 'playwright', phaseLabel: phaseLabel('Phase 3/3 · browser retry', pwTargets.length) });
         }
         
         if (browser) {
-          for (const entry of playwrightFailed.slice(0, expandPortals ? playwrightFailed.length : 30)) {
+          for (const item of pwTargets.slice(0, expandPortals ? pwTargets.length : 30)) {
+            const entry = item.entry;
             const beforeKw = keywordMatched.length;
             const beforeExact = results.length;
             try {
@@ -3499,6 +3767,14 @@ app.get('/scan/stream', async (req, res) => {
               await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-IN,en;q=0.9' });
               await page.goto(entry.careers_url, { waitUntil: 'domcontentloaded', timeout: 15000 });
               await page.waitForTimeout(3500); // wait for SPA content
+
+              // Scroll through the page a few times so infinite-scroll job
+              // boards (Naukri, Foundit, apna, Shine) load the rest of the
+              // listing instead of returning only the first render.
+              for (let s = 0; s < 3; s++) {
+                await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
+                await page.waitForTimeout(1000);
+              }
 
               // Extract job listings from links + headings. Indian portals
               // (Naukri, Indeed, Shine, Foundit, TimesJobs, ...) render job
@@ -3533,8 +3809,10 @@ app.get('/scan/stream', async (req, res) => {
                 const title = job.title.toLowerCase();
                 if (!joby.test(title)) continue;
                 if (job.url && !isJobDetailUrl(job.url)) continue;
+                if (belowSalaryFloor(job.title)) continue;
                 totalBeforeFilter++;
-                if (kw.length === 0 || kw.some(k => title.includes(k))) {
+                const effKw = entry._roleKw || kw;
+                if (effKw.length === 0 || effKw.some(k => title.includes(k))) {
                   const href = job.url;
                   if (href && !keywordMatched.some(r => r.url === href)) {
                     const companyLoc = (entry.location || '').toLowerCase();
@@ -3549,7 +3827,7 @@ app.get('/scan/stream', async (req, res) => {
               }
               
               await page.close();
-              })(), 25000, `${entry.name || 'portal'} scrape`);
+              })(), 32000, `${entry.name || 'portal'} scrape`);
             } catch (e) {
               // Portal failed — continue
             }
@@ -3644,15 +3922,13 @@ app.get('/scan/stream', async (req, res) => {
     // user's minimum (profile.compensation.minimum). Only a *parseable*
     // figure below the floor is rejected; unknown or negotiable salaries are
     // kept (no data → cannot judge, and scoreScanResult still scores them).
-    const salaryFloor = (() => {
-      const m = String(userProfile.compensation?.minimum || '').match(/([\d.]+)/);
-      return m ? parseFloat(m[1]) : null;
-    })();
+    // Phase 1 already applies the floor at match time; this second pass covers
+    // titles scraped from portal HTML/Playwright that embed a salary figure
+    // (e.g. "Software Developer - 2-4 LPA").
     const excludedSalary = [];
     const afterSalaryGate = [];
     for (const r of usableResults) {
-      const lpa = parseSalaryLpa(r.salary);
-      if (salaryFloor != null && lpa != null && lpa < salaryFloor) { excludedSalary.push(r); continue; }
+      if (belowSalaryFloor(r.salary || r.role)) { excludedSalary.push(r); continue; }
       afterSalaryGate.push(r);
     }
 
@@ -3713,6 +3989,9 @@ app.get('/scan/stream', async (req, res) => {
     if (excludedSalary.length > 0) {
       streamWideningSteps.push(`Skipped ${excludedSalary.length} role(s) paying below your ${salaryFloor} LPA minimum.`);
     }
+    if (excludedSources > 0) {
+      streamWideningSteps.push(`Skipped ${excludedSources} source(s) that don't match your profile (roles, domains, or remote preference).`);
+    }
     if (!expandPortals) {
       streamWideningSteps.push(`Scan again to expand across more Indian job portals (Naukri, Indeed, Shine, Foundit, TimesJobs, Hirist, Cutshort, Instahyre, Internshala and more).`);
     }
@@ -3735,6 +4014,7 @@ app.get('/scan/stream', async (req, res) => {
         duplicatesSkipped,
         excludedApplied: excludedApplied.length,
         excludedSalary: excludedSalary.length,
+        excludedSources,
         netNew,
         locationTier,
         expanded: expandPortals,
@@ -4379,7 +4659,7 @@ app.post('/email/reply/send', async (req, res) => {
         Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ raw }),
+      body: JSON.stringify(sendBody),
     });
 
     if (!sendResp.ok) {
