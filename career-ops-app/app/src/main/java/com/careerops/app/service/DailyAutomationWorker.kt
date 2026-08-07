@@ -75,57 +75,24 @@ class DailyAutomationWorker @AssistedInject constructor(
                 Log.i(TAG, "Scan complete: ${scanResult.total} checked, 0 new matches")
             }
 
-            Log.i(TAG, "Step 2: Checking inbox via IMAP...")
+            Log.i(TAG, "Step 2: Scanning inbox for recruiter replies...")
             try {
-                val inbox = api.getInbox(
-                    email = userPrefs.userEmail,
-                    daysBack = 7,
-                    maxEmails = 100
-                )
-                val recruiterReplies = inbox.emails.filter { email ->
-                    val from = (email.from ?: "").lowercase()
-                    val isDigest = listOf(
-                        "quora.com", "indeed.com", "hirist", "linkedin.com", "naukri",
-                        "monster.com", "glassdoor", "buzzfeed", "medium.com", "substack",
-                        "newsletter", "digest", "no-reply", "noreply", "updates@", "donotreply",
-                        "pinterest", "instahyre", "foundit", "github", "havells",
-                        "stackoverflow", "render.com", "edureka"
-                    ).any { from.contains(it) }
-                    !isDigest && !email.isSpam && (
-                        email.subject.contains(Regex("(?i)(interview|phone screen|next round|screening)")) ||
-                        email.subject.contains(Regex("(?i)(offer letter|selected for|joining date|start date)")) ||
-                        email.subject.contains(Regex("(^|\\s)re\\s*:\\s*", RegexOption.IGNORE_CASE)) &&
-                            email.body.contains(Regex("(?i)(your application|your resume|your cv|recruiter|hiring manager)"))
-                    )
+                // Cursor-based scan: first run backfills 90 days, then scans
+                // incrementally each day — no older opportunity is ever missed.
+                val scan = api.scanInbox(emptyMap())
+                val confirmed = scan.notifications.filter {
+                    it.type == "recruiter_reply" || it.type == "interview" || it.type == "offer"
                 }
-
-                if (recruiterReplies.isNotEmpty()) {
-                    Log.i(TAG, "Found ${recruiterReplies.size} candidate replies — confirming via classifier...")
-                    var notified = 0
-                    for (reply in recruiterReplies) {
-                        try {
-                            val classification = api.classifyEmail(ClassifyRequest(
-                                from = reply.from,
-                                subject = reply.subject,
-                                preview = reply.body.take(500)
-                            ))
-                            if (classification.classification == "job_reply" && classification.confidence >= 0.6) {
-                                notified++
-                                sendDraftNotification(
-                                    "RECRUITER REPLY: ${reply.from}",
-                                    "Subject: ${reply.subject}\n${classification.reason}"
-                                )
-                            } else {
-                                Log.i(TAG, "Rejected as ${classification.classification} (${classification.confidence}): ${reply.subject}")
-                            }
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Classify failed for ${reply.subject}: ${e.message}")
-                        }
+                if (confirmed.isNotEmpty()) {
+                    Log.i(TAG, "Found ${confirmed.size} recruiter/interview notifications (scanned ${scan.scanned})")
+                    for (n in confirmed.take(5)) {
+                        sendDraftNotification(n.title, n.message)
                     }
-                    if (notified == 0) Log.i(TAG, "No confirmed recruiter replies after classification")
+                } else {
+                    Log.i(TAG, "Inbox scan complete: ${scan.scanned} emails checked, 0 confirmed recruiter replies")
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Inbox check failed: ${e.message}")
+                Log.e(TAG, "Inbox scan failed: ${e.message}")
             }
 
             Log.i(TAG, "Step 3: Checking follow-up cadence...")

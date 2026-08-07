@@ -213,6 +213,19 @@ data class ClassifyResponse(
     val reason: String = ""
 )
 
+data class ScanInboxNotification(
+    val type: String = "",
+    val title: String = "",
+    val message: String = ""
+)
+
+data class ScanInboxResponse(
+    val notifications: List<ScanInboxNotification> = emptyList(),
+    val count: Int = 0,
+    val scanned: Int = 0,
+    val backfill: Boolean = false
+)
+
 data class CoverLetterRequest(
     val company: String,
     val role: String,

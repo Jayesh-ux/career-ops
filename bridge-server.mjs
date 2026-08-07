@@ -2097,59 +2097,83 @@ function extractGmailBody(msg) {
   return parts.join('\n\n');
 }
 
-async function fetchGmailInboxREST(email, userId, { daysBack = 30, maxEmails = 50, query } = {}) {
+async function fetchGmailInboxREST(email, userId, { daysBack = 30, maxEmails = 50, query, ids } = {}) {
   const accessToken = await resolveGmailAccessToken(userId, email);
   const headers = { Authorization: `Bearer ${accessToken}` };
-  const q = query || `in:inbox newer_than:${Math.max(daysBack, 1)}d`;
-  const cap = Math.min(Math.max(maxEmails, 1), 250);
 
-  // Gmail lists newest-first and pages via nextPageToken. Collect up to `cap` ids
-  // across pages so windows larger than the old 50-message cap actually work.
-  const ids = [];
-  let pageToken = null;
-  while (ids.length < cap) {
-    const params = new URLSearchParams({ q, maxResults: String(Math.min(500, cap - ids.length)) });
-    if (pageToken) params.set('pageToken', pageToken);
-    const listResp = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?${params.toString()}`, { headers });
-    if (!listResp.ok) {
-      const errText = await listResp.text().catch(() => '');
-      throw new Error(`Gmail API list failed: ${listResp.status} ${errText.slice(0, 200)}`);
+  // Explicit `ids` (pending-retry) skips the list query and fetches exactly
+  // those messages; otherwise page the whole window via nextPageToken.
+  let idsToFetch;
+  if (Array.isArray(ids) && ids.length) {
+    idsToFetch = ids.slice();
+  } else {
+    // Gmail lists newest-first and pages via nextPageToken. Collect across pages
+    // up to a 5000-message cap so wide backfills (~90 days of heavy inbox volume)
+    // don't silently drop older recruiter outreach.
+    const q = query || `in:inbox newer_than:${Math.max(daysBack, 1)}d`;
+    const cap = Math.min(Math.max(maxEmails, 1), 5000);
+    idsToFetch = [];
+    let pageToken = null;
+    while (idsToFetch.length < cap) {
+      const params = new URLSearchParams({ q, maxResults: String(Math.min(500, cap - idsToFetch.length)) });
+      if (pageToken) params.set('pageToken', pageToken);
+      const listResp = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?${params.toString()}`, { headers });
+      if (!listResp.ok) {
+        const errText = await listResp.text().catch(() => '');
+        throw new Error(`Gmail API list failed: ${listResp.status} ${errText.slice(0, 200)}`);
+      }
+      const listData = await listResp.json();
+      idsToFetch.push(...(listData.messages || []).map(m => m.id));
+      pageToken = listData.nextPageToken || null;
+      if (!pageToken || (listData.messages || []).length === 0) break;
     }
-    const listData = await listResp.json();
-    ids.push(...(listData.messages || []).map(m => m.id));
-    pageToken = listData.nextPageToken || null;
-    if (!pageToken || (listData.messages || []).length === 0) break;
   }
 
   const emails = [];
-  // Fetch bodies in bounded chunks to avoid hammering the Gmail API on wide windows.
-  const CONCURRENCY = 20;
-  for (let i = 0; i < ids.length; i += CONCURRENCY) {
-    const chunk = ids.slice(i, i + CONCURRENCY);
+  const failedIds = [];
+  // Fetch bodies in bounded chunks with per-message retry so transient Gmail
+  // rate-limit/timeout errors don't silently drop recruiter mail. Anything still
+  // failing after retries is surfaced in `failedIds` (the scan retries it on the
+  // next run rather than losing it forever).
+  const CONCURRENCY = 10;
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  for (let i = 0; i < idsToFetch.length; i += CONCURRENCY) {
+    const chunk = idsToFetch.slice(i, i + CONCURRENCY);
     await Promise.all(chunk.map(async (id) => {
-      try {
-        const msgResp = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`, { headers });
-        if (!msgResp.ok) return;
-        const msg = await msgResp.json();
-        const headersMap = {};
-        for (const h of (msg.payload?.headers || [])) headersMap[h.name.toLowerCase()] = h.value;
-        const bodyText = extractGmailBody(msg);
-        const parsedDate = new Date(headersMap.date || parseInt(msg.internalDate || 0, 10));
-        emails.push({
-          gmailId: msg.id,
-          from: headersMap.from || '',
-          fromEmail: parseFromEmail(headersMap.from || ''),
-          subject: headersMap.subject || '',
-          date: isNaN(parsedDate.getTime()) ? new Date(0).toISOString() : parsedDate.toISOString(),
-          preview: (msg.snippet || '').substring(0, 200),
-          body: bodyText.substring(0, 5000),
-        });
-      } catch { /* skip individual message failures */ }
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const msgResp = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`, { headers });
+          if (msgResp.ok) {
+            const msg = await msgResp.json();
+            const headersMap = {};
+            for (const h of (msg.payload?.headers || [])) headersMap[h.name.toLowerCase()] = h.value;
+            const bodyText = extractGmailBody(msg);
+            const parsedDate = new Date(headersMap.date || parseInt(msg.internalDate || 0, 10));
+            emails.push({
+              gmailId: msg.id,
+              from: headersMap.from || '',
+              fromEmail: parseFromEmail(headersMap.from || ''),
+              subject: headersMap.subject || '',
+              date: isNaN(parsedDate.getTime()) ? new Date(0).toISOString() : parsedDate.toISOString(),
+              preview: (msg.snippet || '').substring(0, 200),
+              body: bodyText.substring(0, 5000),
+            });
+            return;
+          }
+          // Retry transient 429/5xx; a 4xx (e.g. deleted) is permanent.
+          if (msgResp.status !== 429 && msgResp.status < 500) break;
+          await sleep(600 * attempt);
+        } catch {
+          await sleep(600 * attempt);
+        }
+      }
+      failedIds.push(id);
     }));
   }
 
   emails.sort((a, b) => new Date(b.date) - new Date(a.date));
   emails.forEach((e, i) => { e.id = i + 1; });
+  emails.failedIds = failedIds;
   return emails;
 }
 
@@ -2165,6 +2189,76 @@ function isDigestSenderL(email) {
   return DIGEST_SENDERS.some(d => fromL.includes(d));
 }
 
+// Broad, cheap pre-filter for "is this plausibly recruiter mail?" — the
+// classifier is the real gate, so this MUST err on the side of including mail:
+// a false negative here silently misses an opportunity, which is worse than one
+// extra classify call. Catch role/job/position titles ("SDE I Java role at
+// Swiggy"), hiring language, and recruiter asks ("please share", "interested").
+function isPlausibleRecruiterMail(subj, body) {
+  const s = `${subj || ''}`.toLowerCase();
+  const b = `${body || ''}`.slice(0, 600).toLowerCase();
+  const subjectHits =
+    /interview|phone screen|next round|screen(ing)? call|schedule|meeting|recruiter|hiring|your application|opportunity|offer|selected|shortlist|role|job|position|opening|sde|engineer|developer|resume|ctc|interested|follow.?up|re\s*:/i;
+  const bodyHits =
+    /interview|schedule|availability|your application|your resume|recruiter|hiring|hiring manager|opportunity|position|offer|joining date|start date|interested in this role|please share|reply with|role at|next steps|congratulations|selected|shortlist|would like to meet|resurfacing/i;
+  return subjectHits.test(s) || bodyHits.test(b);
+}
+
+// Compensation gate (belt-and-suspenders). The classifier is the primary gate
+// (it knows the candidate's minimum salary), but it only runs once per email and
+// its verdict is cached — so this cheap synchronous check re-validates even
+// cached classifications. A clear unpaid/free-internship / no-stipend signal
+// means the role is below the user's minimum salary expectation and must never
+// surface as an opportunity. Err on the side of NOT discarding (the classifier
+// still sees these); this only catches unambiguous signals.
+function isBelowCompensationEmail(subj, body, from) {
+  const text = `${from || ''} ${subj || ''} ${(body || '').slice(0, 3000)}`.toLowerCase();
+  const unpaidHits =
+    /\bunpaid\b|\bfree intern(?:ship)?\b|\bno stipend\b|\bwithout (?:any )?stipend\b|\bnot paid\b|\bno salary\b|\bstipend[- ]?free\b|\bnon-?stipend\b/i;
+  if (!unpaidHits.test(text)) return false;
+  // A "not an unpaid internship" / "paid internship" framing isn't a gate hit.
+  if (/\bnot an? unpaid\b|\bnot unpaid\b|\bpaid\s+(internship|intern|trainee|role|position)\b/.test(text)) return false;
+  return true;
+}
+
+// Sender blocklist for the inbox scan: data/blacklist.md is the user's
+// do-not-apply list (same markdown-table format as the career-ops CLI:
+// `| Company | Since | Scope | Reason |`, plus `- Company` bullets). A
+// blacklisted company must never surface as a recruiter/interview/offer
+// notification even if the classifier says job_reply — it is the user's
+// explicit no-go (e.g. a free internship they already discarded).
+function loadSenderBlacklist(req) {
+  const p = req.userCtx?.blacklistPath || join(__dirname, 'data/blacklist.md');
+  const out = new Set();
+  if (!existsSync(p)) return out;
+  for (const line of readFileSync(p, 'utf-8').split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let company = null;
+    const table = trimmed.match(/^\|\s*([^|]+)\s*\|/);
+    const bullet = trimmed.match(/^[-*]\s*(.+)/);
+    if (table) company = table[1];
+    else if (bullet) company = bullet[1];
+    if (!company) continue;
+    const key = company.toLowerCase().replace(/[^a-z0-9]+/g, '');
+    if (key && key !== 'company') out.add(key);
+  }
+  return out;
+}
+
+// True when the email's sender matches a blacklisted company (matched against
+// both the from-name and the sender domain, punctuation-insensitive).
+function isBlacklistedSender(req, email) {
+  const bl = loadSenderBlacklist(req);
+  if (!bl.size) return false;
+  const domain = (email.fromEmail || '').split('@')[1] || '';
+  const fromL = `${email.from || ''} ${domain}`.toLowerCase().replace(/[^a-z0-9]+/g, ' ');
+  for (const key of bl) {
+    if (fromL.includes(key)) return true;
+  }
+  return false;
+}
+
 // Classify an email via the bridge's own /email/classify endpoint
 // (opencode-backed). Returns null when classification is unavailable.
 async function classifyEmailViaBridge(userId, email) {
@@ -2178,7 +2272,8 @@ async function classifyEmailViaBridge(userId, email) {
         from: email.from || '',
         fromEmail: email.fromEmail || '',
         subject: email.subject || '',
-        preview: (email.preview || email.body || '').slice(0, 500),
+        preview: (email.preview || '').slice(0, 500),
+        body: (email.body || '').slice(0, 2000),
       }),
     });
     if (!resp.ok) return null;
@@ -2271,6 +2366,9 @@ app.get('/email/inbox', async (req, res) => {
     const daysBack = parseInt(req.query.daysBack, 10) || 30;
     const maxEmails = parseInt(req.query.maxEmails, 10) || 50;
     const query = (req.query.query || '').trim();
+    // Explicit message ids (comma-separated) — used by /email/scan to retry
+    // messages that previously failed to fetch, independent of the time window.
+    const ids = (req.query.ids || '').split(',').map(s => s.trim()).filter(Boolean);
 
     // OAuth users get Gmail REST (reliable; IMAP crashes on large mailboxes).
     // App-password users keep IMAP. On REST failure, fall back to IMAP.
@@ -2278,7 +2376,7 @@ app.get('/email/inbox', async (req, res) => {
     let method;
     if (hasUserOAuth2 || hasLegacyOAuth2) {
       try {
-        allEmails = await fetchGmailInboxREST(email, req.userCtx.userId, { daysBack, maxEmails, query: query || undefined });
+        allEmails = await fetchGmailInboxREST(email, req.userCtx.userId, { daysBack, maxEmails, query: query || undefined, ids: ids.length ? ids : undefined });
         method = hasUserOAuth2 ? 'per_user_oauth2_rest' : 'legacy_oauth2_rest';
       } catch (restErr) {
         logRestError('email/inbox', email, restErr);
@@ -2306,6 +2404,8 @@ app.get('/email/inbox', async (req, res) => {
       legitimateCount: legitimate.length,
       spamCount: spam.length,
       method,
+      listed: allEmails.length + (allEmails.failedIds?.length || 0),
+      failedIds: allEmails.failedIds || [],
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -4738,19 +4838,40 @@ app.get('/followups', (req, res) => {
   }
 });
 
-// POST /email/classify — classify an email via opencode (replaces direct Anthropic calls)
+// POST /email/classify — classify an email via opencode (replaces direct
+// Anthropic calls). Enforces the candidate's compensation gate: emails offering
+// an unpaid/free internship or pay clearly below the user's minimum salary
+// expectation are spam, never job_reply.
 app.post('/email/classify', async (req, res) => {
   try {
-    const { from, fromEmail, subject, preview } = req.body;
+    const { from, fromEmail, subject, preview, body } = req.body;
     if (!subject) return res.status(400).json({ error: 'subject required' });
+
+    // Compensation expectation from the user's onboarding profile. The spawned
+    // classifier enforces it: an unpaid/free internship or sub-minimum offer is
+    // an opportunity the user explicitly ruled out, so it must not surface.
+    const profile = readUserProfileRaw(req);
+    const comp = profile?.compensation || {};
+    const compParts = [
+      comp.minimum ? `minimum: ${comp.minimum}` : null,
+      comp.target_range ? `target range: ${comp.target_range}` : null,
+      comp.currency ? `currency: ${comp.currency}` : null,
+      comp.location_flexibility ? `location: ${comp.location_flexibility}` : null,
+    ].filter(Boolean).join(', ');
+    const compContext = compParts || 'not specified (assume the candidate requires paid work)';
 
     const prompt = `You are a job-search email classifier. Classify this email as one of: job_reply, job_alert, spam.
 Return ONLY a JSON object (no markdown, no code fences): {"classification": "job_reply|job_alert|spam", "confidence": 0.0-1.0, "reason": "brief explanation"}
 
+Candidate's compensation expectation: ${compContext}
+
+COMPENSATION GATE (mandatory): The candidate seeks PAID, full-time work. Emails offering an UNPAID or FREE internship, a stipend-less/volunteer arrangement, or compensation clearly below the minimum must be classified as "spam" — never "job_reply". Flag it in "reason" as "unpaid"/"below minimum compensation".
+
 Email:
 From: ${from || 'Unknown'} <${fromEmail || 'unknown'}>
 Subject: ${subject}
-Preview: ${(preview || '').slice(0, 500)}`;
+Preview: ${(preview || '').slice(0, 500)}
+Body: ${(body || '').slice(0, 2000)}`;
 
     const result = await runOpencode(prompt, 60000, userCwd(req));
 
@@ -7332,6 +7453,350 @@ app.get('/scheduler/status', (req, res) => {
   });
 });
 
+// ── Per-user inbox scan state (cursor + classification cache) ────
+// The cursor remembers which mail has already been seen so the daily scan can
+// be incremental after a one-time deep backfill — no fixed-window gap ever
+// hides an older opportunity (e.g. recruiter outreach older than N days).
+
+function inboxCursorPath(req) {
+  const dataDir = req.userCtx?.dataDir || join(__dirname, 'data');
+  return join(dataDir, 'inbox-cursor.json');
+}
+
+function loadInboxCursor(req) {
+  try {
+    const p = inboxCursorPath(req);
+    return existsSync(p) ? JSON.parse(readFileSync(p, 'utf-8')) : null;
+  } catch { return null; }
+}
+
+function saveInboxCursor(req, cur) {
+  try {
+    const p = inboxCursorPath(req);
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, JSON.stringify(cur));
+  } catch { /* non-fatal */ }
+}
+
+function emailClassifyCachePath(req) {
+  const dataDir = req.userCtx?.dataDir || join(__dirname, 'data');
+  return join(dataDir, 'email-classify-cache.json');
+}
+
+function loadEmailClassifyCache(req) {
+  try {
+    const p = emailClassifyCachePath(req);
+    return existsSync(p) ? JSON.parse(readFileSync(p, 'utf-8')) : {};
+  } catch { return {}; }
+}
+
+function saveEmailClassifyCache(req, cache) {
+  try {
+    const p = emailClassifyCachePath(req);
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, JSON.stringify(cache));
+  } catch { /* non-fatal */ }
+}
+
+// ── Pending-notifications queue ───────────────────────────────────
+// Notifications are durable: each recruiter/interview/offer notification is
+// queued to pending-notifications.json as it is found, so a lost scan response
+// (client timeout / disconnect during a long backfill) never loses the
+// opportunity. The next /email/scan or /notifications/check replays the queue
+// once and clears it only after the response is actually written to the client.
+function pendingNotificationsPath(req) {
+  const dataDir = req.userCtx?.dataDir || join(__dirname, 'data');
+  return join(dataDir, 'pending-notifications.json');
+}
+
+function loadPendingNotifications(req) {
+  try {
+    const p = pendingNotificationsPath(req);
+    return existsSync(p) ? JSON.parse(readFileSync(p, 'utf-8')) : [];
+  } catch { return []; }
+}
+
+function savePendingNotifications(req, arr) {
+  try {
+    const p = pendingNotificationsPath(req);
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, JSON.stringify(Array.isArray(arr) ? arr.slice(-500) : []));
+  } catch { /* non-fatal */ }
+}
+
+function queueNotification(req, notif) {
+  try {
+    const pending = loadPendingNotifications(req);
+    pending.push(notif);
+    savePendingNotifications(req, pending);
+  } catch { /* persist non-fatal */ }
+}
+
+// Dedup notifications by gmailId (or type|title for non-email notifications)
+// so freshly-scanned and replayed queued notifications don't double up.
+function dedupeNotifications(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const n of arr) {
+    const k = n.gmailId || `${n.type}|${n.title}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(n);
+  }
+  return out;
+}
+
+// Serialize per-user inbox scans so the app poll, daily worker and
+// /notifications/check never race the cursor file.
+const inboxScanLocks = new Map();
+function withInboxScanLock(userId, fn) {
+  const key = userId || 'legacy';
+  const prev = inboxScanLocks.get(key) || Promise.resolve();
+  const next = prev.then(fn, fn);
+  inboxScanLocks.set(key, next.catch(() => {}));
+  return next;
+}
+
+// Scan a user's inbox for recruiter replies / interviews / offers.
+// - First run (no cursor) or forceBackfill: one-time deep backfill (90 days,
+//   up to 1000 msgs) so no historical opportunity is missed.
+// - Later runs: incremental window = last scan + 2-day overlap (guarantees no
+//   gap across clock/`newer_than` granularity), skipping mail already seen and
+//   reusing the classification cache so each email is classified exactly once.
+// - No opportunity is ever lost: messages that fail to fetch or classify are
+//   kept in the cursor's `pendingIds` and re-fetched by id on every scan until
+//   they are processed, independent of the moving time window.
+async function scanInboxForUser(req, { forceBackfill = false } = {}) {
+  const userId = req.userCtx?.userId;
+  return withInboxScanLock(userId, async () => {
+    const notifications = [];
+    const cursor = loadInboxCursor(req) || {};
+    const cache = loadEmailClassifyCache(req) || {};
+    const processed = new Set(Array.isArray(cursor.processedIds) ? cursor.processedIds : []);
+    const pending = new Set(Array.isArray(cursor.pendingIds) ? cursor.pendingIds : []);
+    const headers = userId ? { 'X-User-Id': userId } : {};
+
+    const lastScanMs = cursor.lastScanAt ? new Date(cursor.lastScanAt).getTime() : null;
+    const isBackfill = forceBackfill || !cursor.lastScanAt;
+    const daysSince = lastScanMs ? Math.floor((Date.now() - lastScanMs) / 86400000) : null;
+    const daysBack = isBackfill ? 90 : Math.max(daysSince + 2, 2);
+    const maxEmails = isBackfill ? 5000 : 250;
+
+    // Cache-first classification pipeline shared by pending retries and the
+    // window scan. Returns true when the email is fully handled (safe to drop
+    // from `pending`); false means a transient failure (classify unavailable),
+    // so it stays pending and is retried next scan.
+    const handleEmail = async (email) => {
+      if (email.gmailId && processed.has(email.gmailId)) return true;
+      const subj = (email.subject || '').toLowerCase();
+      const body = (email.body || email.preview || '').toLowerCase();
+      if (isDigestSenderL(email)) return true;
+      // Compensation gate: unpaid/free internships or no-stipend offers are
+      // below the user's minimum salary expectation — never surface them, even
+      // when the classify cache already tagged them job_reply.
+      if (isBelowCompensationEmail(subj, body, email.fromEmail || email.from)) return true;
+      // User's explicit do-not-apply list: blacklisted senders never notify.
+      if (isBlacklistedSender(req, email)) return true;
+
+      let cls = null;
+      if (email.gmailId && cache[email.gmailId]) {
+        cls = cache[email.gmailId];
+      } else {
+        cls = await classifyEmailViaBridge(userId, email);
+        if (cls && email.gmailId) cache[email.gmailId] = { ...cls, scannedAt: new Date().toISOString() };
+      }
+      if (!cls) return false; // classify unavailable — retry on next scan
+      if (email.gmailId) processed.add(email.gmailId);
+
+      const classification = cls?.classification;
+      const confidence = typeof cls?.confidence === 'number' ? cls.confidence : 0;
+      if (classification !== 'job_reply' || confidence < 0.7) return true;
+
+      if (/interview|schedule|meeting|next round/i.test(subj) || /interview|schedule|availability|we would like to meet/i.test(body)) {
+        const dt = extractInterviewDateTime(email.subject, email.body || email.preview);
+        const when = dt ? `\n**When:** ${dt.human}` : '';
+        const notif = {
+          type: 'interview',
+          title: 'Interview Scheduled',
+          message: `${email.from}: ${email.subject}${when}`,
+          gmailId: email.gmailId,
+          email,
+          scheduledAt: dt ? dt.iso : null,
+          scheduledHuman: dt ? dt.human : null,
+        };
+        notifications.push(notif);
+        queueNotification(req, notif);
+
+        // Persist to interviews.json for reminders
+        try {
+          const interviews = loadInterviews(req);
+          const key = `${email.fromEmail || email.from || ''}|${(email.subject || '').slice(0, 60)}`;
+          let rec = interviews.find(i => i.key === key);
+          if (!rec) {
+            rec = {
+              key,
+              id: email.gmailId || String(Date.now()),
+              from: email.from || '',
+              subject: email.subject || '',
+              detectedAt: new Date().toISOString(),
+              reminderSentAt: null,
+              status: 'scheduled',
+            };
+            interviews.push(rec);
+          }
+          if (dt) {
+            rec.scheduledAt = dt.iso;
+            rec.scheduledHuman = dt.human;
+            rec.date = dt.date;
+            rec.time = dt.time;
+            rec.confidence = dt.confidence;
+          }
+          saveInterviews(req, interviews);
+        } catch { /* persist non-fatal */ }
+      } else if (/offer|congratulations|pleased to inform/i.test(subj)) {
+        const notif = {
+          type: 'offer',
+          title: 'Offer Received!',
+          message: `${email.from}: ${email.subject}`,
+          gmailId: email.gmailId,
+          email,
+        };
+        notifications.push(notif);
+        queueNotification(req, notif);
+      } else {
+        const notif = {
+          type: 'recruiter_reply',
+          title: 'Recruiter Reply',
+          message: `${email.from}: ${email.subject}`,
+          gmailId: email.gmailId,
+          email,
+        };
+        notifications.push(notif);
+        queueNotification(req, notif);
+      }
+      return true;
+    };
+
+    let scanned = 0;
+    let newestId = null;
+    let sincePersist = 0;
+    // Snapshot processed + pending + cache so an interrupted scan (server
+    // restart, client timeout mid-backfill) resumes where it left off instead
+    // of restarting from scratch. `lastScanAt` is deliberately NOT advanced on
+    // these periodic snapshots: advancing it early would shrink the next scan's
+    // window and skip the older outreach this run never reached. Only the final
+    // persist below advances it, marking a completed scan.
+    const persist = () => {
+      try {
+        const processedIds = Array.from(processed);
+        if (processedIds.length > 1000) processedIds.splice(0, processedIds.length - 1000);
+        const pendingIds = Array.from(pending);
+        if (pendingIds.length > 500) pendingIds.splice(0, pendingIds.length - 500);
+        saveInboxCursor(req, { lastScanAt: cursor.lastScanAt || null, lastGmailIdSeen: newestId, processedIds, pendingIds });
+        saveEmailClassifyCache(req, cache);
+      } catch { /* persist non-fatal */ }
+    };
+
+    try {
+      // 1) Retry messages that previously failed to fetch or classify. These are
+      // fetched by id (independent of the now-moving time window) so nothing is
+      // ever lost to a transient failure. Ids that fail to fetch again simply
+      // stay in `pending` for the next scan.
+      if (pending.size) {
+        const pendResp = await fetch(`http://127.0.0.1:8787/email/inbox?ids=${Array.from(pending).join(',')}&includeSpam=true`, { headers });
+        if (pendResp.ok) {
+          const pendData = await pendResp.json();
+          for (const email of pendData.emails || []) {
+            if (!email.gmailId) continue;
+            if (await handleEmail(email)) {
+              pending.delete(email.gmailId);
+              if (++sincePersist >= 50) { sincePersist = 0; persist(); }
+            } else {
+              pending.add(email.gmailId);
+            }
+          }
+          if (sincePersist) { sincePersist = 0; persist(); }
+        }
+      }
+
+      // 2) Window fetch: backfill enumerates up to 5000 messages so heavy-volume
+      // mailboxes don't truncate older recruiter outreach; incremental scans
+      // reuse the classify cache so each email is classified exactly once.
+      const inboxResp = await fetch(`http://127.0.0.1:8787/email/inbox?daysBack=${daysBack}&maxEmails=${maxEmails}`, { headers });
+      if (inboxResp.ok) {
+        const inboxData = await inboxResp.json();
+        const emails = inboxData.emails || [];
+        scanned = emails.length;
+        for (const email of emails) {
+          if (email.gmailId && !newestId) newestId = email.gmailId;
+          if (email.gmailId && processed.has(email.gmailId)) continue;
+          if (email.gmailId && pending.has(email.gmailId)) continue; // retried above
+
+          const subj = (email.subject || '').toLowerCase();
+          const body = (email.body || email.preview || '').toLowerCase();
+          if (isDigestSenderL(email)) continue;
+
+          // Cheap pre-filter — only plausible recruiter mail reaches the
+          // classifier (each classify call runs opencode, so keep it bounded).
+          // isPlausibleRecruiterMail errs on the side of INCLUDING mail; a
+          // false negative silently misses an opportunity, so never burn a
+          // mail on this check (marking processed happens only after it is
+          // actually classified — if this filter improves later, mail skipped
+          // here is re-examined on the next scan).
+          if (!isPlausibleRecruiterMail(subj, body)) continue;
+
+          const ok = await handleEmail(email);
+          if (!ok && email.gmailId) pending.add(email.gmailId);
+          else if (ok && email.gmailId && ++sincePersist >= 50) { sincePersist = 0; persist(); }
+        }
+
+        // Messages whose bodies could not be fetched stay pending so the next
+        // scan re-fetches them by id (window has already moved on).
+        for (const fid of inboxData.failedIds || []) {
+          if (fid && !processed.has(fid)) pending.add(fid);
+        }
+
+        // Snapshot post-loop state so pending additions (e.g. failed fetches)
+        // survive an interruption even if no further classification happened.
+        if (sincePersist) { sincePersist = 0; persist(); }
+
+        // Advance cursor on a completed scan: new timestamp so the next run is
+        // incremental, bounded processed + pending sets, newest id.
+        cursor.lastScanAt = new Date().toISOString();
+        persist();
+      }
+    } catch { /* inbox scan failed — non-fatal */ }
+
+    return { notifications, scanned, backfill: isBackfill, userId: userId || null };
+  });
+}
+
+// POST /email/scan — cursor-based inbox scan for the app/daily worker.
+// First call backfills 90 days; later calls scan incrementally. Returns the
+// recruiter/interview/offer notifications + scan stats.
+app.post('/email/scan', async (req, res) => {
+  try {
+    const userId = req.userCtx?.userId;
+    if (!userId) return res.status(400).json({ error: 'X-User-Id required' });
+    const forceBackfill = req.body?.forceBackfill === true;
+    const scan = await scanInboxForUser(req, { forceBackfill });
+    // Replay undelivered notifications so a lost backfill response (client
+    // timeout / disconnect) never loses an opportunity. The queue is cleared
+    // only once the response has actually been written to the client.
+    const pending = loadPendingNotifications(req);
+    const notifications = dedupeNotifications([...scan.notifications, ...pending]);
+    res.json({
+      notifications,
+      count: notifications.length,
+      scanned: scan.scanned,
+      backfill: scan.backfill,
+    });
+    res.on('finish', () => { if (pending.length) savePendingNotifications(req, []); });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── POST /notifications/check — Check for new opportunities/replies ──
 app.post('/notifications/check', async (req, res) => {
   try {
@@ -7339,88 +7804,19 @@ app.post('/notifications/check', async (req, res) => {
     const userDir = req.userCtx?.userDir || __dirname;
     const notifications = [];
 
-    // Check inbox for new recruiter emails (7-day window so older recruiter
-    // outreach isn't invisible; the old 1-day/10-email cap missed them).
+    // Scan inbox for recruiter replies / interviews / offers (cursor-based:
+    // one-time 90-day backfill, then incremental daily scans — no opportunity
+    // missed, nothing re-classified).
     try {
-      const inboxResp = await fetch(`http://127.0.0.1:8787/email/inbox?daysBack=7&maxEmails=100`, {
-        headers: userId ? { 'X-User-Id': userId } : {},
-      });
-      if (inboxResp.ok) {
-        const inboxData = await inboxResp.json();
-        for (const email of (inboxData.emails || [])) {
-          const subj = (email.subject || '').toLowerCase();
-          const body = (email.body || email.preview || '').toLowerCase();
-          if (isDigestSenderL(email)) continue;
+      const scan = await scanInboxForUser(req);
+      notifications.push(...scan.notifications);
+    } catch { /* inbox scan failed — non-fatal */ }
 
-          // Cheap pre-filter first — only plausible recruiter mail reaches the
-          // classifier (each classify call runs opencode, so keep it bounded).
-          const plausible =
-            /interview|phone screen|next round|screen(ing)? call|schedule|meeting|recruiter|hiring|your application|opportunity|offer|selected|shortlist|re\s*:/i.test(subj) ||
-            /interview|schedule|availability|your application|your resume|recruiter|hiring manager|opportunity|position|offer|joining date|start date/i.test(body.slice(0, 400));
-          if (!plausible) continue;
-
-          // Classifier gate — only high-confidence direct recruiter mail counts.
-          const cls = await classifyEmailViaBridge(userId, email);
-          const classification = cls?.classification;
-          const confidence = typeof cls?.confidence === 'number' ? cls.confidence : 0;
-          if (classification !== 'job_reply' || confidence < 0.7) continue;
-
-          if (/interview|schedule|meeting|next round/i.test(subj) || /interview|schedule|availability|we would like to meet/i.test(body)) {
-            const dt = extractInterviewDateTime(email.subject, email.body || email.preview);
-            const when = dt ? `\n**When:** ${dt.human}` : '';
-            notifications.push({
-              type: 'interview',
-              title: 'Interview Scheduled',
-              message: `${email.from}: ${email.subject}${when}`,
-              email,
-              scheduledAt: dt ? dt.iso : null,
-              scheduledHuman: dt ? dt.human : null,
-            });
-
-            // Persist to interviews.json for reminders
-            try {
-              const interviews = loadInterviews(req);
-              const key = `${email.fromEmail || email.from || ''}|${(email.subject || '').slice(0, 60)}`;
-              let rec = interviews.find(i => i.key === key);
-              if (!rec) {
-                rec = {
-                  key,
-                  id: email.gmailId || String(Date.now()),
-                  from: email.from || '',
-                  subject: email.subject || '',
-                  detectedAt: new Date().toISOString(),
-                  reminderSentAt: null,
-                  status: 'scheduled',
-                };
-                interviews.push(rec);
-              }
-              if (dt) {
-                rec.scheduledAt = dt.iso;
-                rec.scheduledHuman = dt.human;
-                rec.date = dt.date;
-                rec.time = dt.time;
-                rec.confidence = dt.confidence;
-              }
-              saveInterviews(req, interviews);
-            } catch { /* persist non-fatal */ }
-          } else if (/offer|congratulations|pleased to inform/i.test(subj)) {
-            notifications.push({
-              type: 'offer',
-              title: 'Offer Received!',
-              message: `${email.from}: ${email.subject}`,
-              email,
-            });
-          } else {
-            notifications.push({
-              type: 'recruiter_reply',
-              title: 'Recruiter Reply',
-              message: `${email.from}: ${email.subject}`,
-              email,
-            });
-          }
-        }
-      }
-    } catch { /* inbox check failed — non-fatal */ }
+    // Replay any undelivered notifications from a scan whose response was lost
+    // (client timeout), so no opportunity is ever missed. Dedup against the
+    // fresh scan results above; clear once the response is actually written.
+    const pending = loadPendingNotifications(req);
+    notifications.push(...pending);
 
     // Emit reminders for scheduled interviews coming up (dedup via reminderSentAt)
     try {
@@ -7477,7 +7873,9 @@ app.post('/notifications/check', async (req, res) => {
       }
     } catch { /* tracker check failed — non-fatal */ }
 
-    res.json({ notifications, count: notifications.length });
+    const deduped = dedupeNotifications(notifications);
+    res.json({ notifications: deduped, count: deduped.length });
+    res.on('finish', () => { if (pending.length) savePendingNotifications(req, []); });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

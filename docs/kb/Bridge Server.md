@@ -1,7 +1,7 @@
 ---
 type: component
 tags: [component, backend, api]
-updated: 2026-08-06
+updated: 2026-08-07
 ---
 
 # Bridge Server
@@ -123,14 +123,30 @@ header.
   merge-tracker.mjs` was spawned from the per-user cwd and silently failed to
   find the module — leaving eval rows stranded in `batch/tracker-additions/`
   and never merged into `data/applications.md`.
-- Own the **email-inbox scan** (`fetchGmailInboxREST`, 2026-08-06 hardening):
-  the Gmail REST list previously capped at 50 messages (`Math.min(maxEmails,
-  50)` on a single page) — roughly two days of inbox volume — so older recruiter
-  outreach was invisible to the app, the worker, and `/notifications/check`.
-  It now **paginates with `nextPageToken`** up to a 250-message cap and fetches
-  message bodies in bounded chunks (20 at a time) to avoid Gmail rate limits.
+- Own the **email-inbox scan** (`fetchGmailInboxREST`, 2026-08-06 → 08-07
+  hardening): the Gmail REST list previously capped at 50 messages
+  (`Math.min(maxEmails, 50)` on a single page) — roughly two days of inbox
+  volume — so older recruiter outreach was invisible to the app, the worker, and
+  `/notifications/check`. It now **paginates with `nextPageToken`** up to a
+  5000-message cap for backfills (a 250-cap still truncated the 90-day window —
+  this mailbox holds **2035 messages** in 90 days), fetches bodies in bounded
+  chunks (**concurrency 10**) with a **3-attempt retry**, and returns any
+  still-failing messages as `failedIds` instead of silently dropping them.
   `/email/inbox` also accepts a **`query`** param passed straight to the Gmail
-  API. Detection in `/notifications/check` and `/interview/detect` is now
+  API and an **`ids`** param to fetch specific messages by id.
+  **`POST /email/scan`** (`scanInboxForUser`) is the cursor-based scan the app /
+  daily worker use: per-user `inbox-cursor.json` (`lastScanAt`, `processedIds`,
+  `pendingIds`) + `email-classify-cache.json`. First run (or `forceBackfill`)
+  does a one-time 90-day backfill (up to 5000 msgs); later runs scan the last
+  scan + 2-day overlap, classifying each email exactly once. Failed fetch /
+  classify messages go to `pendingIds` and are re-fetched **by id** each scan so
+  nothing is ever lost; progress is persisted every 50 classifications so an
+  interrupted backfill resumes (and `lastScanAt` only advances on completion).
+  Recruiter-reply / offer / interview notifications are **durable**: queued to
+  `pending-notifications.json` as found and replayed by `/email/scan` and
+  `/notifications/check`, cleared only after the response is written — a lost
+  response (client timeout on a long backfill) never loses the opportunity.
+  Detection in `/notifications/check` and `/interview/detect` is now
   **classifier-gated**: after a cheap keyword pre-filter, each candidate email
   is sent to the opencode-backed `/email/classify` via the shared
   `classifyEmailViaBridge` helper, and only `job_reply` messages with
@@ -144,6 +160,15 @@ header.
   `DailyAutomationWorker`) mirrors the same gate against `/email/classify`.
   Note: `/email/classify` runs opencode per candidate, so the keyword
   pre-filter keeps each check bounded.
+  **Salary gate (2026-08-07)**: `/email/classify` injects the candidate's
+  `config/profile.yml` `compensation` (minimum 3 LPA, target 3-12 LPA) into its
+  prompt and mandates that unpaid/free-internship / below-minimum offers classify
+  as `spam`. `classifyEmailViaBridge` now sends up to 2000 chars of body. Two
+  cheap sync gates in `scanInboxForUser`'s `handleEmail` run before classify (so
+  they also cover cached verdicts): `isBelowCompensationEmail` (regex on
+  unpaid/free-intern/no-stipend signals) and `isBlacklistedSender` (the user's
+  `data/blacklist.md` do-not-apply table, e.g. 1Accord) — both skip the email
+  without notifying.
 
 ## Design notes
 

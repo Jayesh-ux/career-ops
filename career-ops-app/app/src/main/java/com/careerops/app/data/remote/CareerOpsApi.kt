@@ -79,6 +79,9 @@ interface CareerOpsApi {
     @POST("email/classify")
     suspend fun classifyEmail(@Body request: ClassifyRequest): ClassifyResponse
 
+    @POST("email/scan")
+    suspend fun scanInbox(@Body body: Map<String, Any> = emptyMap()): ScanInboxResponse
+
     // ── Email Inbox ────────────────────────────────────────────
     @GET("email/inbox")
     suspend fun getInbox(

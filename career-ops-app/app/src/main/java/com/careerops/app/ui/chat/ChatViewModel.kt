@@ -308,7 +308,6 @@ class ChatViewModel @Inject constructor(
 
     private var currentSessionId: String? = null
     private var inboxPollJob: kotlinx.coroutines.Job? = null
-    private val classifiedEmailIds = mutableSetOf<String>()
     private var processingCardId: Long? = null
 
     /** The currently-running operation so the persistent HITL "Stop" can cancel it. */
@@ -391,53 +390,35 @@ class ChatViewModel @Inject constructor(
                 kotlinx.coroutines.delay(30_000) // every 30s
                 if (prefs.userEmail.isEmpty()) continue
                 try {
-                    val inbox = api.getInbox(
-                        email = prefs.userEmail,
-                        daysBack = 14,
-                        maxEmails = 50
-                    )
-                    // Cheap pre-filter first, then confirm via the classifier so
-                    // job-board digests never masquerade as recruiter replies.
-                    val candidates = inbox.emails.filter { email ->
-                        !email.isSpam && !isClassified(email) && looksLikeRecruiterReply(email)
-                    }
-                    for (candidate in candidates) {
-                        markClassified(candidate)
-                        try {
-                            val cls = api.classifyEmail(ClassifyRequest(
-                                from = candidate.from,
-                                subject = candidate.subject,
-                                preview = candidate.body.take(500)
-                            ))
-                            if (cls.classification != "job_reply" || cls.confidence < 0.6) continue
-                            val alreadyNotified = messages.any { msg ->
-                                msg is ChatMessage.System && msg.text.contains(candidate.subject)
-                            }
-                            if (!alreadyNotified) {
-                                Toast.makeText(app, "Recruiter reply: ${candidate.from} — ${candidate.subject}", Toast.LENGTH_LONG).show()
-                                // NOTIFY ONLY. Never auto-draft or auto-send from polling —
-                                // the user must explicitly ask to draft a reply.
-                                messages.add(ChatMessage.System(
-                                    "\uD83D\uDCE8 **Recruiter reply:**\n" +
-                                    "From: ${candidate.from}\n" +
-                                    "Subject: ${truncateIfNeeded(candidate.subject)}\n\n" +
-                                    "_Nothing was drafted or sent. To reply, say **'reply to {company}'** and I'll prepare a draft for your review._"
-                                ))
-                            }
-                        } catch (_: Exception) {}
+                    // Cursor-based scan: first run backfills 90 days, then scans
+                    // incrementally — no older opportunity is ever missed, and
+                    // already-classified mail is not re-processed.
+                    val scan = api.scanInbox(emptyMap())
+                    for (n in scan.notifications) {
+                        if (n.type != "recruiter_reply" && n.type != "interview" && n.type != "offer") continue
+                        val alreadyNotified = messages.any { msg ->
+                            msg is ChatMessage.System && msg.text.contains(n.message.take(60))
+                        }
+                        if (alreadyNotified) continue
+                        val icon = when (n.type) {
+                            "interview" -> "\uD83C\uDF1F"
+                            "offer" -> "\uD83C\uDF89"
+                            else -> "\uD83D\uDCE8"
+                        }
+                        Toast.makeText(app, "${n.title}: ${n.message}", Toast.LENGTH_LONG).show()
+                        // NOTIFY ONLY. Never auto-draft or auto-send from polling —
+                        // the user must explicitly ask to draft a reply.
+                        val text = if (n.type == "recruiter_reply") {
+                            "$icon **${n.title}:**\n${n.message}\n\n" +
+                            "_Nothing was drafted or sent. To reply, say **'reply to {company}'** and I'll prepare a draft for your review._"
+                        } else {
+                            "$icon **${n.title}:**\n${n.message}"
+                        }
+                        messages.add(ChatMessage.System(text))
                     }
                 } catch (_: Exception) {}
             }
         }
-    }
-
-    private fun emailKey(email: InboxEmail): String =
-        email.gmailId.takeIf { it.isNotBlank() } ?: "${email.from}|${email.subject}"
-
-    private fun isClassified(email: InboxEmail): Boolean = classifiedEmailIds.contains(emailKey(email))
-
-    private fun markClassified(email: InboxEmail) {
-        classifiedEmailIds.add(emailKey(email))
     }
 
     /**
@@ -3134,44 +3115,6 @@ class ChatViewModel @Inject constructor(
             }
         }
         return e.message ?: e.javaClass.simpleName
-    }
-
-    /**
-     * Conservative filter for "recruiter replied to my application" emails.
-     * Requires a strong interview/offer signal OR a reply thread (Re:) that
-     * mentions application/profile/recruiter content, so newsletters and
-     * random posts (Quora digests, marketing) never match. Even when this
-     * matches, nothing is sent until the user approves the draft.
-     */
-    private fun isDigestSender(from: String): Boolean {
-        val f = from.lowercase()
-        val digestDomains = listOf(
-            "quora.com", "indeed.com", "hirist", "linkedin.com", "naukri", "monster.com",
-            "glassdoor", "simplyhired", "jobrapido", "buzzfeed", "medium.com", "substack",
-            "youtube.com", "internshala", "timesjobs", "shine.com", "foundit.com",
-            "freshersworld", "apna.co", "teamlease", "zoho", "newsletter", "digest",
-            "mailer", "notifications", "updates@", "no-reply", "noreply", "donotreply",
-            "pinterest", "instahyre", "github", "havells", "stackoverflow", "render.com",
-            "edureka"
-        )
-        return digestDomains.any { f.contains(it) }
-    }
-
-    private fun looksLikeRecruiterReply(email: InboxEmail): Boolean {
-        if (isDigestSender(email.from)) return false
-        val subj = email.subject.lowercase()
-        val body = email.body.lowercase()
-        val isReplyThread = Regex("(^|\\s)re\\s*:\\s*").containsMatchIn(email.subject)
-        val strongInterview =
-            subj.contains(Regex("(?i)(interview|phone screen|next round|screening)")) ||
-            body.contains(Regex("(?i)(interview|phone screen|next round)"))
-        val strongOffer =
-            subj.contains(Regex("(?i)(offer|offer letter)")) ||
-            body.contains(Regex("(?i)(offer letter|pleased to inform|start date|joining date|selected for)"))
-        val replyToApplication = isReplyThread && body.contains(
-            Regex("(?i)(your application|your resume|your cv|recruiter|hiring manager|interview|opportunity|profile|role)")
-        )
-        return strongInterview || strongOffer || replyToApplication
     }
 
     /**
