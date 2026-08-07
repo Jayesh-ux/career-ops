@@ -101,13 +101,24 @@ interview:
 These gates run for every scan, on every email, whether or not it is in the
 classify cache.
 
+## Thread-aware replies (2026-08-07)
+
+`POST /email/reply` (rewritten) is thread-aware: it accepts
+`to`/`subject`/`originalBody`/`body` plus `inReplyTo`/`messageId`/`threadId`
+and returns `replyBody`/`subject: Re: ...`/`to`/`inReplyTo`/`threadId` so the
+app can carry the whole chain. Drafting no longer hard-requires `to`
+(follow-up drafts allowed); sending still requires it. `POST /email/reply/send`
+adds `In-Reply-To` + `References` headers and forwards `threadId` in the Gmail
+REST send body, so replies land inside the original recruiter conversation.
+The app reaches this via the Reply button on each `InboxNotificationCard`.
+
 ## Endpoints (Bridge Server)
 
 | Endpoint | Purpose |
 |----------|---------|
 | `/email/inbox` | List + classify inbox emails, detect interviews/replies |
 | `/email/send` | Send an application/reply email (OAuth via the token store) |
-| `/email/reply` | Draft a context-aware reply using career-ops data |
+| `/email/reply` | Draft a **thread-aware** reply to a specific recruiter |
 | `/email/spam/delete` | Detect and remove recruitment junk/spam |
 
 ## Auth model

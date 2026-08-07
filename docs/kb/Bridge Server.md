@@ -169,6 +169,26 @@ header.
   unpaid/free-intern/no-stipend signals) and `isBlacklistedSender` (the user's
   `data/blacklist.md` do-not-apply table, e.g. 1Accord) — both skip the email
   without notifying.
+  **Scan filtering (2026-08-07)**: `/scan/stream` now drops two kinds of noise
+  before scoring. **Tracker exclusion** — `buildTrackerExclusion` previously
+  matched tracker company names exactly, but tracker rows carry clutter ("Shine —
+  Mumbai") that never equals a clean scan hit. Results are now filtered through
+  `isTrackerExcluded` using `normalizeCompanyForExclusion` (lowercase, strip
+  punctuation, remove location/suffix suffixes) + **substring containment both
+  ways**, so a listed-applied company never reappears in scan results. **Salary
+  floor** — `parseSalaryLpa()` (regex handles `₹6-8 LPA`, `₹20k/mo` → 2.4,
+  `Competitive` → null) + the per-user profile's `compensation.minimum`
+  (3 LPA) form a hard gate: a **parseable** salary below the floor is dropped;
+  unknown/negotiable salaries pass. Both filters update the `excludedSalary`
+  counter in the summary and the "widening" step.
+- Own **thread-aware recruiter replies** (`POST /email/reply` + `/email/reply/send`,
+  2026-08-07 rewrite): `/email/reply` accepts `to`/`subject`/`originalBody`/`body`
+  plus `inReplyTo`/`messageId`/`threadId` and returns
+  `replyBody`/`subject: Re: ...`/`to`/`inReplyTo`/`threadId` so the app can carry
+  the full thread chain to the reply. Drafting no longer hard-requires `to`
+  (follow-up drafts are allowed); sending still requires `to`. `/email/reply/send`
+  adds `In-Reply-To` + `References` headers and forwards `threadId` in the Gmail
+  REST send body so replies land inside the original conversation.
 
 ## Design notes
 

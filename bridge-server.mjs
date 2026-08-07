@@ -1803,8 +1803,8 @@ app.post('/email/send', async (req, res) => {
               Authorization: `Bearer ${accessToken}`,
               'Content-Type': 'application/json',
             },
-            body: JSON.stringify({ raw }),
-          });
+      body: JSON.stringify(sendBody),
+    });
           if (sendResp.ok) {
             const sent = await sendResp.json();
             console.log(`[email/send] gmail_rest success (id=${sent.id})`);
@@ -2151,6 +2151,9 @@ async function fetchGmailInboxREST(email, userId, { daysBack = 30, maxEmails = 5
             const parsedDate = new Date(headersMap.date || parseInt(msg.internalDate || 0, 10));
             emails.push({
               gmailId: msg.id,
+              threadId: msg.threadId || '',
+              messageId: headersMap['message-id'] || '',
+              inReplyTo: headersMap['in-reply-to'] || '',
               from: headersMap.from || '',
               fromEmail: parseFromEmail(headersMap.from || ''),
               subject: headersMap.subject || '',
@@ -2984,6 +2987,20 @@ function isSeniorOnlyRole(title) {
 // Active statuses (applied/responded/interview/offer) make a company an
 // active target — results there are suppressed so we never spam a company
 // the user is already in-process with. Rejected/discarded are re-eligible.
+//
+// Company names in the tracker carry clutter ("Shine — Mumbai", "Internshala
+// — Mumbai", "SmartinfoLogiks (Analytics101)") that never equals a clean scan
+// company name, so keys are normalized AND matched by substring either way:
+// "Shine — Mumbai" (→ "shinemumbai") still blocks a scan hit for "Shine".
+function normalizeCompanyForExclusion(name) {
+  return String(name || '')
+    .toLowerCase()
+    .replace(/\s*\(.*?\)\s*/g, ' ')
+    .replace(/\s*[—-][^a-z0-9]*.*$/i, '')
+    .replace(/[^a-z0-9]+/g, '')
+    .trim();
+}
+
 function buildTrackerExclusion(trackerPath) {
   const activeCompanies = new Set();
   const activeRoles = new Set();
@@ -2996,12 +3013,41 @@ function buildTrackerExclusion(trackerPath) {
       const role = m[2].trim().toLowerCase();
       const status = m[4].trim().toLowerCase();
       if (company && ['applied', 'responded', 'interview', 'offer'].includes(status)) {
-        activeCompanies.add(company);
-        activeRoles.add(`${company}::${role}`);
+        activeCompanies.add(normalizeCompanyForExclusion(company));
+        activeRoles.add(`${normalizeCompanyForExclusion(company)}::${normalizeCompanyForExclusion(role)}`);
       }
     }
   }
   return { activeCompanies, activeRoles };
+}
+
+// True when a scanned company/role collides with an active tracker entry.
+// Substring containment in either direction, so "shine mumbai" blocks "shine".
+function isTrackerExcluded(company, role, exclusion) {
+  const { activeCompanies, activeRoles } = exclusion;
+  if (!activeCompanies.size && !activeRoles.size) return false;
+  const c = normalizeCompanyForExclusion(company);
+  const r = normalizeCompanyForExclusion(role);
+  if (activeRoles.has(`${c}::${r}`)) return true;
+  for (const ac of activeCompanies) {
+    if (ac && (c.includes(ac) || ac.includes(c))) return true;
+  }
+  return false;
+}
+
+// Parse the minimum LPA figure from a salary string ("₹6-8 LPA" → 6,
+// "₹20k/mo" → 0.24, "Competitive" → null). Returns null when unparseable.
+function parseSalaryLpa(salaryStr) {
+  const s = String(salaryStr || '').toLowerCase().replace(/,/g, '');
+  const lpa = s.match(/([\d.]+)\s*(?:-|to)\s*[\d.]+\s*(?:lpa|lakh|\/annum|\/year|l)\b/) || s.match(/([\d.]+)\s*(lpa|lakh|l)\b/);
+  if (lpa) return parseFloat(lpa[1]);
+  const monthly = s.match(/₹?\s*([\d.]+)\s*k?\s*\/?\s*(mo|month)/);
+  if (monthly) {
+    const k = /k\s*\/?\s*(mo|month)/.test(s) ? 1000 : 1;
+    const perMonth = parseFloat(monthly[1]) * k;
+    if (perMonth > 0) return perMonth * 12 / 100000; // /month → LPA
+  }
+  return null;
 }
 
 // Decode common HTML entities in scraped titles.
@@ -3581,22 +3627,38 @@ app.get('/scan/stream', async (req, res) => {
     });
 
     // Don't re-spam companies the user already applied to (per-user tracker).
-    const { activeCompanies, activeRoles } = buildTrackerExclusion(req.userCtx.trackerPath || TRACKER_PATH);
+    // Normalized + substring matching, so "Shine — Mumbai" in the tracker
+    // still blocks a clean "Shine" scan hit.
+    const trackerExclusion = buildTrackerExclusion(req.userCtx.trackerPath || TRACKER_PATH);
     const excludedApplied = [];
     const usableResults = [];
     for (const r of levelFiltered) {
-      const company = (r.company || '').toLowerCase();
-      const role = (r.role || '').toLowerCase();
-      if (activeCompanies.has(company) || activeRoles.has(`${company}::${role}`)) {
+      if (isTrackerExcluded(r.company, r.role, trackerExclusion)) {
         excludedApplied.push(r);
         continue;
       }
       usableResults.push(r);
     }
 
+    // Salary gate — drop listings whose posted salary is clearly below the
+    // user's minimum (profile.compensation.minimum). Only a *parseable*
+    // figure below the floor is rejected; unknown or negotiable salaries are
+    // kept (no data → cannot judge, and scoreScanResult still scores them).
+    const salaryFloor = (() => {
+      const m = String(userProfile.compensation?.minimum || '').match(/([\d.]+)/);
+      return m ? parseFloat(m[1]) : null;
+    })();
+    const excludedSalary = [];
+    const afterSalaryGate = [];
+    for (const r of usableResults) {
+      const lpa = parseSalaryLpa(r.salary);
+      if (salaryFloor != null && lpa != null && lpa < salaryFloor) { excludedSalary.push(r); continue; }
+      afterSalaryGate.push(r);
+    }
+
     // Score every opportunity with the career-ops rubric so each card is rated.
     const profileForScore = readUserProfileRaw(req);
-    const scored = usableResults.map(r => {
+    const scored = afterSalaryGate.map(r => {
       const s = scoreScanResult(r, profileForScore, rawKw);
       return { ...r, score: s.score, scoreNum: s.scoreNum, fit: s.fit, scoreDetails: s.details };
     });
@@ -3648,6 +3710,9 @@ app.get('/scan/stream', async (req, res) => {
     if (excludedApplied.length > 0) {
       streamWideningSteps.push(`Skipped ${excludedApplied.length} role(s) at companies you already applied to (tracker).`);
     }
+    if (excludedSalary.length > 0) {
+      streamWideningSteps.push(`Skipped ${excludedSalary.length} role(s) paying below your ${salaryFloor} LPA minimum.`);
+    }
     if (!expandPortals) {
       streamWideningSteps.push(`Scan again to expand across more Indian job portals (Naukri, Indeed, Shine, Foundit, TimesJobs, Hirist, Cutshort, Instahyre, Internshala and more).`);
     }
@@ -3669,6 +3734,7 @@ app.get('/scan/stream', async (req, res) => {
         filteredByLevel: filteredByLevel.length,
         duplicatesSkipped,
         excludedApplied: excludedApplied.length,
+        excludedSalary: excludedSalary.length,
         netNew,
         locationTier,
         expanded: expandPortals,
@@ -4177,10 +4243,12 @@ app.get('/portals', (req, res) => {
   }
 });
 
-// POST /email/reply — draft a contextual reply using profile data
+// POST /email/reply — draft a contextual reply using profile data.
+// Thread-aware: pass `to` + `subject` (+ optional `inReplyTo`/`originalBody`)
+// from the recruiter's actual email so the draft responds to THAT conversation.
 app.post('/email/reply', async (req, res) => {
   try {
-    const { email, appPassword, to, subject, originalBody, replyType } = req.body;
+    const { email, appPassword, to, subject, originalBody, body, inReplyTo, messageId, threadId, replyType } = req.body;
     // Check auth: OAuth2 (per-user or legacy) OR app password
     const userId = req.userCtx?.userId;
     const userOAuth = userId ? getUserOAuth(userId) : null;
@@ -4190,7 +4258,10 @@ app.post('/email/reply', async (req, res) => {
     if (!resolvedEmail || (!appPassword && !hasUserOAuth2 && !hasLegacyOAuth2)) {
       return res.status(400).json({ error: 'email and auth (appPassword or OAuth2) required' });
     }
-    if (!to) return res.status(400).json({ error: 'to is required' });
+    // `to` is strongly preferred (thread-aware reply to the recruiter), but a
+    // draft may be produced without it (e.g. follow-up drafts where the user
+    // supplies the recipient later). Sending always requires `to`.
+    const toClean = String(to || '').trim();
 
     const profilePath = req.userCtx?.profilePath || PROFILE_PATH;
     const profile = existsSync(profilePath) ? yaml.load(readFileSync(profilePath, 'utf-8')) || {} : readProfile();
@@ -4198,6 +4269,7 @@ app.post('/email/reply', async (req, res) => {
     const name = c.full_name || 'Candidate';
     const phone = c.phone || '';
     const loc = profile.location?.city || '';
+    const original = (originalBody || body || '').slice(0, 2000);
 
     let replyBody = '';
     const type = (replyType || 'interview').toLowerCase();
@@ -4211,11 +4283,23 @@ app.post('/email/reply', async (req, res) => {
     } else if (type === 'negotiate') {
       const comp = profile.compensation?.target_range || '5-6 LPA';
       replyBody = `Dear Hiring Team,\n\nThank you for the offer. I am very excited about the role and the opportunity to contribute to your team. Before I accept, I was hoping we could discuss the compensation package. Based on my experience and the market rate for this role in ${loc || 'Mumbai'}, I was expecting something in the range of ${comp}. I am confident I can deliver strong value and would love to make this work.\n\nI look forward to hearing your thoughts.\n\nBest regards,\n${name}\n${phone || ''}`.trim();
+    } else if (type === 'generic' || type === 'thank_you') {
+      replyBody = original
+        ? `Dear Hiring Team,\n\nThank you for your message${subject ? ` about "${subject.replace(/^re:\s*/i, '')}"` : ''}. I would be happy to provide any additional information or documents you need.\n\nBest regards,\n${name}\n${phone || ''}`.trim()
+        : `Dear Hiring Team,\n\nThank you for your message.\n\nBest regards,\n${name}`.trim();
     } else {
       replyBody = `Dear Team,\n\nThank you for your message.\n\nBest regards,\n${name}`.trim();
     }
 
-    res.json({ replyBody, subject: `Re: ${subject || ''}` });
+    // Return the thread context so the app can send a true in-thread reply
+    // (the send call reuses inReplyTo/messageId for the In-Reply-To header).
+    res.json({
+      replyBody,
+      subject: `Re: ${String(subject || '').replace(/^re:\s*/i, '')}`,
+      to: toClean,
+      inReplyTo: inReplyTo || messageId || null,
+      threadId: threadId || null,
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -4224,7 +4308,7 @@ app.post('/email/reply', async (req, res) => {
 // POST /email/reply/send — send an approved reply draft via SMTP (HITL: user must tap [Send])
 app.post('/email/reply/send', async (req, res) => {
   try {
-    const { to, subject, body, cc, bcc } = req.body;
+    const { to, subject, body, cc, bcc, inReplyTo, messageId, threadId } = req.body;
     if (!to || !body) return res.status(400).json({ error: 'to and body are required' });
 
     // Resolve auth (same logic as /email/send)
@@ -4266,13 +4350,17 @@ app.post('/email/reply/send', async (req, res) => {
       accessToken = await getGmailAccessToken();
     }
 
-    // Build RFC 2822 message
+    // Build RFC 2822 message. In-Reply-To / References make the reply land in
+    // the same Gmail thread as the recruiter's message.
     const boundary = `----=_Part_${Date.now()}`;
+    const inReplyToHeader = (inReplyTo || messageId || '').trim();
     const lines = [
       `From: ${userEmail}`,
       `To: ${to}`,
       cc ? `Cc: ${cc}` : null,
       bcc ? `Bcc: ${bcc}` : null,
+      inReplyToHeader ? `In-Reply-To: ${inReplyToHeader}` : null,
+      inReplyToHeader ? `References: ${inReplyToHeader}` : null,
       `Subject: ${subject || ''}`,
       `MIME-Version: 1.0`,
       `Content-Type: text/plain; charset=UTF-8`,
@@ -4282,6 +4370,8 @@ app.post('/email/reply/send', async (req, res) => {
     ].filter(Boolean);
 
     const raw = Buffer.from(lines.join('\r\n')).toString('base64url');
+
+    const sendBody = threadId ? { raw, threadId } : { raw };
 
     const sendResp = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
       method: 'POST',
@@ -4982,8 +5072,24 @@ Candidate phone: ${profile?.candidate?.phone || ''}
 Return JSON: {"to": "hiring contact email or empty string if unknown", "subject": "...", "body": "...", "contactBlock": "...", "phone": "recruiter contact phone or empty string if unknown"}`;
 
     const result = await runOpencode(prompt, 180000, userCwd(req));
-    const parsed = parseJsonFromOutput(result);
-    res.json(parsed || { to: '', subject: '', body: result.trim().slice(0, 2000), contactBlock: '', phone: '' });
+    const parsed = parseJsonFromOutput(result) || { to: '', subject: '', body: result.trim().slice(0, 2000), contactBlock: '', phone: '' };
+
+    // The drafter often stops at "no email on the posting page" without
+    // searching. Run a dedicated websearch pass so real application addresses
+    // (Supabase → Greenhouse/Lever/Ashby etc.) are found instead of returning
+    // a blank "to" that makes the app silently fall back to form auto-fill.
+    if ((!parsed.to || !parsed.to.trim()) && company) {
+      try {
+        const lookupPrompt = `Search the web for the real application/recruiting contact email address for ${company} (hiring ${role ? `for ${role} roles` : 'software roles'}). Check their careers page, job-board postings (Greenhouse/Lever/Ashby/etc.), and contact page. Return ONLY a JSON object: {"to": "the verified application/HR email, or empty string if you truly cannot verify one"}. Never guess or fabricate — the address must be one you actually saw in a search result or on their own site.`;
+        const lookupResult = await runOpencode(lookupPrompt, 60000, userCwd(req));
+        const lookup = parseJsonFromOutput(lookupResult) || {};
+        if (lookup.to && lookup.to.trim()) {
+          parsed.to = lookup.to.trim();
+          parsed.contactBlock = (parsed.contactBlock || '') + ` (email found via websearch)`;
+        }
+      } catch { /* best-effort — keep the empty "to" */ }
+    }
+    res.json(parsed);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

@@ -213,10 +213,32 @@ data class ClassifyResponse(
     val reason: String = ""
 )
 
+data class ScanInboxEmailData(
+    val gmailId: String = "",
+    val threadId: String = "",
+    val messageId: String = "",
+    val inReplyTo: String = "",
+    val from: String = "",
+    val fromEmail: String = "",
+    val subject: String = "",
+    val body: String = "",
+    val preview: String = "",
+    val date: String = ""
+)
+
 data class ScanInboxNotification(
     val type: String = "",
     val title: String = "",
-    val message: String = ""
+    val message: String = "",
+    val gmailId: String = "",
+    val from: String = "",
+    val fromEmail: String = "",
+    val subject: String = "",
+    val threadId: String = "",
+    val messageId: String = "",
+    val body: String = "",
+    val date: String = "",
+    val email: ScanInboxEmailData? = null
 )
 
 data class ScanInboxResponse(
@@ -566,7 +588,10 @@ data class EmailSendRequest(
 // ── Reply draft response ─────────────────────────────────────────────
 data class ReplyDraftResponse(
     val replyBody: String = "",
-    val subject: String = ""
+    val subject: String = "",
+    val to: String = "",
+    val inReplyTo: String? = null,
+    val threadId: String? = null
 )
 
 // ── Playwright Apply endpoints (bridge-server /apply/*) ──────────────

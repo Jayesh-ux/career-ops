@@ -67,10 +67,27 @@ sealed class ChatMessage {
         val subject: String,
         val body: String,
         val replyType: String,
+        val inReplyTo: String = "",
+        val threadId: String = "",
         val sending: Boolean = false,
         val sent: Boolean = false,
         val onSend: (() -> Unit)? = null,
         val onEdit: (() -> Unit)? = null
+    ) : ChatMessage()
+    data class InboxNotificationCard(
+        override val id: Long = nextId(),
+        val type: String = "",
+        val title: String = "",
+        val message: String = "",
+        val from: String = "",
+        val fromEmail: String = "",
+        val subject: String = "",
+        val threadId: String = "",
+        val messageId: String = "",
+        val inReplyTo: String = "",
+        val body: String = "",
+        val date: String = "",
+        val onReply: (() -> Unit)? = null
     ) : ChatMessage()
     data class Evaluation(
         override val id: Long = nextId(),
@@ -322,6 +339,11 @@ class ChatViewModel @Inject constructor(
     private var scanLocations: String = ""
     private var scanRound: Int = 0
 
+    // In-flight /scan/stream OkHttp call — cancelled on Stop so the SSE read
+    // loop unblocks (a bare coroutine cancel can't interrupt a blocking
+    // readLine(); only cancelling the call does).
+    private var activeScanCall: okhttp3.Call? = null
+
     // Full-screen scan results overlay (all jobs in one scrollable list)
     var scanResultsOverlay: List<ScanResult>? by mutableStateOf(null)
         private set
@@ -332,6 +354,25 @@ class ChatViewModel @Inject constructor(
     }
     fun closeScanResults() { scanResultsOverlay = null }
     fun scanResultsOverlaySummary(): String = scanResultsSummary
+
+    // Pinned "Suggested jobs" list — every scan's results are collected here so
+    // a pinned button (ChatScreen FAB) can re-open them in a modal without
+    // scrolling the chat. Auto-updates: applying to a company removes it, so
+    // the list only ever shows companies you have NOT applied to yet.
+    var suggestedJobs: List<ScanResult> by mutableStateOf(emptyList())
+        private set
+    var suggestedJobsOverlay: Boolean by mutableStateOf(false)
+        private set
+    fun openSuggestedJobs() { suggestedJobsOverlay = true }
+    fun closeSuggestedJobs() { suggestedJobsOverlay = false }
+    fun applyFromSuggestedJobs(job: ScanResult) {
+        suggestedJobsOverlay = false
+        viewModelScope.launch { draftApplication(job.company, job.role, job.url) }
+    }
+    fun removeAppliedFromSuggested(company: String) {
+        if (company.isBlank()) return
+        suggestedJobs = suggestedJobs.filterNot { it.company.equals(company, ignoreCase = true) }
+    }
     fun applyFromScanResults(job: ScanResult) {
         // Close the overlay so the draft steps are visible in the chat below.
         scanResultsOverlay = null
@@ -607,7 +648,7 @@ class ChatViewModel @Inject constructor(
             activeJob = viewModelScope.launch { handleDirectSpam() }
             return
         }
-        if ((lower.startsWith("reply") || lower.startsWith("respond")) && (lower.contains("recruiter") || lower.contains("email") || lower.contains("interview"))) {
+        if ((lower.startsWith("reply") || lower.startsWith("respond")) && !lower.contains("http")) {
             activeJob = viewModelScope.launch { handleDirectReply(text) }
             return
         }
@@ -735,7 +776,9 @@ class ChatViewModel @Inject constructor(
                 .header("X-User-Id", prefs.userEmail)
                 .build()
 
-            val response = withContext(Dispatchers.IO) { client.newCall(request).execute() }
+            val call = client.newCall(request)
+            activeScanCall = call
+            val response = withContext(Dispatchers.IO) { call.execute() }
             val body = response.body ?: throw Exception("No response body")
 
             var finalResults: ScanResponse? = null
@@ -867,6 +910,13 @@ class ChatViewModel @Inject constructor(
                 if (finalResults != null) {
                     val r = finalResults!!
 
+                    // Collect into the pinned suggested-jobs list (auto-updates
+                    // as companies get applied).
+                    if (r.results.isNotEmpty()) {
+                        suggestedJobs = (suggestedJobs + r.results)
+                            .distinctBy { it.url.ifBlank { "${it.company}::${it.role}" } }
+                    }
+
                     // Show widening steps (honest match report)
                     if (r.wideningSteps.isNotEmpty()) {
                         for (step in r.wideningSteps) {
@@ -944,11 +994,23 @@ class ChatViewModel @Inject constructor(
             removeProcessing()
             isProcessing = false
             messages.add(ChatMessage.System("Couldn't reach the server. Make sure your bridge server is running."))
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // Stop was pressed — stopProcessing already cleaned up and posted
+            // the "Stopped" message. Rethrow so the coroutine ends quietly.
+            throw e
         } catch (e: Exception) {
             timerJob?.cancel()
             removeProcessing()
             isProcessing = false
+            if (wasInterrupted) {
+                // OkHttp cancel throws IOException ("Canceled"), which would
+                // otherwise surface as "Scan failed". Quietly exit — the
+                // "Stopped" message was already posted by stopProcessing().
+                return
+            }
             messages.add(ChatMessage.System("Scan failed: ${e.message}"))
+        } finally {
+            activeScanCall = null
         }
     }
 
@@ -969,7 +1031,9 @@ class ChatViewModel @Inject constructor(
         handleDirectScan(overrideKeywords = rerun.keywords, overrideLocations = rerun.locations, deep = rerun.deep, round = rerun.round)
     }
 
-    // ── Direct inbox via GET /email/inbox ─────────────────────────────────
+    // ── Direct inbox via POST /email/scan (classified) ──────────────────
+    // Only recruiter-relevant mail surfaces (interview / offer / recruiter_reply),
+    // each with a Reply button that drafts a thread-aware reply to THAT recruiter.
     private suspend fun handleDirectInbox() {
         try {
             val userEmail = prefs.userEmail
@@ -980,40 +1044,77 @@ class ChatViewModel @Inject constructor(
                 return
             }
             val response = withContext(Dispatchers.IO) {
-                api.getInbox(email = userEmail, daysBack = 14, maxEmails = 30)
+                api.scanInbox(emptyMap())
             }
             removeProcessing()
             isProcessing = false
 
-            if (response.emails.isEmpty()) {
-                messages.add(ChatMessage.System("No new emails found in the last 14 days."))
+            val relevant = response.notifications.filter {
+                it.type == "interview" || it.type == "offer" || it.type == "recruiter_reply"
+            }
+
+            if (relevant.isEmpty()) {
+                messages.add(ChatMessage.System(
+                    "**Inbox:** No recruiter replies, interviews, or offers found (${response.scanned} emails scanned). " +
+                    "I'll keep watching for new opportunities."
+                ))
+                persistMessages()
                 return
             }
 
-            val legitimate = response.emails.filter { !it.isSpam }
-            val spam = response.emails.filter { it.isSpam }
-
             messages.add(ChatMessage.System(
-                "**Inbox:** ${response.total} emails (${legitimate.size} legitimate, ${spam.size} spam)"
+                "**Inbox:** ${relevant.size} recruiter message${if (relevant.size != 1) "s" else ""} found (${response.scanned} emails scanned). " +
+                "Tap **Reply** on any conversation to draft a reply to that specific recruiter."
             ))
 
-            for (email2 in legitimate.take(10)) {
-                val category = email2.category.ifEmpty { "general" }
-                val icon = when (category) {
+            for (n in relevant) {
+                val icon = when (n.type) {
                     "interview" -> "\uD83C\uDF1F"
-                    "response" -> "\u2709\uFE0F"
+                    "offer" -> "\uD83C\uDF89"
                     else -> "\uD83D\uDCE8"
                 }
-                messages.add(ChatMessage.System(
-                    "$icon **${email2.subject}**\nFrom: ${email2.from}\nDate: ${email2.date}\nPreview: ${email2.body.take(150)}..."
+                val email = n.email
+                val fromEmail = (email?.fromEmail ?: n.fromEmail).ifBlank { "" }
+                val from = (email?.from ?: n.from).ifBlank { "Unknown" }
+                val subject = (email?.subject ?: n.subject).ifBlank { "Re: your application" }
+                val body = (email?.body ?: n.body).ifBlank { "" }
+                val messageId = (email?.messageId ?: n.messageId).ifBlank { "" }
+                val threadId = (email?.threadId ?: n.threadId).ifBlank { "" }
+                val inReplyTo = (email?.inReplyTo ?: "").ifBlank { "" }
+                val date = (email?.date ?: n.date).ifBlank { "" }
+                messages.add(ChatMessage.InboxNotificationCard(
+                    type = n.type,
+                    title = n.title,
+                    message = n.message,
+                    from = from,
+                    fromEmail = fromEmail,
+                    subject = subject,
+                    threadId = threadId,
+                    messageId = messageId,
+                    inReplyTo = inReplyTo,
+                    body = body,
+                    date = date,
+                    onReply = {
+                        viewModelScope.launch {
+                            draftReplyForThread(
+                                to = fromEmail,
+                                subject = subject,
+                                originalBody = body,
+                                inReplyTo = messageId,
+                                threadId = threadId,
+                                replyType = when (n.type) {
+                                    "interview" -> "interview"
+                                    "offer" -> "accept_offer"
+                                    else -> "generic"
+                                }
+                            )
+                        }
+                    }
                 ))
+                // Brief visual header line before the card
+                messages.add(ChatMessage.System("$icon **${n.title}**"))
             }
 
-            if (spam.isNotEmpty()) {
-                messages.add(ChatMessage.System(
-                    "\uD83D\uDDD1\uFE0F ${spam.size} spam emails detected. Say **'delete spam'** to clean them."
-                ))
-            }
             persistMessages()
         } catch (e: Exception) {
             removeProcessing()
@@ -1113,7 +1214,10 @@ class ChatViewModel @Inject constructor(
         }
     }
 
-    // ── Direct reply via POST /email/reply ────────────────────────────────
+    // ── Direct reply via POST /email/reply (thread-aware) ─────────────────
+    // "reply to {company}" / "reply to {recruiter}" resolves against the most
+    // recent inbox conversation matching the hint, then drafts a reply to that
+    // specific email thread (to / subject / inReplyTo / threadId).
     private suspend fun handleDirectReply(text: String) {
         try {
             val replyType = when {
@@ -1123,31 +1227,111 @@ class ChatViewModel @Inject constructor(
                 text.contains("negotiate") -> "negotiate"
                 else -> "generic"
             }
+
+            // Resolve the conversation from the hint after "reply to".
+            val hint = text.replace(Regex("(?i)^(reply|respond)(\\s+to)?\\s*"), "")
+                .trim().trimEnd('.')
+                .lowercase()
+                .ifBlank { "" }
+
+            val conversation = messages.indexOfLast { it is ChatMessage.InboxNotificationCard }
+                .takeIf { it >= 0 }
+                ?.let { messages[it] as ChatMessage.InboxNotificationCard }
+                ?.let { card ->
+                    // Prefer a card whose from/subject/message contains the hint;
+                    // fall back to the most recent card when there is no hint.
+                    val matches = messages.filterIsInstance<ChatMessage.InboxNotificationCard>()
+                        .filter {
+                            hint.isEmpty() ||
+                            it.from.lowercase().contains(hint) ||
+                            it.subject.lowercase().contains(hint) ||
+                            it.message.lowercase().contains(hint) ||
+                            it.fromEmail.lowercase().contains(hint)
+                        }
+                    matches.lastOrNull() ?: card
+                }
+
+            if (conversation == null || conversation.fromEmail.isBlank()) {
+                removeProcessing()
+                isProcessing = false
+                messages.add(ChatMessage.System(
+                    "\uD83D\uDCE8 No recruiter conversation found to reply to.\n" +
+                    "Say **'check inbox'** first — each recruiter message gets a **Reply** button you can tap to draft a reply to that specific conversation."
+                ))
+                persistMessages()
+                return
+            }
+
+            draftReplyForThread(
+                to = conversation.fromEmail,
+                subject = conversation.subject,
+                originalBody = conversation.body,
+                inReplyTo = conversation.messageId,
+                threadId = conversation.threadId,
+                replyType = replyType
+            )
+        } catch (e: Exception) {
+            removeProcessing()
+            isProcessing = false
+            messages.add(ChatMessage.System("Couldn't draft a reply right now. Please try again."))
+        }
+    }
+
+    // Draft a thread-aware reply to a specific recruiter email and show it as a
+    // ReplyDraft card. On send, the full thread context (to/subject/inReplyTo/
+    // threadId) goes to /email/reply/send so the reply lands in the SAME thread.
+    private suspend fun draftReplyForThread(
+        to: String,
+        subject: String,
+        originalBody: String = "",
+        inReplyTo: String = "",
+        threadId: String = "",
+        replyType: String = "generic"
+    ) {
+        if (to.isBlank()) {
+            removeProcessing()
+            isProcessing = false
+            messages.add(ChatMessage.System(
+                "\uD83D\uDCE8 I couldn't find a verified sender email for that conversation, so I can't draft a reply to it.\n" +
+                "Use the **Reply** button on an inbox message, or say **'check inbox'** to reload recruiter conversations."
+            ))
+            persistMessages()
+            return
+        }
+        try {
+            ensureProcessingCard("Drafting reply to ${to.takeBefore("@")}...")
+            updateProcessingCard(detail = "Drafting reply...")
+
             val response = withContext(Dispatchers.IO) {
                 api.draftReply(EmailReplyRequest(
-                    to = "",
-                    subject = "",
-                    body = "",
+                    to = to,
+                    subject = subject,
+                    body = originalBody,
+                    inReplyTo = inReplyTo.ifBlank { null },
                     replyType = replyType
                 ))
             }
             removeProcessing()
             isProcessing = false
 
-            if (prefs.autoReply) {
-                // Note: autoReply no longer auto-sends — HITL is mandatory. The
-                // toggle only controls whether a draft is generated up-front.
-                messages.add(ChatMessage.System("\u23F3 Generating reply draft (${replyType})..."))
-            }
-            // Interactive: show ReplyDraft card for user approval
             val replyBody = response.replyBody
+            val replySubject = response.subject.ifBlank { "Re: $subject" }
+            val draftTo = response.to.ifBlank { to }
+            val draftInReplyTo = (response.inReplyTo ?: inReplyTo).orEmpty()
+            val draftThreadId = (response.threadId ?: threadId).orEmpty()
+
             val replyDraftId = ChatMessage.nextId()
+            messages.add(ChatMessage.System(
+                "\uD83D\uDCE8 **Reply draft** for **${draftTo.takeBefore("@")}** — tap **Send** below after reviewing."
+            ))
             messages.add(ChatMessage.ReplyDraft(
                 id = replyDraftId,
-                to = "",
-                subject = "Re: Your application",
+                to = draftTo,
+                subject = replySubject,
                 body = replyBody,
                 replyType = replyType,
+                inReplyTo = draftInReplyTo,
+                threadId = draftThreadId,
                 onSend = {
                     viewModelScope.launch {
                         // No repeat sends for the same reply draft.
@@ -1155,16 +1339,21 @@ class ChatViewModel @Inject constructor(
                         sendingDraftIds.add(replyDraftId)
                         setDraftSendState(replyDraftId, sending = true, sent = false)
                         try {
+                            val sendBody = mutableMapOf(
+                                "to" to draftTo,
+                                "subject" to replySubject,
+                                "body" to replyBody
+                            )
+                            if (draftInReplyTo.isNotBlank()) sendBody["inReplyTo"] = draftInReplyTo
+                            if (draftThreadId.isNotBlank()) sendBody["threadId"] = draftThreadId
                             withContext(Dispatchers.IO) {
-                                api.sendReplyDraft(mapOf(
-                                    "to" to "",
-                                    "subject" to "Re: Your application",
-                                    "body" to replyBody
-                                ))
+                                api.sendReplyDraft(sendBody)
                             }
                             sentDraftIds.add(replyDraftId)
                             setDraftSendState(replyDraftId, sending = false, sent = true)
-                            messages.add(ChatMessage.System("\u2705 Reply sent."))
+                            messages.add(ChatMessage.System(
+                                "\u2705 **Reply sent** to **${draftTo.takeBefore("@")}** in the same conversation."
+                            ))
                         } catch (e: Exception) {
                             setDraftSendState(replyDraftId, sending = false, sent = false)
                             messages.add(ChatMessage.System("\u274C Failed to send reply."))
@@ -1183,6 +1372,9 @@ class ChatViewModel @Inject constructor(
             messages.add(ChatMessage.System("Couldn't draft a reply right now. Please try again."))
         }
     }
+
+    // Grab the local-part of an email for friendly display.
+    private fun String.takeBefore(sep: String): String = substringBefore(sep)
 
     // ── Direct apply via auto-pipeline + optional auto-send ───────────────
     private fun extractCompanyFromUrl(url: String): String {
@@ -1704,6 +1896,8 @@ class ChatViewModel @Inject constructor(
     // Confirm and execute auto-fill
     private suspend fun handleConfirmFill() {
         if (_pendingAutoFillUrl.isEmpty()) {
+            removeProcessing()
+            isProcessing = false
             messages.add(ChatMessage.System("No pending auto-fill. Paste a job URL and say 'auto-fill' first."))
             return
         }
@@ -1712,6 +1906,8 @@ class ChatViewModel @Inject constructor(
             .filter { it.required && it.field_id !in _pendingAutoFillAnswers }
             .map { it.label }
         if (unanswered.isNotEmpty()) {
+            removeProcessing()
+            isProcessing = false
             messages.add(ChatMessage.System(
                 "Please answer ${unanswered.size} more question${if (unanswered.size != 1) "s" else ""} first: " +
                 unanswered.joinToString("; ") + "."
@@ -1944,6 +2140,7 @@ class ChatViewModel @Inject constructor(
                     "\uD83D\uDCCB **Added $company to your tracker as Applied**"
                 ))
             }
+            removeAppliedFromSuggested(company)
         } catch (e: Exception) {
             messages.add(ChatMessage.System(
                 "\uD83D\uDCCB Couldn't update the tracker for $company (${e.message}). Update it from your tracker view."
@@ -2464,6 +2661,8 @@ class ChatViewModel @Inject constructor(
     fun stopProcessing() {
         activeJob?.cancel()
         activeJob = null
+        activeScanCall?.cancel()
+        activeScanCall = null
         suppressDrain = true
         removeProcessing()
         isProcessing = false

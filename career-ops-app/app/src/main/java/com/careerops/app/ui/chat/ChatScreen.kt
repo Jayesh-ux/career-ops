@@ -20,6 +20,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -30,7 +31,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import androidx.hilt.navigation.compose.hiltViewModel
+import android.content.Intent
+import android.net.Uri
 
 // One source of truth for quick actions. Playwright scraping is part of
 // scanning jobs, so it is intentionally NOT a separate action here.
@@ -301,8 +305,9 @@ fun ChatScreen(
                                  is ChatMessage.ScanResultsCard -> ScanResultsSummaryCard(message)
                                  is ChatMessage.FormQuestion -> FormQuestionCard(message)
                                  is ChatMessage.SubmitConfirmation -> SubmitConfirmationCard(message)
-                                 is ChatMessage.ManualApplyCard -> ManualApplyCard(message)
-                                 is ChatMessage.SpamConfirm -> SpamConfirmCard(message)
+                                is ChatMessage.ManualApplyCard -> ManualApplyCard(message)
+                                is ChatMessage.SpamConfirm -> SpamConfirmCard(message)
+                                is ChatMessage.InboxNotificationCard -> InboxNotificationCard(message)
                             }
                         }
                         // Live-updating streaming bubble
@@ -378,6 +383,25 @@ fun ChatScreen(
                     }
                 }
             }
+
+            // Pinned "Suggested jobs" button — re-opens every suggested job in a
+            // modal so you never have to scroll the chat back up to find one.
+            if (viewModel.suggestedJobs.isNotEmpty()) {
+                ExtendedFloatingActionButton(
+                    onClick = { viewModel.openSuggestedJobs() },
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(16.dp),
+                    icon = { Icon(Icons.Default.Search, contentDescription = null) },
+                    text = {
+                        Text(
+                            text = "Suggested (${viewModel.suggestedJobs.size})",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                )
+            }
     }
 
     // Full-screen scan results list (all found jobs, apply/discard)
@@ -390,6 +414,117 @@ fun ChatScreen(
             onApply = { viewModel.applyFromScanResults(it) },
             onDiscard = { viewModel.discardFromScanResults(it) }
         )
+    }
+
+    // Pinned "Suggested jobs" modal — every scan's jobs live here; applying to a
+    // company removes it, so the list only shows unapplied opportunities.
+    if (viewModel.suggestedJobsOverlay) {
+        val suggested = viewModel.suggestedJobs
+        Dialog(onDismissRequest = { viewModel.closeSuggestedJobs() }) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Suggested jobs",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 17.sp,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Text(
+                            text = if (suggested.isEmpty()) "none left" else "${suggested.size}",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(12.dp))
+                    if (suggested.isEmpty()) {
+                        Text(
+                            text = "No unapplied jobs left. Run another scan to find more.",
+                            fontSize = 13.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else {
+                        LazyColumn(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 420.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            items(suggested, key = { "${it.company}-${it.role}-${it.url}" }) { job ->
+                                Surface(
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Column(modifier = Modifier.padding(12.dp)) {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = job.company,
+                                                    fontWeight = FontWeight.Bold,
+                                                    fontSize = 14.sp
+                                                )
+                                                Text(
+                                                    text = job.role,
+                                                    fontSize = 12.sp,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    maxLines = 2,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                            }
+                                            if (job.score.isNotEmpty() && job.score != "N/A") {
+                                                Spacer(modifier = Modifier.width(8.dp))
+                                                Text(
+                                                    text = job.score,
+                                                    fontSize = 12.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = MaterialTheme.colorScheme.primary
+                                                )
+                                            }
+                                        }
+                                        if (job.location.isNotEmpty()) {
+                                            Spacer(modifier = Modifier.height(4.dp))
+                                            Text(
+                                                text = job.location,
+                                                fontSize = 11.sp,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                        Spacer(modifier = Modifier.height(8.dp))
+                                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            Button(
+                                                onClick = { viewModel.applyFromSuggestedJobs(job) },
+                                                modifier = Modifier.weight(1f)
+                                            ) {
+                                                Icon(Icons.Default.Check, null, modifier = Modifier.size(14.dp))
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Text("Apply", fontSize = 13.sp)
+                                            }
+                                            OpenJobUrlButton(url = job.url, modifier = Modifier.weight(1f))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(12.dp))
+                    OutlinedButton(
+                        onClick = { viewModel.closeSuggestedJobs() },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Close")
+                    }
+                }
+            }
+        }
     }
 
     // Draft editor — opened by the persistent "Edit" quick action or the
@@ -805,6 +940,7 @@ fun JobCardBubble(message: ChatMessage.JobCard) {
                     Spacer(modifier = Modifier.width(4.dp))
                     Text("Apply")
                 }
+                OpenJobUrlButton(url = message.url, modifier = Modifier.weight(1f))
                 OutlinedButton(onClick = { message.onSkip?.invoke() }, modifier = Modifier.weight(1f)) {
                     Icon(Icons.Default.Close, null, modifier = Modifier.size(16.dp))
                     Spacer(modifier = Modifier.width(4.dp))
@@ -1019,6 +1155,96 @@ fun ReplyDraftBubble(message: ChatMessage.ReplyDraft) {
                 }
             }
         )
+    }
+}
+
+// Opens a job posting URL in the system browser. Shared by the chat job card,
+// the scan results rows and the suggested-jobs modal.
+@Composable
+fun OpenJobUrlButton(url: String, modifier: Modifier = Modifier) {
+    if (url.isBlank()) return
+    val context = LocalContext.current
+    OutlinedButton(
+        onClick = {
+            runCatching {
+                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            }
+        },
+        modifier = modifier
+    ) {
+        Icon(Icons.Default.ExitToApp, null, modifier = Modifier.size(14.dp))
+        Spacer(modifier = Modifier.width(4.dp))
+        Text("Open", fontSize = 13.sp)
+    }
+}
+
+@Composable
+fun InboxNotificationCard(message: ChatMessage.InboxNotificationCard) {
+    Card(
+        modifier = Modifier.fillMaxWidth(0.92f),
+        shape = RoundedCornerShape(12.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.4f)
+        )
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.Email, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = if (message.title.isNotEmpty()) message.title else message.type,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp
+                    )
+                    if (message.date.isNotEmpty()) {
+                        Text(text = message.date, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+            Text(
+                text = message.message,
+                fontSize = 13.sp,
+                lineHeight = 18.sp
+            )
+
+            if (message.from.isNotEmpty() || message.fromEmail.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = buildString {
+                        if (message.from.isNotEmpty()) append(message.from)
+                        if (message.fromEmail.isNotEmpty()) append(if (message.from.isNotEmpty()) " <" else "<").append(message.fromEmail).append(">")
+                    },
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            if (message.subject.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(3.dp))
+                Text(
+                    text = "Re: ${message.subject}",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            if (message.onReply != null) {
+                Spacer(modifier = Modifier.height(12.dp))
+                Button(
+                    onClick = { message.onReply?.invoke() },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.AutoMirrored.Filled.Send, null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Reply")
+                }
+            }
+        }
     }
 }
 

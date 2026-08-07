@@ -9,17 +9,21 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.ExitToApp
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.careerops.app.data.model.ScanResult
+import android.content.Intent
+import android.net.Uri
 import java.net.URI
 
 private enum class ScoreFilter(val label: String, val minScore: Float?) {
@@ -336,6 +340,23 @@ private fun ScanResultRow(
                     modifier = Modifier.weight(1f)
                 ) {
                     Text("Discard", fontSize = 13.sp)
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+            if (job.url.isNotBlank()) {
+                val context = LocalContext.current
+                OutlinedButton(
+                    onClick = {
+                        runCatching {
+                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(job.url)))
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Default.ExitToApp, null, modifier = Modifier.size(14.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Open job posting", fontSize = 13.sp)
                 }
             }
         }

@@ -121,6 +121,42 @@ Every apply-completion path funnels through `ChatViewModel.markCompanyApplied()`
 Never auto-sends: the email is always shown for review first
 ([[Security & Human-in-the-loop]]).
 
+## Chat inbox flow (2026-08-07)
+
+"check inbox" now routes to **`POST /email/scan`** (the classified, cursor-based
+scan) instead of the raw unclassified `/email/inbox`:
+- `ChatViewModel.handleDirectInbox` keeps only `interview` / `offer` /
+  `recruiter_reply` notifications and renders one `InboxNotificationCard` per
+  message (type, title, body, from/from-email, subject, date).
+- Each card's **Reply** button calls `draftReplyForThread(to, subject,
+  originalBody, inReplyTo, threadId, replyType)` which POSTs to the bridge's
+  thread-aware `/email/reply` and renders a `ReplyDraft` card carrying the full
+  chain (`inReplyTo`, `threadId`). Sending goes through `/email/reply/send` with
+  `In-Reply-To`/`References` headers so the reply lands in the original thread.
+- `handleDirectReply` resolves a free-text hint (e.g. "reply to anisha") against
+  the last `InboxNotificationCard`s; if no conversation matches it says so
+  instead of failing.
+
+## Pinned suggested jobs (2026-08-07)
+
+Every scan's results are collected into `ChatViewModel.suggestedJobs`
+(deduped). A pinned **ExtendedFloatingActionButton** ("Suggested (N)") opens a
+modal (`Dialog`) listing them with **Apply** (runs `draftApplication`) and
+**Open** (opens the posting in the system browser) buttons. Applying to a
+company removes it from the list, so it only ever shows unapplied
+opportunities. `JobCardBubble` and `ScanResultRow` also gained an **Open**
+button (`OpenJobUrlButton` helper).
+
+## Scan stop is reliable (2026-08-07)
+
+The SSE scan read loop blocks on `readLine()`; a bare coroutine cancel can't
+interrupt it. `handleDirectScan` now holds `activeScanCall` (an OkHttp call)
+and `stopProcessing` calls `activeScanCall.cancel()` so the read unblocks. A
+cancelled read throws `IOException`, which the generic catch now swallows when
+`wasInterrupted` is set (the "Stopped" message was already posted). The
+`handleConfirmFill` early-returns also clear the processing card, fixing the
+stuck "processing" spinner.
+
 ## Related files
 
 - `career-ops-app/app/src/main/java/com/careerops/app/ui/navigation/Navigation.kt`
