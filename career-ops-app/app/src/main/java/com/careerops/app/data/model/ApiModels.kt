@@ -87,7 +87,16 @@ data class InboxEmail(
     val date: String = "",
     val body: String = "",
     val isSpam: Boolean = false,
-    val category: String = ""
+    val category: String = "",
+    // The bridge nests spam detection under `spam:{isSpam,spamScore,signals}` —
+    // the flat `isSpam` above is never populated by the server.
+    val spam: SpamInfo? = null
+)
+
+data class SpamInfo(
+    val isSpam: Boolean = false,
+    val spamScore: Int = 0,
+    val signals: List<String> = emptyList()
 )
 
 data class TriageResponse(
@@ -248,6 +257,32 @@ data class ScanInboxResponse(
     val backfill: Boolean = false
 )
 
+// Retrofit rejects `Map<String, Any>` as a @Body (Kotlin emits it as
+// `Map<String, ?>`, a wildcard). Every such endpoint uses a concrete request
+// class instead.
+data class ScanInboxRequest(
+    val daysBack: Int? = null,
+    val forceBackfill: Boolean? = null
+)
+
+data class SpamDeleteRequest(
+    val messageIds: List<String> = emptyList(),
+    val markAsRead: Boolean? = null
+)
+
+data class FormAnswersRequest(
+    val answers: Map<String, String> = emptyMap()
+)
+
+data class LoginSessionTapRequest(
+    val x: Int,
+    val y: Int
+)
+
+data class SeedLoginSessionRequest(
+    val cookieString: String = ""
+)
+
 data class CoverLetterRequest(
     val company: String,
     val role: String,
@@ -390,6 +425,19 @@ data class ScanResponse(
     val portalResults: List<PortalResult> = emptyList(),
     val wideningSteps: List<String> = emptyList(),
     val otherLocations: List<ScanResult> = emptyList()
+)
+
+// GET /scan/results — the last scan's job list, cached per-user on the bridge
+// server. Restored on app open (instant, no re-scan); overwritten whenever the
+// user runs a scan again.
+data class ScanResultsCacheResponse(
+    val results: List<ScanResult> = emptyList(),
+    val total: Int = 0,
+    val newFound: Int = 0,
+    val otherLocations: List<ScanResult> = emptyList(),
+    val locationExactMatch: Boolean? = null,
+    val cached: Boolean = false,
+    val savedAt: String? = null
 )
 
 data class LivenessRequest(

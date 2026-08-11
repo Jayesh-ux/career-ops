@@ -1,4 +1,8 @@
 # Personal data (user fills these)
+# Per-user runtime tree (OAuth creds, portal passwords, uploads) — never commit
+data/users/
+data/uploads/
+data/discard.log
 cv.md
 data/applications.md
 data/applications.db
@@ -119,3 +123,25 @@ career-ops-app/app/build/
 career-ops-app/build/
 career-ops-app/local.properties
 career-ops-app/app/release/
+
+# Diagnostic / dev artifacts (one-off debug scripts, screenshots, logs)
+.tmp-*.mjs
+_disable-companies.mjs
+capture-session.mjs
+debug-opencode.mjs
+diag-*.mjs
+scratch-*.mjs
+test-*.mjs
+verify-seed.mjs
+_inspect_internshala.png
+fill-latest.png
+start-bridge.log
+audit-2026-07-30.md
+dsa-plan.md
+
+# Eclipse IDE files
+career-ops-app/.project
+career-ops-app/.settings/
+career-ops-app/app/.classpath
+career-ops-app/app/.project
+career-ops-app/app/.settings/

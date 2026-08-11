@@ -16,6 +16,7 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.careerops.app.data.model.GoogleIdTokenRequest
 import com.careerops.app.data.model.OAuthExchangeRequest
+import com.careerops.app.data.model.SeedLoginSessionRequest
 import com.careerops.app.data.remote.CareerOpsApi
 import com.careerops.app.ui.chat.ChatScreen
 import com.careerops.app.ui.onboarding.ConfirmStartScreen
@@ -114,7 +115,7 @@ fun CareerOpsNavHost(
             suspend fun seedPendingCookies() {
                 val cs = pendingCookies
                 if (cs.isNotBlank()) {
-                    try { api.seedLoginSession(mapOf("cookieString" to cs)) } catch (_: Exception) { }
+                    try { api.seedLoginSession(SeedLoginSessionRequest(cookieString = cs)) } catch (_: Exception) { }
                     pendingCookies = ""
                 }
             }

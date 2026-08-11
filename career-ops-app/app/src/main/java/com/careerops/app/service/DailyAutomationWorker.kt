@@ -79,7 +79,7 @@ class DailyAutomationWorker @AssistedInject constructor(
             try {
                 // Cursor-based scan: first run backfills 90 days, then scans
                 // incrementally each day — no older opportunity is ever missed.
-                val scan = api.scanInbox(emptyMap())
+                val scan = api.scanInbox()
                 val confirmed = scan.notifications.filter {
                     it.type == "recruiter_reply" || it.type == "interview" || it.type == "offer"
                 }

@@ -1,7 +1,7 @@
 ---
 type: component
 tags: [component, backend, api]
-updated: 2026-08-07
+updated: 2026-08-11
 ---
 
 # Bridge Server
@@ -15,7 +15,8 @@ header.
 
 - Expose REST endpoints: `/health`, `/profile`, `/tracker`, `/email/*`,
   `/login/session/*`, `/login/session/seed`, `/portal/session/status`,
-  `/apply/open|fill`, `/cv`, `/resume/upload`, `/scan`, `/auto-pipeline`,
+  `/apply/open|fill`, `/cv`, `/resume/upload`, `/scan`, `/scan/results`,
+  `/auto-pipeline`,
   `/batch`, `/cv/tailor` (2026-08-03 — tailored ATS-optimized CV PDF per role).
 - `/resume/upload` (2026-08-05 fix) extracts text via **pdftotext first**, then
   a pdf-parse fallback. pdf-parse ships two shapes — v1 callable, v2
@@ -52,8 +53,13 @@ header.
   email (company careers page/contact page) and return it as `to`, falling back
   to `""` (and thus Playwright auto-fill) only if nothing verified is found.
   `runOpencode` polls the session until assistant **text** is present (a prior
-  idle-count break raced the final text after tool calls, causing
-  "opencode produced no text output").
+   idle-count break raced the final text after tool calls, causing
+   "opencode produced no text output"). **Draft timeout (2026-08-08)**: the
+   main draft's opencode budget was 180s, but the reasoning model routinely
+   takes ~3min for a grounded letter — a live apply with a JD fetch + the
+   websearch contact lookup blew past it and failed with `opencode prompt
+   timeout`. Raised the main draft to 300s and the contact-lookup pass to 120s
+   (still fits the app's 600s read timeout).
 - Own the **scan paths** (`POST /scan`, `GET /scan/stream`): keywords,
   location proximity (`buildNearbyTerms`), and the career-ops rubric scoring
   (`scoreScanResult`) are all driven by the **per-user** profile via
@@ -160,7 +166,28 @@ header.
   `DailyAutomationWorker`) mirrors the same gate against `/email/classify`.
   Note: `/email/classify` runs opencode per candidate, so the keyword
   pre-filter keeps each check bounded.
-  **Salary gate (2026-08-07)**: `/email/classify` injects the candidate's
+   **Full-listing scan rework (2026-08-11)**: a 90-day backfill of this mailbox
+   once took 2m+ (2000 full HTML bodies, ~0.7s each) and even then surfaced a
+   Jobrapido job-board alert as a recruiter reply. `scanInboxForUser`'s
+   full-listing branch is now a three-step pipeline: (1) an **ids-only** pass
+   (`listGmailIds` helper, `/email/inbox?idsOnly=true`, digest exclusions applied)
+   returns ids with no per-message GETs; (2) **metadata** (headers+snippet) is
+   fetched only for ids missing from the per-user `inbox-meta-cache.json`
+   (bounded to the newest 5000, saved after each run); (3) **full bodies** are
+   fetched only for emails whose cached verdict is a confident job_reply or that
+   pass the cheap `isPlausibleRecruiterMail(subject, preview)` pre-filter.
+   `DIGEST_SENDERS` + `DIGEST_DOMAIN_EXCLUSIONS` grew with the mailbox's real
+   noise (jobrapido, internshala, jobhai, timesjobs, shine, iimjobs, cutshort,
+   freshersworld, workindia, apna, kotak, magicbricks, consumer-app alerts);
+   google/amazon/microsoft/adobe/redhat/apple stay eligible as employers.
+   Result: a 90-day scan dropped from 2m+ to ~21s and the Jobrapido false
+   positive is gone (verified: QualityKiosk interview still surfaces).
+   **Gmail gotchas learned here**: `-from:(a b c)` (parenthesized space-list) is
+   silently ignored by Gmail — use repeated `-from:a -from:b -from:c`;
+   `resultSizeEstimate` caps at 201 so compare fetched id sets, never the
+   estimate; duplicate keys in a `URLSearchParams({...})` object literal collapse
+   (empty From/Subject headers) — use `.append()` per key.
+   **Salary gate (2026-08-07)**: `/email/classify` injects the candidate's
   `config/profile.yml` `compensation` (minimum 3 LPA, target 3-12 LPA) into its
   prompt and mandates that unpaid/free-internship / below-minimum offers classify
   as `spam`. `classifyEmailViaBridge` now sends up to 2000 chars of body. Two
@@ -204,11 +231,68 @@ header.
   fetch can't render joins Phase 3's Playwright retry carrying `_roleKw` so
   matching stays per-role. Added genuine Indian portals to `portals.yml`
   `job_boards` (Monster, TechGig, Jora, Jooble, Talent.com, Hirect, all Tier 2
-  `expand_on_rerun`) + free no-key API boards (Remotive, Arbeitnow via their
-  `providers/*`) which the `isRelevantSource` gate auto-skips for on-site
-  profiles and auto-includes for remote/hybrid ones. Per-role result cards use
-  a human-readable location label (slug → title case, e.g. `mumbai` → `Mumbai`);
-  the URL keeps the lowercase slug and location matching is case-insensitive.
+   `expand_on_rerun`) + free no-key API boards (Remotive, Arbeitnow via their
+   `providers/*`) which the `isRelevantSource` gate auto-skips for on-site
+   profiles and auto-includes for remote/hybrid ones. Per-role result cards use
+   a human-readable location label (slug → title case, e.g. `mumbai` → `Mumbai`);
+   the URL keeps the lowercase slug and location matching is case-insensitive.
+   **Employer resolution (2026-08-07, extended 2026-08-08)**: portal-sourced
+   titles embed the real employer (`Kiya.ai - Automation Engineer -
+   Python/Ansible`); the role phase, the Phase 3 Playwright retry paths (remote
+   proxy + local Chromium), **and the Phase 2 websearch loop** run titles
+   through `employerFromPortalTitle(portal, title, rolePhrases)` and
+   `stripCompanyPrefix` so the tracker/dedup record the **employer**, never the
+   portal. `rolePhrases` = the user's own `target_roles` (primary + archetypes,
+   lowercased) carried on each spec (`spec.rolePhrases`), each Playwright retry
+   entry (`_rolePhrases`), and — since 2026-08-08 — a handler-level
+   `profileRolePhrases` list for the websearch phase, with `portalNameKey()`
+   reducing location-suffixed board names (`Shine — Mumbai` → `shine`) so the
+    portal-id set keys correctly. Prefixes matching a user role or a
+    language-neutral listing marker (`jobs|job|careers|career|hiring|vacancy|
+    openings|apply|position|roles|role`) fall back to the portal name. No
+    hardcoded role/employer dictionary — detection is profile-driven, so it
+    adapts to any user.
+    **Result-count fix (2026-08-08)**: the employer heuristic above could
+    mislabel ROLE titles as the employer — `Software Development Engineer -
+    Backend Technologies` (LinkedIn) or `Technical Lead - Backend` have a
+    role prefix, not a company, so dedup's `company::role` key then collapsed
+    every distinct posting sharing that prefix (250+ results → ~45). Three
+    fixes in `bridge-server.mjs`:
+    1. `extractEmployerFromUrl()` pulls the real company slug from job URLs
+       (LinkedIn `-at-<company>-<id>`, Shine `/jobs/<slug>/<company>/<id>`,
+       Internshala `-at-<company><id>`), rendered via `slugToName`.
+    2. `employerFromPortalTitle(portal, title, rolePhrases, url)` rejects
+       role-looking dash-prefixes (`ROLE_TOKEN_RE` — developer/engineer/manager/
+       analyst/consultant/… + walk/drive/event) and falls back to the URL
+       company; a confident title prefix still wins.
+    3. Dedup is gated by `isConfidentEmployer(company)`: unknown-employer rows
+       (portal name or role-like label) dedup by **URL only** so distinct jobs
+       never vanish; `normalizeUrlForDedup()` strips LinkedIn tracking params
+       + `&amp;` so the same posting viewed N times isn't counted N times.
+       Applied in both the final pass and the live `results` snapshots.
+    Verified: a live 12-role run returned **535 results** (raw 1468,
+    duplicatesSkipped 302, excludedApplied 35), 7/535 role/portal-ish labels —
+    and those are real companies (`R3 Consultant`, `Cutshort`).
+    **Live results streaming (2026-08-08)**: `GET /scan/stream` now emits
+   `results` SSE events (~every 3s) while the scan runs, not only at `done`.
+   Each snapshot applies the same profile-driven gates as the final pass —
+   `isTrackerExcluded` (which since 2026-08-08 also excludes **`discarded`**
+   status), the salary floor, senior-level drop, and URL/company+role dedup.
+    The interval is declared at handler scope so the outer catch clears it too;
+    `done`/`error` stop the timer. The Android app merges each `results` event
+    into its pinned suggested-jobs list in realtime.
+    **Per-user scan-results cache (2026-08-11)**: the final job list of every
+    scan (`POST /scan` and `GET /scan/stream` `done`) is persisted per-user to
+    `data/users/<email>/data/scan-results-cache.json` (`saveScanResultsCache`),
+    and **`GET /scan/results`** returns it instantly
+    (`{cached:true, savedAt, results, otherLocations, total, newFound, ...}`) or
+    an empty `cached:false` payload. The app restores the pinned suggested-jobs
+    list from this server cache on open; re-running a scan overwrites the cache
+    with the latest results ("scan again" = update the list). An empty result
+    set (e.g. every portal errored) never overwrites an existing cache, so a
+    flaky scan can't wipe a good list. `POST /email/scan`
+    logs `[email/scan] start/done/error` (userId, daysBack, count, scanned,
+    elapsed ms) for diagnosing app-side "check inbox" failures.
 - Own **thread-aware recruiter replies** (`POST /email/reply` + `/email/reply/send`,
   2026-08-07 rewrite): `/email/reply` accepts `to`/`subject`/`originalBody`/`body`
   plus `inReplyTo`/`messageId`/`threadId` and returns
@@ -217,6 +301,26 @@ header.
   (follow-up drafts are allowed); sending still requires `to`. `/email/reply/send`
   adds `In-Reply-To` + `References` headers and forwards `threadId` in the Gmail
   REST send body so replies land inside the original conversation.
+- Own **spam deletion** (`POST /email/spam/delete`, HITL): OAuth users go through
+  Gmail REST, app-password users through IMAP. The OAuth path resolves the
+  selected `messageIds` (Gmail ids pass through; sequential ids from
+  `/email/inbox` map via a fresh `fetchGmailInboxREST` pass), optionally clears
+  UNREAD via `messages.modify`, then moves each message to the **Trash** with
+  `POST /messages/{id}/trash`. This changed 2026-08-11: `users.messages.delete`
+  (permanent purge) requires the `https://mail.google.com/` scope, which the
+  app's OAuth token (gmail.readonly/modify/send only) does **not** grant — live
+  testing returned `403 PERMISSION_DENIED` ("insufficient authentication
+  scopes") on DELETE, so the endpoint now **trashes** instead of purging
+  (recoverable, needs only `gmail.modify`). Permanent deletion would require the
+  user to re-consent OAuth with the full `mail.google.com/` scope.
+  **Base36 id fix (2026-08-11)**: Gmail REST message ids are 16-char base36
+  strings (e.g. `19fefbb10e4a9738`), not purely numeric. The original
+  `isGmailId` regex (`/^\d{15,19}$/`) sent the app's base36 gmailIds into the
+  sequential-id resolution map, every lookup missed, and `/email/spam/delete`
+  returned `deleted:0` with a silent `!gmailId` skip (no log). Now `isGmailId`
+  is `/^[0-9a-zA-Z]{15,19}$/` and the resolution map is keyed by every
+  identifier the app could send (sequential `id`/`uid` AND base36 `gmailId`) so
+  resolution cannot miss. Verified live: 15/15 spam moved to Trash.
 
 ## Design notes
 

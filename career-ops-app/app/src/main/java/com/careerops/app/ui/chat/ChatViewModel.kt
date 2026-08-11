@@ -186,6 +186,31 @@ sealed class ChatMessage {
         val onMarkApplied: (() -> Unit)? = null
     ) : ChatMessage()
 
+    // One recruiter phone + its own ready-to-open wa.me link. A posting can
+    // expose several phones, so each number gets its own target — a single
+    // bad/concatenated value can never corrupt the whole draft.
+    data class WhatsAppTarget(
+        val label: String = "",
+        val digits: String = "",
+        val link: String = ""
+    )
+
+    // Fallback when the posting has no contact email but the recruiter's
+    // phone was found — the drafted letter is sent straight to WhatsApp
+    // via a wa.me link with a prefilled message, so the user can apply
+    // without the assistant being present.
+    data class WhatsAppApply(
+        override val id: Long = nextId(),
+        val company: String = "",
+        val role: String = "",
+        val url: String = "",
+        val phone: String = "",
+        val waTargets: List<WhatsAppTarget> = emptyList(),
+        val waLink: String = "",
+        val message: String = "",
+        val onMarkApplied: (() -> Unit)? = null
+    ) : ChatMessage()
+
     data class SpamConfirm(
         override val id: Long = nextId(),
         val count: Int = 0,
@@ -351,7 +376,11 @@ class ChatViewModel @Inject constructor(
     private var scanResultsSummary: String = ""
     fun openScanResults(summary: String, results: List<ScanResult>) {
         scanResultsSummary = summary
-        scanResultsOverlay = results
+        // Render the list live: drop any job that has since been applied to or
+        // discarded (removed from suggestedJobs), so re-opening the full-screen
+        // list from an old chat card never resurrects a company you already
+        // applied to — no duplicate applications.
+        scanResultsOverlay = results.filter { job -> suggestedJobs.any { isSameListing(it, job) } }
     }
     fun closeScanResults() { scanResultsOverlay = null }
     fun scanResultsOverlaySummary(): String = scanResultsSummary
@@ -364,16 +393,72 @@ class ChatViewModel @Inject constructor(
         private set
     var suggestedJobsOverlay: Boolean by mutableStateOf(false)
         private set
+    // True once the first scan produces results — keeps the pinned
+    // "Suggested jobs" button visible permanently (even when the list is
+    // empty), so the job list never "goes away" into the chat history.
+    var hasScannedOnce: Boolean by mutableStateOf(false)
+        private set
     fun openSuggestedJobs() { suggestedJobsOverlay = true }
     fun closeSuggestedJobs() { suggestedJobsOverlay = false }
     fun applyFromSuggestedJobs(job: ScanResult) {
         suggestedJobsOverlay = false
         viewModelScope.launch { draftApplication(job.company, job.role, job.url) }
     }
-    fun removeAppliedFromSuggested(company: String) {
-        if (company.isBlank()) return
-        suggestedJobs = suggestedJobs.filterNot { it.company.equals(company, ignoreCase = true) }
+    // Fuzzy identity: two listings are "the same job" if their normalized
+    // company names match (e.g. "Sanket Rathod Collectives" vs
+    // "Sanket Rathod Collectives Pvt. Ltd.") or their URLs match ignoring a
+    // trailing slash. Used so applied/discarded jobs never reappear even when
+    // the tracked name or URL string differs from the listing's.
+    // Fuzzy identity: two listings are "the same opening" if their URLs match
+    // (ignoring a trailing slash) OR their normalized company AND role both
+    // match. A different role at the same company is a SEPARATE job and stays
+    // visible/applyable — applying to "Senior Developer" at a company must not
+    // hide that company's "DevOps Engineer" opening.
+    private fun isSameListing(a: ScanResult, b: ScanResult): Boolean {
+        val urlMatches = a.url.isNotBlank() && b.url.isNotBlank() &&
+            a.url.trim().trimEnd('/').equals(b.url.trim().trimEnd('/'), ignoreCase = true)
+        if (urlMatches) return true
+        val companyMatches = normalizeCompanyName(a.company).isNotEmpty() &&
+            normalizeCompanyName(a.company) == normalizeCompanyName(b.company)
+        val roleMatches = normalizeRoleName(a.role).isNotEmpty() &&
+            normalizeRoleName(a.role) == normalizeRoleName(b.role)
+        return companyMatches && roleMatches
+    }
+    private fun normalizeCompanyName(name: String): String =
+        name.lowercase().filter { it.isLetterOrDigit() }
+    private fun normalizeRoleName(role: String): String =
+        role.lowercase().filter { it.isLetterOrDigit() }
+
+    fun removeAppliedFromSuggested(company: String, role: String = "", jobUrl: String = "") {
+        if (company.isBlank() && jobUrl.isBlank()) return
+        val target = ScanResult(company = company, role = role, url = jobUrl)
+        // Remove only the exact opening that was applied to/discarded (by URL,
+        // or by company+role). Other roles at the same company stay listed.
+        suggestedJobs = suggestedJobs.filterNot { job -> isSameListing(target, job) }
         persistSuggestedJobs()
+    }
+
+    // Drop any suggested job whose EXACT opening (company AND role) is already
+    // in the tracker with an active status (Applied/Responded/Interview/Offer/
+    // Discarded). Keeps the pinned list truthful even for entries restored from
+    // a previous session or merged before a job was applied/discarded — while
+    // leaving a company's other, unapplied roles visible.
+    private suspend fun filterSuggestedAgainstTracker() {
+        if (suggestedJobs.isEmpty()) return
+        try {
+            val tracker = withContext(Dispatchers.IO) { api.getTracker() }
+            val blocked = tracker.applications
+                .filter { it.status in setOf("Applied", "Interview", "Offer", "Responded", "Discarded") }
+                .map { Pair(normalizeCompanyName(it.company), normalizeRoleName(it.role)) }
+                .filter { it.first.isNotEmpty() && it.second.isNotEmpty() }
+                .toSet()
+            if (blocked.isEmpty()) return
+            val before = suggestedJobs.size
+            suggestedJobs = suggestedJobs.filterNot { job ->
+                blocked.contains(Pair(normalizeCompanyName(job.company), normalizeRoleName(job.role)))
+            }
+            if (suggestedJobs.size != before) persistSuggestedJobs()
+        } catch (_: Exception) {}
     }
 
     // Persist the pinned suggested-jobs list to disk so it survives app
@@ -418,12 +503,34 @@ class ChatViewModel @Inject constructor(
             suggestedJobs = restored.distinctBy { it.url.ifBlank { "${it.company}::${it.role}" } }
         } catch (_: Exception) {}
     }
+
+    // The bridge server is the source of truth for the last scan's job list —
+    // it caches the final results per-user (scan-results-cache.json). Restore
+    // from there on open: instant, no re-scan, and the list only changes when
+    // the user runs a scan again (which overwrites the server cache). The local
+    // suggested_jobs.json restore above stays as a fallback for offline opens.
+    private suspend fun restoreSuggestedJobsFromServer() {
+        try {
+            val cached = withContext(Dispatchers.IO) { api.getCachedScanResults() }
+            if (!cached.cached) return
+            if (cached.results.isNotEmpty()) {
+                suggestedJobs = cached.results
+                    .distinctBy { it.url.ifBlank { "${it.company}::${it.role}" } }
+                hasScannedOnce = true
+                persistSuggestedJobs()
+            }
+            filterSuggestedAgainstTracker()
+        } catch (_: Exception) {}
+    }
     fun applyFromScanResults(job: ScanResult) {
         // Close the overlay so the draft steps are visible in the chat below.
         scanResultsOverlay = null
         viewModelScope.launch { draftApplication(job.company, job.role, job.url) }
     }
     fun discardFromScanResults(job: ScanResult) {
+        // Remove the discarded job from the pinned list (by URL + company) so
+        // it disappears immediately — the same removal used after applying.
+        removeAppliedFromSuggested(job.company, job.role, job.url)
         messages.add(ChatMessage.System("Discarded: ${job.company} — ${job.role}"))
         persistMessages()
     }
@@ -456,6 +563,16 @@ class ChatViewModel @Inject constructor(
 
         // Restore the pinned suggested-jobs list so it survives restarts.
         restoreSuggestedJobs()
+        if (suggestedJobs.isNotEmpty()) hasScannedOnce = true
+
+        // Restore the server-side per-user scan cache (last scan's job list).
+        // Overrides the local restore above so the pinned list always reflects
+        // the most recent scan, then re-filters against the tracker.
+        viewModelScope.launch { restoreSuggestedJobsFromServer() }
+
+        // Re-filter the restored list against the tracker (applied/discarded
+        // companies must not linger from a previous session).
+        viewModelScope.launch { filterSuggestedAgainstTracker() }
 
         debugLog.add(DebugEntry("init", "ViewModel created, session: none"))
 
@@ -486,12 +603,17 @@ class ChatViewModel @Inject constructor(
         inboxPollJob = viewModelScope.launch {
             while (true) {
                 kotlinx.coroutines.delay(30_000) // every 30s
+                // Keep the pinned suggested-jobs list truthful: re-drop any
+                // company that entered the tracker since the last refresh
+                // (Applied/Responded/Interview/Offer/Discarded) even when the
+                // application was submitted from another client.
+                filterSuggestedAgainstTracker()
                 if (prefs.userEmail.isEmpty()) continue
                 try {
                     // Cursor-based scan: first run backfills 90 days, then scans
                     // incrementally — no older opportunity is ever missed, and
                     // already-classified mail is not re-processed.
-                    val scan = api.scanInbox(emptyMap())
+                    val scan = api.scanInbox()
                     for (n in scan.notifications) {
                         if (n.type != "recruiter_reply" && n.type != "interview" && n.type != "offer") continue
                         val alreadyNotified = messages.any { msg ->
@@ -697,12 +819,15 @@ class ChatViewModel @Inject constructor(
             activeJob = viewModelScope.launch { handleDirectScan() }
             return
         }
-        if (lower.contains("inbox") || lower.contains("check email") || lower.contains("any reply") || lower.contains("any recruiter")) {
-            activeJob = viewModelScope.launch { handleDirectInbox() }
-            return
-        }
+        // Spam intent first — "clean spam from my inbox" / "clean inbox" /
+        // "delete spam" all contain "inbox", which must not route to the
+        // recruiter-reply scan below.
         if (lower.contains("spam") || lower.contains("clean inbox") || lower.contains("delete spam")) {
             activeJob = viewModelScope.launch { handleDirectSpam() }
+            return
+        }
+        if (lower.contains("inbox") || lower.contains("check email") || lower.contains("any reply") || lower.contains("any recruiter")) {
+            activeJob = viewModelScope.launch { handleDirectInbox() }
             return
         }
         if ((lower.startsWith("reply") || lower.startsWith("respond")) && !lower.contains("http")) {
@@ -886,6 +1011,36 @@ class ChatViewModel @Inject constructor(
                                                 )
                                             }
                                         }
+                                        "results" -> {
+                                            // Live results during the scan — merge into the
+                                            // pinned suggested-jobs list so the FAB count and
+                                            // the open modal update in realtime, no need to
+                                            // wait for `done`. Server already excluded tracker
+                                            // (applied/responded/interview/offer/discarded)
+                                            // and below-minimum-salary jobs.
+                                            val resultsArr = json.optJSONArray("results") ?: JSONArray()
+                                            val jobs = mutableListOf<ScanResult>()
+                                            for (i in 0 until resultsArr.length()) {
+                                                val j = resultsArr.getJSONObject(i)
+                                                jobs.add(ScanResult(
+                                                    company = j.optString("company", ""),
+                                                    role = j.optString("role", ""),
+                                                    url = j.optString("url", ""),
+                                                    location = j.optString("location", ""),
+                                                    salary = j.optString("salary", ""),
+                                                    score = j.optString("score", ""),
+                                                    fit = j.optString("fit", "")
+                                                ))
+                                            }
+                                            if (jobs.isNotEmpty()) {
+                                                withContext(Dispatchers.Main) {
+                                                    hasScannedOnce = true
+                                                    suggestedJobs = (suggestedJobs + jobs)
+                                                        .distinctBy { it.url.ifBlank { "${it.company}::${it.role}" } }
+                                                    persistSuggestedJobs()
+                                                }
+                                            }
+                                        }
                                         "done" -> {
                                             val resultsArr = json.optJSONArray("results") ?: JSONArray()
                                             val jobs = mutableListOf<ScanResult>()
@@ -967,15 +1122,24 @@ class ChatViewModel @Inject constructor(
                 if (finalResults != null) {
                     val r = finalResults!!
 
-                    // Collect into the pinned suggested-jobs list (auto-updates
-                    // as companies get applied). Persist immediately — not just
-                    // via the 500ms debounce — so the results survive the app
-                    // being killed from Recents right after a scan.
+                    // The pinned "View Jobs (N)" list mirrors the LAST scan's
+                    // results — REPLACE, don't merge. During the scan the live
+                    // `results` events merged progressive snapshots onto the old
+                    // list; the final `done` payload is the authoritative set,
+                    // so the FAB count, the JobsScreen header, the chat message
+                    // and the card all show the same number after it lands.
                     if (r.results.isNotEmpty()) {
-                        suggestedJobs = (suggestedJobs + r.results)
+                        hasScannedOnce = true
+                        suggestedJobs = r.results
                             .distinctBy { it.url.ifBlank { "${it.company}::${it.role}" } }
                         persistSuggestedJobs()
                     }
+
+                    // Belt-and-suspenders: drop any restored/stale entry whose
+                    // company is already in the tracker (applied/responded/
+                    // interview/offer/discarded), then surface the pinned list
+                    // right away — no scrolling the chat to find it.
+                    viewModelScope.launch { filterSuggestedAgainstTracker() }
 
                     // Show widening steps (honest match report)
                     if (r.wideningSteps.isNotEmpty()) {
@@ -991,7 +1155,7 @@ class ChatViewModel @Inject constructor(
                             summary = "Found ${r.results.size} jobs matching your profile",
                             scanned = r.total,
                             results = r.results,
-                            onViewAll = { openScanResults("${r.results.size} jobs for $rolesStr", r.results) }
+                            onViewAll = { openSuggestedJobs() }
                         ))
                     } else {
                         messages.add(ChatMessage.System("No matching jobs found right now. I'll re-check on the next scheduled scan."))
@@ -1104,7 +1268,11 @@ class ChatViewModel @Inject constructor(
                 return
             }
             val response = withContext(Dispatchers.IO) {
-                api.scanInbox(emptyMap())
+                // Explicit 90-day window: the server re-lists EVERY recruiter
+                // reply from the last 90 days (cache + fast heuristic, no slow
+                // model calls), so no recruiter conversation is ever missed.
+                // The background poll keeps scanning incrementally (new only).
+                api.scanInbox(ScanInboxRequest(daysBack = 90))
             }
             removeProcessing()
             isProcessing = false
@@ -1115,7 +1283,7 @@ class ChatViewModel @Inject constructor(
 
             if (relevant.isEmpty()) {
                 messages.add(ChatMessage.System(
-                    "**Inbox:** No recruiter replies, interviews, or offers found (${response.scanned} emails scanned). " +
+                    "**Inbox (90 days):** No recruiter replies, interviews, or offers found (${response.scanned} emails scanned). " +
                     "I'll keep watching for new opportunities."
                 ))
                 persistMessages()
@@ -1123,7 +1291,7 @@ class ChatViewModel @Inject constructor(
             }
 
             messages.add(ChatMessage.System(
-                "**Inbox:** ${relevant.size} recruiter message${if (relevant.size != 1) "s" else ""} found (${response.scanned} emails scanned). " +
+                "**Inbox (90 days):** ${relevant.size} recruiter message${if (relevant.size != 1) "s" else ""} found (${response.scanned} emails scanned). " +
                 "Tap **Reply** on any conversation to draft a reply to that specific recruiter."
             ))
 
@@ -1179,7 +1347,8 @@ class ChatViewModel @Inject constructor(
         } catch (e: Exception) {
             removeProcessing()
             isProcessing = false
-            messages.add(ChatMessage.System("Couldn't check your inbox right now. Please try again."))
+            val reason = e.message?.takeIf { it.isNotBlank() }?.let { "\n($it)" } ?: ""
+            messages.add(ChatMessage.System("Couldn't check your inbox right now. Please try again.$reason"))
         }
     }
 
@@ -1199,7 +1368,7 @@ class ChatViewModel @Inject constructor(
             val inbox = withContext(Dispatchers.IO) {
                 api.getInbox(email = email, daysBack = 14, maxEmails = 50, includeSpam = true)
             }
-            val spamEmails = inbox.emails.filter { it.isSpam }
+            val spamEmails = inbox.emails.filter { it.spam?.isSpam == true }
             val spamIds = spamEmails.mapNotNull {
                 it.gmailId.ifEmpty { it.uid.ifEmpty { it.id } }.takeIf { id -> id.isNotEmpty() && id != "0" }
             }
@@ -1237,7 +1406,8 @@ class ChatViewModel @Inject constructor(
         } catch (e: Exception) {
             removeProcessing()
             isProcessing = false
-            messages.add(ChatMessage.System("Couldn't check your inbox right now. Please try again."))
+            val reason = e.message?.takeIf { it.isNotBlank() }?.let { "\n($it)" } ?: ""
+            messages.add(ChatMessage.System("Couldn't clean your inbox right now. Please try again.$reason"))
         }
     }
 
@@ -1257,7 +1427,7 @@ class ChatViewModel @Inject constructor(
         }
         try {
             val response = withContext(Dispatchers.IO) {
-                api.deleteSpam(mapOf("messageIds" to ids, "markAsRead" to true))
+                api.deleteSpam(SpamDeleteRequest(messageIds = ids, markAsRead = true))
             }
             val deletedCount = (response["deleted"] as? Number)?.toInt() ?: ids.size
             messages.add(ChatMessage.System("Deleted $deletedCount spam email${if (deletedCount == 1) "" else "s"}."))
@@ -1480,7 +1650,7 @@ class ChatViewModel @Inject constructor(
 
             // Step 2: Check tracker for duplicates
             val tracker = withContext(Dispatchers.IO) { api.getTracker() }
-            if (isSpammed(company, tracker.applications)) {
+            if (isSpammed(company, role, tracker.applications)) {
                 messages.add(ChatMessage.Evaluation(
                     company = company, role = role, score = scoreLabel,
                     summary = "Fit: ${evalResponse.fit}\nStrengths: ${evalResponse.strengths.joinToString(", ")}\nGaps: ${evalResponse.gaps.joinToString(", ")}",
@@ -1580,6 +1750,7 @@ class ChatViewModel @Inject constructor(
                         }
                     } } else null,
                     onDiscard = {
+                        removeAppliedFromSuggested(r.company.orEmpty(), r.role.orEmpty(), r.url.orEmpty())
                         messages.add(ChatMessage.System("Discarded: ${r.company} — ${r.role}"))
                         persistMessages()
                     }
@@ -1927,7 +2098,7 @@ class ChatViewModel @Inject constructor(
             viewModelScope.launch {
                 try {
                     withContext(Dispatchers.IO) {
-                        api.saveFormAnswers(mapOf("answers" to mapOf(q.category to trimmed)))
+                        api.saveFormAnswers(FormAnswersRequest(answers = mapOf(q.category to trimmed)))
                     }
                 } catch (_: Exception) {}
             }
@@ -2104,7 +2275,7 @@ class ChatViewModel @Inject constructor(
                     "${fillResponse.filled.size} fields filled$cvLine\n" +
                     "I'll watch your inbox and track their reply."
                 ))
-                markCompanyApplied(company, role, notes = "Submitted via auto-fill ($url)")
+                markCompanyApplied(company, role, notes = "Submitted via auto-fill ($url)", jobUrl = url)
             } else if (submitState?.clicked == true && submitState.validationErrors.isNotEmpty()) {
                 // Form was submitted but validation blocked it — safe, nothing was sent
                 val errorList = submitState.validationErrors.joinToString("\n") { "• $it" }
@@ -2155,31 +2326,36 @@ class ChatViewModel @Inject constructor(
         }
     }
 
-    // Find the most recent tracker entry for a company (case-insensitive).
-    private suspend fun findTrackerId(company: String): String? {
+    // Find the most recent tracker entry for a company AND role (both
+    // case-insensitive). Role-aware so applying to a different role at the same
+    // company adds its own row instead of overwriting another role's row.
+    private suspend fun findTrackerId(company: String, role: String = ""): String? {
         return try {
             val resp = withContext(Dispatchers.IO) { api.getTracker() }
             resp.applications
                 .filter { it.company.equals(company, ignoreCase = true) }
+                .filter { role.isBlank() || it.role.equals(role, ignoreCase = true) }
                 .maxByOrNull { it.id.toIntOrNull() ?: 0 }
                 ?.id
         } catch (_: Exception) { null }
     }
 
     // Mark a company as Applied in the tracker. If a tracker entry already
-    // exists for the company (case-insensitive) its status is updated to
-    // Applied; otherwise a new entry is added as Applied. Every apply path
-    // (email send, auto-fill submit, manual apply) funnels through here so the
-    // tracker always reflects what was actually done — no duplicate rows, no
-    // stale "Evaluated" entries left behind.
+    // exists for the exact company+role its status is updated to Applied;
+    // otherwise a new entry is added as Applied (so a second role at the same
+    // company gets its own truthful row). Every apply path (email send,
+    // auto-fill submit, manual apply) funnels through here so the tracker
+    // always reflects what was actually done — no stale "Evaluated" entries
+    // left behind, and different roles at one company stay distinct.
     private suspend fun markCompanyApplied(
         company: String,
         role: String = "",
         contactEmail: String = "",
-        notes: String = ""
+        notes: String = "",
+        jobUrl: String = ""
     ) {
         try {
-            val existingId = findTrackerId(company)
+            val existingId = findTrackerId(company, role)
             if (existingId != null) {
                 withContext(Dispatchers.IO) {
                     api.updateStatus(existingId, mapOf("status" to ApplicationStatus.APPLIED.name))
@@ -2200,7 +2376,7 @@ class ChatViewModel @Inject constructor(
                     "\uD83D\uDCCB **Added $company to your tracker as Applied**"
                 ))
             }
-            removeAppliedFromSuggested(company)
+            removeAppliedFromSuggested(company, role, jobUrl)
         } catch (e: Exception) {
             messages.add(ChatMessage.System(
                 "\uD83D\uDCCB Couldn't update the tracker for $company (${e.message}). Update it from your tracker view."
@@ -2210,7 +2386,7 @@ class ChatViewModel @Inject constructor(
 
     // Called from the ManualApplyCard's "I applied manually" button.
     private suspend fun handleMarkApplied(company: String, url: String, role: String = "") {
-        markCompanyApplied(company, role, notes = "Marked applied manually — $url")
+        markCompanyApplied(company, role, notes = "Marked applied manually — $url", jobUrl = url)
     }
 
     // ── Direct follow-up via POST /followup/draft ──────────────────────────
@@ -3169,10 +3345,17 @@ class ChatViewModel @Inject constructor(
         return result
     }
 
-    private fun isSpammed(company: String, entries: List<TrackerEntry>): Boolean {
-        val cLower = company.lowercase()
+    // Anti-duplicate gate: blocks only the EXACT opening (company AND role)
+    // already in the tracker with an active status. A different role at the
+    // same company is a separate job and remains applyable.
+    private fun isSpammed(company: String, role: String, entries: List<TrackerEntry>): Boolean {
+        val cNorm = normalizeCompanyName(company)
+        val rNorm = normalizeRoleName(role)
+        if (cNorm.isEmpty() || rNorm.isEmpty()) return false
         return entries.any { e ->
-            e.company.lowercase() == cLower && e.status in setOf("Applied", "Interview", "Offer", "Responded")
+            normalizeCompanyName(e.company) == cNorm &&
+                normalizeRoleName(e.role) == rNorm &&
+                e.status in setOf("Applied", "Interview", "Offer", "Responded", "Discarded")
         }
     }
 
@@ -3186,7 +3369,7 @@ class ChatViewModel @Inject constructor(
             // Step 1: Check tracker for duplicates (anti-spam)
             updateProcessingCard(detail = "Checking tracker for $company...")
             val tracker = withContext(Dispatchers.IO) { api.getTracker() }
-            if (isSpammed(company, tracker.applications)) {
+            if (isSpammed(company, role, tracker.applications)) {
                 removeProcessing(); isProcessing = false
                 messages.add(ChatMessage.System(
                     "\u26A0\uFE0F Already applied to **$company** \u2014 skipping to avoid duplicate."
@@ -3208,18 +3391,60 @@ class ChatViewModel @Inject constructor(
 
             if (response.body.isNotEmpty()) {
                 if (response.to.isBlank()) {
-                    val phoneHint = if (response.phone.isNotBlank()) {
-                        "\n\uD83D\uDCDE **Recruiter contact found:** ${response.phone} — call/WhatsApp them directly to apply manually."
-                    } else ""
-                    if (url.isNotBlank()) {
+                    if (response.phone.isNotBlank()) {
+                        // No contact email, but the recruiter's phone is on the
+                        // posting — send the drafted letter straight to WhatsApp.
+                        // A posting can list several phones, so each one becomes
+                        // its own one-tap target (never concatenated into one
+                        // invalid number); the message is pre-typed for each.
+                        val targets = splitPhones(response.phone)
+                            .map { num ->
+                                val digits = normalizeWhatsAppNumber(num)
+                                ChatMessage.WhatsAppTarget(
+                                    label = num.trim(),
+                                    digits = digits,
+                                    link = if (digits.isNotEmpty()) buildWhatsAppLink(digits, response.body) else ""
+                                )
+                            }
+                            .filter { it.digits.isNotEmpty() }
+                        if (targets.isNotEmpty()) {
+                            messages.add(ChatMessage.System(
+                                "\uD83D\uDCF1 **Draft ready** for **$company** \u2014 **$role**, but no contact email was found on the posting page.\n" +
+                                "Recruiter phone found: **${response.phone}** \u2014 I've prepared a WhatsApp application you can send with one tap."
+                            ))
+                            messages.add(ChatMessage.WhatsAppApply(
+                                company = company,
+                                role = role,
+                                url = url,
+                                phone = response.phone,
+                                waTargets = targets,
+                                waLink = targets.first().link,
+                                message = response.body,
+                                onMarkApplied = {
+                                    viewModelScope.launch { handleMarkApplied(company, url, role) }
+                                }
+                            ))
+                        } else if (url.isNotBlank()) {
+                            messages.add(ChatMessage.System(
+                                "\u26A0\uFE0F **Draft ready** for **$company** \u2014 **$role**, but no contact email was found and the recruiter phone could not be parsed.\n" +
+                                "I'll try auto-filling the application form on the job page instead."
+                            ))
+                            startAutoFill(url, company, role)
+                        } else {
+                            messages.add(ChatMessage.System(
+                                "\u26A0\uFE0F **Draft ready** for **$company** \u2014 **$role**, but no contact email was found.\n" +
+                                "Apply via the portal directly, or paste a URL with the contact details and I'll draft again."
+                            ))
+                        }
+                    } else if (url.isNotBlank()) {
                         messages.add(ChatMessage.System(
-                            "\u26A0\uFE0F **Draft ready** for **$company** \u2014 **$role**, but no contact email was found on the posting page.$phoneHint\n" +
+                            "\u26A0\uFE0F **Draft ready** for **$company** \u2014 **$role**, but no contact email was found on the posting page.\n" +
                             "I'll try auto-filling the application form on the job page instead."
                         ))
                         startAutoFill(url, company, role)
                     } else {
                         messages.add(ChatMessage.System(
-                            "\u26A0\uFE0F **Draft ready** for **$company** \u2014 **$role**, but no contact email was found.$phoneHint\n" +
+                            "\u26A0\uFE0F **Draft ready** for **$company** \u2014 **$role**, but no contact email was found.\n" +
                             "Apply via the portal directly, or paste a URL with the contact details and I'll draft again."
                         ))
                     }
@@ -3252,6 +3477,36 @@ class ChatViewModel @Inject constructor(
         }
         persistMessages()
     }
+
+    // Build a wa.me deep link from a recruiter phone + prefilled message.
+    // Portal phone numbers are usually local (10-digit Indian mobiles), but
+    // wa.me requires the full international number, so strip separators and
+    // prepend the IN country code for bare 10-digit numbers.
+    private fun buildWhatsAppLink(phone: String, message: String): String {
+        val digits = normalizeWhatsAppNumber(phone)
+        if (digits.isEmpty()) return ""
+        val encoded = java.net.URLEncoder.encode(message, "UTF-8")
+        return "https://wa.me/$digits?text=$encoded"
+    }
+
+    // Normalize one recruiter phone to the digits wa.me expects: strip all
+    // non-digits, drop a leading 0 from 11-digit local numbers, prepend the
+    // IN country code to bare 10-digit mobiles, and reject anything outside
+    // E.164 length so a bad value yields no link instead of a broken one.
+    private fun normalizeWhatsAppNumber(raw: String): String {
+        var digits = raw.replace(Regex("[^\\d]"), "")
+        if (digits.length == 11 && digits.startsWith("0")) digits = digits.substring(1)
+        if (digits.length == 10) digits = "91$digits"
+        return if (digits.length in 10..15) digits else ""
+    }
+
+    // A posting can expose several recruiter phones (comma/semicolon/newline
+    // separated). Split into individual numbers — each gets its own wa.me
+    // link so one malformed entry never breaks the others.
+    private fun splitPhones(raw: String): List<String> =
+        raw.split(Regex("[,\\n;&]+"))
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
 
     private suspend fun sendEmail(draftId: Long?, to: String, subject: String, body: String, company: String, role: String) {
         // No repeat sends: ignore taps while a send is in flight or already done.

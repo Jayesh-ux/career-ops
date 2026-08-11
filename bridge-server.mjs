@@ -2097,7 +2097,38 @@ function extractGmailBody(msg) {
   return parts.join('\n\n');
 }
 
-async function fetchGmailInboxREST(email, userId, { daysBack = 30, maxEmails = 50, query, ids } = {}) {
+async function listGmailIds(email, userId, { daysBack = 30, maxEmails = 50, query, excludeDigest = false } = {}) {
+  const accessToken = await resolveGmailAccessToken(userId, email);
+  const headers = { Authorization: `Bearer ${accessToken}` };
+  let q = query || `in:inbox newer_than:${Math.max(daysBack, 1)}d`;
+  // Job-board / digest senders dominate inbox volume but are never recruiter
+  // replies. Excluding them at the Gmail query level keeps scans fast and
+  // focused — the body-fetch loop below is the expensive part, and real
+  // recruiters never mail from these domains. Repeated `-from:term` operators
+  // (NOT a parenthesized space-list — Gmail silently ignores that form).
+  if (excludeDigest && !query) {
+    q += ' ' + DIGEST_DOMAIN_EXCLUSIONS.map(t => `-from:${t}`).join(' ');
+  }
+  const cap = Math.min(Math.max(maxEmails, 1), 5000);
+  const ids = [];
+  let pageToken = null;
+  while (ids.length < cap) {
+    const params = new URLSearchParams({ q, maxResults: String(Math.min(500, cap - ids.length)) });
+    if (pageToken) params.set('pageToken', pageToken);
+    const listResp = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?${params.toString()}`, { headers });
+    if (!listResp.ok) {
+      const errText = await listResp.text().catch(() => '');
+      throw new Error(`Gmail API list failed: ${listResp.status} ${errText.slice(0, 200)}`);
+    }
+    const listData = await listResp.json();
+    ids.push(...(listData.messages || []).map(m => m.id));
+    pageToken = listData.nextPageToken || null;
+    if (!pageToken || (listData.messages || []).length === 0) break;
+  }
+  return ids;
+}
+
+async function fetchGmailInboxREST(email, userId, { daysBack = 30, maxEmails = 50, query, ids, metadataOnly = false, excludeDigest = false } = {}) {
   const accessToken = await resolveGmailAccessToken(userId, email);
   const headers = { Authorization: `Bearer ${accessToken}` };
 
@@ -2110,23 +2141,7 @@ async function fetchGmailInboxREST(email, userId, { daysBack = 30, maxEmails = 5
     // Gmail lists newest-first and pages via nextPageToken. Collect across pages
     // up to a 5000-message cap so wide backfills (~90 days of heavy inbox volume)
     // don't silently drop older recruiter outreach.
-    const q = query || `in:inbox newer_than:${Math.max(daysBack, 1)}d`;
-    const cap = Math.min(Math.max(maxEmails, 1), 5000);
-    idsToFetch = [];
-    let pageToken = null;
-    while (idsToFetch.length < cap) {
-      const params = new URLSearchParams({ q, maxResults: String(Math.min(500, cap - idsToFetch.length)) });
-      if (pageToken) params.set('pageToken', pageToken);
-      const listResp = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?${params.toString()}`, { headers });
-      if (!listResp.ok) {
-        const errText = await listResp.text().catch(() => '');
-        throw new Error(`Gmail API list failed: ${listResp.status} ${errText.slice(0, 200)}`);
-      }
-      const listData = await listResp.json();
-      idsToFetch.push(...(listData.messages || []).map(m => m.id));
-      pageToken = listData.nextPageToken || null;
-      if (!pageToken || (listData.messages || []).length === 0) break;
-    }
+    idsToFetch = await listGmailIds(email, userId, { daysBack, maxEmails, query, excludeDigest });
   }
 
   const emails = [];
@@ -2137,17 +2152,27 @@ async function fetchGmailInboxREST(email, userId, { daysBack = 30, maxEmails = 5
   // next run rather than losing it forever).
   const CONCURRENCY = 10;
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  // metadataOnly fetches headers + snippet (no body) — far lighter payloads,
+  // used for the first pass of a wide window so the expensive body fetch runs
+  // only on mail that plausibly needs it.
+  const fetchParams = new URLSearchParams();
+  if (metadataOnly) {
+    fetchParams.set('format', 'metadata');
+    for (const h of ['From', 'Subject', 'Date', 'Message-ID', 'In-Reply-To']) fetchParams.append('metadataHeaders', h);
+  } else {
+    fetchParams.set('format', 'full');
+  }
   for (let i = 0; i < idsToFetch.length; i += CONCURRENCY) {
     const chunk = idsToFetch.slice(i, i + CONCURRENCY);
     await Promise.all(chunk.map(async (id) => {
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          const msgResp = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`, { headers });
+          const msgResp = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?${fetchParams.toString()}`, { headers });
           if (msgResp.ok) {
             const msg = await msgResp.json();
             const headersMap = {};
             for (const h of (msg.payload?.headers || [])) headersMap[h.name.toLowerCase()] = h.value;
-            const bodyText = extractGmailBody(msg);
+            const bodyText = metadataOnly ? '' : extractGmailBody(msg);
             const parsedDate = new Date(headersMap.date || parseInt(msg.internalDate || 0, 10));
             emails.push({
               gmailId: msg.id,
@@ -2185,7 +2210,15 @@ async function fetchGmailInboxREST(email, userId, { daysBack = 30, maxEmails = 5
 
 // Job-board alerts / digest senders that are never direct recruiter replies.
 // Shared by /notifications/check and /interview/detect so both stay consistent.
-const DIGEST_SENDERS = ['naukri', 'indeed', 'linkedin', 'glassdoor', 'monster', 'hirist', 'quora', 'buzzfeed', 'medium', 'substack', 'newsletter', 'digest', 'no-reply', 'noreply', 'updates@', 'donotreply', 'pinterest', 'instahyre', 'foundit', 'github', 'havells', 'stackoverflow', 'render.com', 'edureka'];
+const DIGEST_SENDERS = ['naukri', 'indeed', 'linkedin', 'glassdoor', 'monster', 'hirist', 'quora', 'buzzfeed', 'medium', 'substack', 'newsletter', 'digest', 'no-reply', 'noreply', 'updates@', 'donotreply', 'pinterest', 'instahyre', 'foundit', 'github', 'havells', 'stackoverflow', 'render.com', 'edureka', 'jobrapido', 'internshala', 'jobhai', 'michaelpage', 'timesjobs', 'shine', 'iimjobs', 'cutshort', 'freshersworld', 'workindia', 'apna', 'kotak', 'magicbricks', 'jio', 'jobrapidoalert'];
+
+// Domains/words we can safely exclude in a Gmail `from:` search clause —
+// job boards, aggregators, portals and unambiguous transactional senders that
+// can never be a direct recruiter reply for a software role. Gmail matches
+// these as substrings of the sender address, so keep them unambiguous.
+// Deliberately EXCLUDED here (real employers — recruiters DO mail from them):
+// google, amazon, microsoft, adobe, redhat, apple, uber (hiring!), swiggy, etc.
+const DIGEST_DOMAIN_EXCLUSIONS = ['naukri', 'indeed', 'linkedin', 'glassdoor', 'monster', 'hirist', 'quora', 'buzzfeed', 'medium', 'substack', 'pinterest', 'instahyre', 'foundit', 'github', 'stackoverflow', 'edureka', 'render', 'havells', 'jobrapido', 'internshala', 'jobhai', 'timesjobs', 'shine', 'iimjobs', 'cutshort', 'freshersworld', 'workindia', 'apna', 'kotak', 'magicbricks', 'jio', 'supabase', 'truecaller', 'codeql', 'dropbox', 'paypal', 'irctc', 'meesho', 'flipkart', 'bigbasket', 'myntra', 'nykaa', 'swiggy', 'zomato', 'vercel', 'gitlab', 'cloudflare', 'airtel', 'vodafone'];
 
 function isDigestSenderL(email) {
   const fromL = (email.fromEmail || email.from || '').toLowerCase();
@@ -2347,6 +2380,64 @@ function classifyEmailSpam(email) {
   };
 }
 
+// Synchronous email classifier — the reliability backbone for the inbox scan.
+// The opencode classifier is authoritative but slow (60s+ per email) and can
+// time out under load; a timeout must NEVER silently swallow a recruiter reply
+// (which the old parse-error default of `spam` did). This heuristic runs in
+// microseconds, is used as the fast path for unambiguous mail AND as the
+// fallback when opencode fails, so the scan stays fast and never drops mail.
+// Verdicts mirror the model's contract: job_reply / job_alert / spam + 0-1
+// confidence. It errs toward job_reply on genuinely ambiguous mail — surfacing
+// an extra candidate email beats missing a recruiter.
+function classifyEmailHeuristic(email) {
+  const from = `${email?.from || ''}`.toLowerCase();
+  const fromEmail = `${email?.fromEmail || ''}`.toLowerCase();
+  const subj = `${email?.subject || ''}`.toLowerCase();
+  const body = `${email?.body || ''}`.slice(0, 3000).toLowerCase();
+  const preview = `${email?.preview || ''}`.toLowerCase();
+  const all = `${from} ${fromEmail} ${subj} ${body} ${preview}`;
+
+  // 1) Job-board digests / automated alerts — never a recruiter reply.
+  if (DIGEST_SENDERS.some(d => from.includes(d) || fromEmail.includes(d)) ||
+      /\b(?:job alert|new jobs for you|recommended jobs|top matches|similar jobs|jobs for you|vacancy|daily jobs|weekly jobs|career update|job matches|new openings)\b/i.test(subj)) {
+    return { classification: 'job_alert', confidence: 0.92, reason: 'digest/alert sender' };
+  }
+
+  // 2) Unambiguous spam (promotions, loans, giveaways, generic junk).
+  if (/\b(unsubscribe now|you won|winner|limited time offer|act now|discount|coupon|promotion|lend|loan|cash back|click here|earn money|work from home no experience|call now|buy now|amazon gift|lottery)\b/i.test(all) ||
+      /no-reply|noreply|donotreply/.test(fromEmail) && !/interview|application|resume|offer/.test(subj)) {
+    return { classification: 'spam', confidence: 0.9, reason: 'promotional/unsubscribe signals' };
+  }
+
+  // 3) Interview scheduling / invites.
+  if (/interview|phone screen|next round|screen(ing)? call|technical round|hr round|face.?to.?face|meet(?:ing)? with|zoom|teams call|we would like to meet|pleased to invite|schedule(d)? (a|an|the)? (call|meeting|interview)|confirm.*(call|meeting|availability)/i.test(`${subj} ${preview}`) &&
+      !isDigestSenderL(email)) {
+    return { classification: 'job_reply', confidence: 0.9, reason: 'interview scheduling signal' };
+  }
+
+  // 4) Offers / shortlists.
+  if (/offer letter|congratulations.*(selected|offer)|pleased to inform|we are excited to offer|you have been selected|selected for the role|offer.*(ctc|compensation|package)/i.test(subj) ||
+      /\b(offer letter|joining date|start date|onboarding|we are pleased to offer)\b/i.test(body)) {
+    return { classification: 'job_reply', confidence: 0.93, reason: 'offer/shortlist signal' };
+  }
+
+  // 5) Rejections — still a recruiter reply the user must see.
+  if (/reject|unfortunately.*(not (moving|selected)|other candidates|not selected)|decided to pursue other|we regret to inform/i.test(subj) ||
+      /unfortunately.*(position|role|profile).*(filled|closed|other candidate)|not moving forward/i.test(body)) {
+    return { classification: 'job_reply', confidence: 0.82, reason: 'recruiter rejection' };
+  }
+
+  // 6) Generic recruiter / application follow-up.
+  if (/recruiter|talent.?acquisition|hiring manager|your application|your resume|your profile|opportunity with|position (of|at|for)|interested in this role|please share|reply with|next steps|follow.?up on (your|the) application|regarding (your|the) (application|resume|profile)/i.test(`${subj} ${body}`) ||
+      /^re\s*:/i.test(subj) && !/naukri|indeed|linkedin/.test(fromEmail)) {
+    return { classification: 'job_reply', confidence: 0.75, reason: 'recruiter/application signal' };
+  }
+
+  // 7) Everything else — noise, but low confidence so a real reply that slips
+  // through the regexes is re-examined rather than hard-dropped.
+  return { classification: 'spam', confidence: 0.55, reason: 'no recruiter signal' };
+}
+
 // GET /email/inbox — supports both app password and OAuth2, with spam filtering
 app.get('/email/inbox', async (req, res) => {
   const email = req.query.email || process.env.GMAIL_USER;
@@ -2369,6 +2460,14 @@ app.get('/email/inbox', async (req, res) => {
     const daysBack = parseInt(req.query.daysBack, 10) || 30;
     const maxEmails = parseInt(req.query.maxEmails, 10) || 50;
     const query = (req.query.query || '').trim();
+    // metadataOnly: headers + snippet only (no body) — used as the first pass of
+    // a wide window so scans stay fast. excludeDigest: drop job-board/digest
+    // senders at the Gmail query level — they can never be recruiter replies.
+    const metadataOnly = req.query.metadataOnly === 'true';
+    const excludeDigest = req.query.excludeDigest === 'true';
+    // idsOnly: return just the message id list (no per-message GETs) so a scan
+    // can decide which ids actually need metadata/bodies fetched.
+    const idsOnly = req.query.idsOnly === 'true';
     // Explicit message ids (comma-separated) — used by /email/scan to retry
     // messages that previously failed to fetch, independent of the time window.
     const ids = (req.query.ids || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -2379,9 +2478,14 @@ app.get('/email/inbox', async (req, res) => {
     let method;
     if (hasUserOAuth2 || hasLegacyOAuth2) {
       try {
-        allEmails = await fetchGmailInboxREST(email, req.userCtx.userId, { daysBack, maxEmails, query: query || undefined, ids: ids.length ? ids : undefined });
+        if (idsOnly) {
+          const idList = await listGmailIds(email, req.userCtx.userId, { daysBack, maxEmails, query: query || undefined, excludeDigest });
+          return res.json({ ids: idList, total: idList.length, method: 'gmail_rest_ids' });
+        }
+        allEmails = await fetchGmailInboxREST(email, req.userCtx.userId, { daysBack, maxEmails, query: query || undefined, ids: ids.length ? ids : undefined, metadataOnly, excludeDigest });
         method = hasUserOAuth2 ? 'per_user_oauth2_rest' : 'legacy_oauth2_rest';
       } catch (restErr) {
+        if (idsOnly) return res.status(500).json({ error: restErr.message, ids: [] });
         logRestError('email/inbox', email, restErr);
         allEmails = await fetchEmails(email, appPassword, { userOAuth, daysBack, maxEmails });
         method = hasUserOAuth2 ? 'per_user_oauth2_imap' : 'legacy_oauth2_imap';
@@ -2802,6 +2906,23 @@ app.post('/scan', async (req, res) => {
     const otherResults = otherLocations.slice(0, 100);
     const mergedResults = exactResults.length > 0 ? exactResults : otherResults;
 
+    // Persist the per-user scan results so the app can show them instantly on
+    // "scan again" without re-scanning (GET /scan/results). Re-running a scan
+    // overwrites this cache with the latest results. An empty result set (e.g.
+    // all portals errored) never overwrites a good cache — the app keeps the
+    // last real findings instead of "View Jobs (0)".
+    if (mergedResults.length > 0) {
+      saveScanResultsCache(req, {
+        results: mergedResults,
+        otherLocations: otherResults,
+        total: totalBeforeFilter,
+        newFound: netNew,
+        keywords: kw,
+        locations: locs,
+        locationExactMatch,
+      });
+    }
+
     res.json({
       total: totalBeforeFilter,
       newFound: netNew,
@@ -3021,7 +3142,7 @@ function buildTrackerExclusion(trackerPath) {
       const company = m[1].trim().toLowerCase();
       const role = m[2].trim().toLowerCase();
       const status = m[4].trim().toLowerCase();
-      if (company && ['applied', 'responded', 'interview', 'offer'].includes(status)) {
+      if (company && ['applied', 'responded', 'interview', 'offer', 'discarded'].includes(status)) {
         activeCompanies.add(normalizeCompanyForExclusion(company));
         activeRoles.add(`${normalizeCompanyForExclusion(company)}::${normalizeCompanyForExclusion(role)}`);
       }
@@ -3188,15 +3309,142 @@ function roleKwFor(role) {
   return [...kw].filter(Boolean);
 }
 
+// Job boards whose name is NOT an employer. Scan results sourced from these
+// carry the portal as `company`; the real employer is embedded in the title
+// ("Kiya.ai - Automation Engineer - Python/Ansible") or the job URL, so we
+// resolve it here — otherwise the tracker/dedup record the portal name and
+// applying to one job falsely blocks every other job on the same portal.
+const ROLE_SOURCE_PORTALS = new Set(['linkedin', 'naukri', 'indeed', 'shine', 'foundit', 'timesjobs', 'hirist', 'internshala', 'monster', 'techgig', 'jora', 'jooble', 'talent.com', 'hirect', 'iimjobs', 'apna']);
+// Words that are never part of an employer name — language-neutral listing
+// markers, not a role dictionary (role detection is profile-driven below).
+const NOT_EMPLOYER_PREFIX = /(^|[^a-z])(jobs|job|careers|career|hiring|vacancy|vacancies|openings|apply|position|positions|roles|role|walk|walkin|drive|fresher|freshers|urgent|opening|opportunity|opportunities|event|meet|jobfair)($|[^a-z])/i;
+// Generic role-like tokens that mark a dash-prefix as a ROLE TITLE rather than
+// an employer ("Software Development Engineer - Backend Technologies"). Treating
+// such a prefix as the company would collapse every distinct job sharing that
+// prefix in dedup — the exact cause of the 250+ → ~45 result drop. This is a
+// language-level marker set (same spirit as `joby`), not a role dictionary.
+const ROLE_TOKEN_RE = /\b(developer|developers|development|engineers?|engineering|managers?|analysts?|consultants?|architects?|specialists?|associates?|trainees?|interns?|internship|freshers?|executives?|designers?|leads?|seniors?|juniors?|principals?|staff|head|administrators?|technicians?|coordinators?|supervisors?|programmers?|sde|swe|qa|support|helpdesk|testers?|admin|walk|drive|walkin|event)\b/i;
+
+// "kyzer-software" → "Kyzer Software" for URL-derived employer slugs.
+function slugToName(slug) {
+  return String(slug || '')
+    .replace(/-+/g, ' ')
+    .trim()
+    .replace(/\b[a-z]/g, (c) => c.toUpperCase());
+}
+
+// Extract the real employer from job URLs whose path embeds the company slug —
+// more reliable than guessing from the listing title. Supports the Indian
+// portals where the company is always in the URL (LinkedIn/Shine/Internshala).
+function extractEmployerFromUrl(urlStr) {
+  if (!urlStr) return null;
+  let u;
+  try { u = new URL(urlStr); } catch { return null; }
+  const host = (u.hostname || '').toLowerCase();
+  const path = (u.pathname || '');
+  // LinkedIn: /jobs/view/<slug>-at-<company>-<numericId>
+  if (host.endsWith('linkedin.com')) {
+    const m = path.match(/-at-([a-z0-9][a-z0-9-]*?)-(\d{6,})$/i);
+    if (m) return slugToName(m[1]);
+  }
+  // Shine: /jobs/<slug>/<company-slug>/<numericId>
+  if (host.endsWith('shine.com')) {
+    const parts = path.split('/').filter(Boolean);
+    if (parts.length >= 3 && parts[0] === 'jobs' && /^\d+$/.test(parts[parts.length - 1])) {
+      return slugToName(parts[parts.length - 2]);
+    }
+  }
+  // Internshala: /job/detail/<slug>-in-<city>-at-<company><numericId>
+  if (host.endsWith('internshala.com')) {
+    const m = path.match(/-at-([a-z0-9][a-z0-9-]*?)(\d{6,})$/i);
+    if (m) return slugToName(m[1]);
+  }
+  return null;
+}
+
+// True when a resolved company label is a confident real employer — NOT a portal
+// fallback and NOT a mislabeled role title. Used to decide whether dedup may
+// collapse distinct URLs by company+role; unknown-employer rows are kept by URL.
+function isConfidentEmployer(company) {
+  const c = String(company || '').toLowerCase().trim();
+  if (!c || c.length < 2) return false;
+  if (ROLE_SOURCE_PORTALS.has(c)) return false;
+  if (ROLE_TOKEN_RE.test(c)) return false;
+  return true;
+}
+
+function employerFromPortalTitle(portal, title, rolePhrases, urlStr) {
+  const p = String(portal || '').toLowerCase();
+  if (!ROLE_SOURCE_PORTALS.has(p)) return portal;
+  const urlEmployer = extractEmployerFromUrl(urlStr);
+  const t = String(title || '').trim();
+  const dash = t.indexOf(' - ');
+  if (dash > 0) {
+    const cand = t.slice(0, dash).trim();
+    if (cand.length >= 3 && cand.length <= 45) {
+      const cl = cand.toLowerCase();
+      // Profile-driven role detection: if the prefix contains one of THIS user's
+      // own onboarding roles, it is a role title, not an employer. Works for any
+      // end user — no hardcoded role dictionary.
+      for (const rp of rolePhrases) {
+        if (rp && cl.includes(rp)) return urlEmployer || portal;
+      }
+      if (NOT_EMPLOYER_PREFIX.test(cl)) return urlEmployer || portal;
+      // Generic role-like prefix ("Software Development Engineer - Backend") is
+      // a ROLE, not an employer — use the URL company when available.
+      if (ROLE_TOKEN_RE.test(cl)) return urlEmployer || portal;
+      return cand; // confident employer from the title
+    }
+  }
+  return urlEmployer || portal;
+}
+
+function stripCompanyPrefix(title, company) {
+  if (!company || company.length < 2) return title;
+  const t = String(title || '').trim();
+  const prefix = `${company} - `;
+  if (t.toLowerCase().startsWith(prefix.toLowerCase())) return t.slice(company.length + 3).trim();
+  return t;
+}
+
+// Boards carry a location suffix ("Shine — Mumbai") — reduce to the portal id
+// ("shine") so portal-name resolution keys against ROLE_SOURCE_PORTALS.
+function portalNameKey(name) {
+  return String(name || '').split(/\s+—\s+/)[0].trim();
+}
+
+// Normalize a job URL for dedup: strip HTML-entity queries and per-view tracking
+// params (LinkedIn re-issues the SAME posting with different position/pageNum/
+// refId/trackingId query strings — those are not distinct jobs).
+function normalizeUrlForDedup(urlStr) {
+  if (!urlStr) return urlStr;
+  let s = String(urlStr).replace(/&amp;/g, '&');
+  try {
+    const u = new URL(s);
+    for (const p of ['position', 'pageNum', 'refId', 'trackingId', 'gclid', 'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'source', 'fcid', 'lid', 'gi']) {
+      u.searchParams.delete(p);
+    }
+    return u.href;
+  } catch { return s; }
+}
+
 // Build the per-role search plan from the user's own profile: one spec per
-// onboarding role, each with a role-specific keyword set and search-URL list
-// (portal templates × the profile's target location — the flexibility-named
-// commuting metro first, the profile city as fallback).
+// onboarding role (primary roles + archetypes, so the "matching <roles>"
+// summary is truthful), each with a role-specific keyword set and search-URL
+// list (portal templates × the profile's target location — the
+// flexibility-named commuting metro first, the profile city as fallback).
 function buildRoleSearchSpecs(userProfile, opts = {}) {
   const expand = !!opts.expandPortals;
   const profile = userProfile || {};
-  const roles = (profile.target_roles?.primary || []).map(r => String(r).trim()).filter(Boolean);
+  const primary = (profile.target_roles?.primary || []).map(r => String(r).trim()).filter(Boolean);
+  const archetypes = (profile.target_roles?.archetypes || [])
+    .map(a => (typeof a === 'string' ? a : (a?.name || '')))
+    .map(r => String(r).trim()).filter(Boolean);
+  const roles = [...new Set([...primary, ...archetypes])];
   if (!roles.length) return [];
+  // This user's own role names, lowercased — used as the profile-driven role
+  // detector when splitting "Employer - Role" titles on portal-sourced jobs.
+  const rolePhrases = roles.map(r => String(r).toLowerCase().trim()).filter(r => r.length >= 3);
   const country = String(profile.location?.country || '').toLowerCase().trim();
   const city = String(profile.location?.city || '').toLowerCase().trim();
   const flex = String((profile.candidate?.location_flexibility) || (profile.compensation?.location_flexibility) || '').toLowerCase();
@@ -3223,7 +3471,7 @@ function buildRoleSearchSpecs(userProfile, opts = {}) {
     const q = roleSearchQuery(role);
     const kw = roleKwFor(role);
     const urls = portals.map(p => ({ portal: p.id, url: p.url(slug, q, useLoc), location: locLabel }));
-    return { label: role, kw, urls, index: i, total: roles.length };
+    return { label: role, kw, urls, index: i, total: roles.length, rolePhrases };
   });
 }
 
@@ -3236,6 +3484,11 @@ app.get('/scan/stream', async (req, res) => {
     'X-Accel-Buffering': 'no',
   });
   const send = (event, data) => { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); if (res.flush) res.flush(); };
+
+  // Live-results streaming state (declared at handler scope so the catch can
+  // stop the timer too).
+  let scanFinished = false;
+  let streamInterval = null;
 
   try {
     let queryKeywords = req.query.keywords || '';
@@ -3268,6 +3521,15 @@ app.get('/scan/stream', async (req, res) => {
     const userCountry = ((userProfile.location?.country) || '').toLowerCase().trim();
     const userLocFull = ((userProfile.candidate?.location) || '').toLowerCase().trim();
     const userLocFlex = ((userProfile.candidate?.location_flexibility) || '').toLowerCase().trim();
+
+    // This user's own role names (primary + archetypes), lowercased — the
+    // profile-driven detector used when splitting "Employer - Role" titles on
+    // portal-sourced jobs in every phase (incl. websearch), so the tracker/
+    // dedup never record a portal name as the employer.
+    const profileRolePhrases = [
+      ...((userProfile.target_roles?.primary || []).map(r => String(r))),
+      ...((userProfile.target_roles?.archetypes || []).map(a => (typeof a === 'string' ? a : (a?.name || '')))),
+    ].map(r => String(r).toLowerCase().trim()).filter(r => r.length >= 3);
 
     // Salary floor from profile (compensation.minimum, e.g. "3 LPA"). Applied
     // at match time in every phase so title/salary/location gate together —
@@ -3361,6 +3623,37 @@ app.get('/scan/stream', async (req, res) => {
     let totalBeforeFilter = 0;
     const providerTargets = [];
     const webSearchTargets = [];
+
+    // Live-results streaming: while the scan runs, push accumulated results as
+    // SSE `results` events (~every 3s) so the app's pinned job list updates in
+    // realtime — no need to wait for `done`. The snapshot applies the same
+    // profile-driven gates as the final pass: tracker exclusion (applied/
+    // responded/interview/offer/discarded), the salary floor, senior-level
+    // drop, and URL/company+role dedup.
+    const trackerExclusion = buildTrackerExclusion(req.userCtx.trackerPath || TRACKER_PATH);
+    let lastPushedCount = 0;
+    streamInterval = setInterval(() => {
+      if (scanFinished || results.length <= lastPushedCount) return;
+      lastPushedCount = results.length;
+      const seen = new Set();
+      const seenCR = new Set();
+      const snap = results.filter(r => {
+        if (!r.company || !r.role) return false;
+        const urlKey = normalizeUrlForDedup(r.url || '');
+        if (urlKey && seen.has(urlKey)) return false;
+        if (urlKey) seen.add(urlKey);
+        if (isConfidentEmployer(r.company)) {
+          const crKey = `${(r.company || '').toLowerCase()}::${(r.role || '').toLowerCase()}`;
+          if (seenCR.has(crKey)) return false;
+          seenCR.add(crKey);
+        }
+        if (isTrackerExcluded(r.company, r.role, trackerExclusion)) return false;
+        if (belowSalaryFloor(r.salary || r.role)) return false;
+        if (isSeniorOnlyRole(r.role)) return false;
+        return true;
+      });
+      if (snap.length) send('results', { results: snap });
+    }, 3000);
 
     // Profile-driven source relevance (no hardcoded lists — adapts to any user).
     // A configured source is scanned only when it is a genuine job board (a
@@ -3550,7 +3843,12 @@ app.get('/scan/stream', async (req, res) => {
             if (!keywordMatched.some(r => r.url === link.url)) {
               const companyLoc = (entry.location || '').toLowerCase();
               const matchesLoc = locs.length === 0 || locs.some(l => companyLoc.includes(l));
-              const entry2 = { company: entry.name || '', role: link.title, location: entry.location || '', url: link.url, matched: true, source: 'websearch', notes: entry.notes || '' };
+              // Portal-sourced boards ("Shine — Mumbai") embed the employer in
+              // the title — resolve it (profile-driven) so the tracker/dedup
+              // never record the portal name as the company.
+              const employer = employerFromPortalTitle(portalNameKey(entry.name), link.title, profileRolePhrases, link.url);
+              const roleTitle = stripCompanyPrefix(link.title, employer);
+              const entry2 = { company: employer, role: roleTitle, location: entry.location || '', url: link.url, matched: true, source: 'websearch', notes: entry.notes || '' };
               keywordMatched.push(entry2);
               if (matchesLoc && !results.some(r => r.url === link.url)) {
                 exactCount++;
@@ -3626,7 +3924,11 @@ app.get('/scan/stream', async (req, res) => {
                 kwCount++;
                 if (!keywordMatched.some(r => r.url === link.url)) {
                   const matchesLoc = locs.length === 0 || locs.some(l => location.toLowerCase().includes(l));
-                  const entry2 = { company: portal, role: link.title, location, url: link.url, matched: true, source: 'role-search', notes: `role: ${spec.label}` };
+                  // Portal-sourced titles embed the employer ("Kiya.ai - ...") —
+                  // use it so the tracker/dedup never record the portal name.
+                  const employer = employerFromPortalTitle(portal, link.title, spec.rolePhrases, link.url);
+                  const roleTitle = stripCompanyPrefix(link.title, employer);
+                  const entry2 = { company: employer, role: roleTitle, location, url: link.url, matched: true, source: 'role-search', notes: `role: ${spec.label}` };
                   keywordMatched.push(entry2);
                   if (matchesLoc && !results.some(r => r.url === link.url)) {
                     exactCount++;
@@ -3639,14 +3941,14 @@ app.get('/scan/stream', async (req, res) => {
           if (!usable || links.length === 0) {
             // Blocked / empty / JS-only → Phase 3 Playwright retry with the
             // role-specific keyword set attached so matching stays per-role.
-            rolePlaywrightFailed.push({ entry: { name: portal, careers_url: url, location, notes: `role: ${spec.label}`, _roleKw: spec.kw } });
+            rolePlaywrightFailed.push({ entry: { name: portal, careers_url: url, location, notes: `role: ${spec.label}`, _roleKw: spec.kw, _rolePhrases: spec.rolePhrases } });
             statusNote = usable ? 'no listings rendered — Playwright retry queued' : 'blocked/empty page — Playwright retry queued';
           } else {
             statusNote = kwCount > 0 ? `${kwCount} relevant title${kwCount !== 1 ? 's' : ''}` : `${links.length} listing(s) scanned, none matched`;
           }
           streamPortalResults.push({ company: current, status: usable && links.length > 0 ? (kwCount > 0 ? 'scanned' : 'no_matches') : 'queued_for_playwright', keywordMatches: kwCount, exactMatches: exactCount });
         } catch (e) {
-          rolePlaywrightFailed.push({ entry: { name: portal, careers_url: url, location, notes: `role: ${spec.label}`, _roleKw: spec.kw } });
+          rolePlaywrightFailed.push({ entry: { name: portal, careers_url: url, location, notes: `role: ${spec.label}`, _roleKw: spec.kw, _rolePhrases: spec.rolePhrases } });
           streamPortalResults.push({ company: current, status: 'queued_for_playwright', keywordMatches: 0, exactMatches: 0 });
           statusNote = `failed (${(e.message || 'error').slice(0, 60)}) — Playwright retry queued`;
         } finally {
@@ -3725,7 +4027,9 @@ app.get('/scan/stream', async (req, res) => {
                   const effKw = entry._roleKw || kw;
                   const matchesKeyword = effKw.length === 0 || effKw.some(k => title.includes(k));
                   if (!matchesKeyword) continue;
-                  const entry2 = { company: entry.name || '', role: link.title, location: entry.location || '', url: href, matched: true, source: 'remote-playwright', notes: entry.notes || '' };
+                  const employer = employerFromPortalTitle(portalNameKey(entry.name), link.title, entry._rolePhrases, href);
+                  const roleTitle = stripCompanyPrefix(link.title, employer);
+                  const entry2 = { company: employer || entry.name || '', role: roleTitle, location: entry.location || '', url: href, matched: true, source: 'remote-playwright', notes: entry.notes || '' };
                   keywordMatched.push(entry2);
                   const companyLoc = (entry.location || '').toLowerCase();
                   const matchesLoc = locs.length === 0 || locs.some(l => companyLoc.includes(l));
@@ -3817,7 +4121,9 @@ app.get('/scan/stream', async (req, res) => {
                   if (href && !keywordMatched.some(r => r.url === href)) {
                     const companyLoc = (entry.location || '').toLowerCase();
                     const matchesLoc = locs.length === 0 || locs.some(l => companyLoc.includes(l));
-                    const entry2 = { company: entry.name || '', role: job.title, location: entry.location || '', url: href, matched: true, source: 'playwright', notes: entry.notes || '' };
+                    const employer = employerFromPortalTitle(portalNameKey(entry.name), job.title, entry._rolePhrases, job.url);
+                    const roleTitle = stripCompanyPrefix(job.title, employer);
+                    const entry2 = { company: employer || entry.name || '', role: roleTitle, location: entry.location || '', url: href, matched: true, source: 'playwright', notes: entry.notes || '' };
                     keywordMatched.push(entry2);
                     if (matchesLoc && !results.some(r => r.url === href)) {
                       results.push(entry2);
@@ -3881,18 +4187,22 @@ app.get('/scan/stream', async (req, res) => {
       });
     }
 
-    // Dedup (by URL, fallback by company+role for entries without a URL)
+    // Dedup (by URL always; by company+role only for confident employers).
+    // Distinct URLs never collapse under a portal-name or role-like label —
+    // otherwise distinct opportunities silently vanish (the 250+ → ~45 drop).
     const seen = new Set();
     const seenCR = new Set();
     const rawResults = [...results, ...otherLocations];
     const deduped = rawResults.filter(r => {
       if (!r.company || !r.role) return false; // never show empty cards
-      const urlKey = r.url || '';
+      const urlKey = normalizeUrlForDedup(r.url || '');
       if (urlKey && seen.has(urlKey)) return false;
       if (urlKey) seen.add(urlKey);
-      const crKey = `${(r.company || '').toLowerCase()}::${(r.role || '').toLowerCase()}`;
-      if (seenCR.has(crKey)) return false;
-      seenCR.add(crKey);
+      if (isConfidentEmployer(r.company)) {
+        const crKey = `${(r.company || '').toLowerCase()}::${(r.role || '').toLowerCase()}`;
+        if (seenCR.has(crKey)) return false;
+        seenCR.add(crKey);
+      }
       return true;
     });
 
@@ -3906,8 +4216,8 @@ app.get('/scan/stream', async (req, res) => {
 
     // Don't re-spam companies the user already applied to (per-user tracker).
     // Normalized + substring matching, so "Shine — Mumbai" in the tracker
-    // still blocks a clean "Shine" scan hit.
-    const trackerExclusion = buildTrackerExclusion(req.userCtx.trackerPath || TRACKER_PATH);
+    // still blocks a clean "Shine" scan hit. Reuses the trackerExclusion built
+    // above for the live-results stream.
     const excludedApplied = [];
     const usableResults = [];
     for (const r of levelFiltered) {
@@ -3996,6 +4306,23 @@ app.get('/scan/stream', async (req, res) => {
       streamWideningSteps.push(`Scan again to expand across more Indian job portals (Naukri, Indeed, Shine, Foundit, TimesJobs, Hirist, Cutshort, Instahyre, Internshala and more).`);
     }
 
+    scanFinished = true;
+    clearInterval(streamInterval);
+    // Persist the per-user scan results (the app reads them back instantly via
+    // GET /scan/results; a re-scan overwrites them with the latest list). An
+    // empty result set (all portals errored) never overwrites a good cache.
+    if (scored.length > 0) {
+      saveScanResultsCache(req, {
+        results: scored,
+        otherLocations: [],
+        total: totalBeforeFilter,
+        newFound: netNew,
+        keywords: kw,
+        locations: locs,
+        locationExactMatch,
+        round,
+      });
+    }
     send('done', {
       total: totalBeforeFilter,
       newFound: netNew,
@@ -4024,8 +4351,25 @@ app.get('/scan/stream', async (req, res) => {
     });
     res.end();
   } catch (e) {
+    scanFinished = true;
+    clearInterval(streamInterval);
     send('error', { error: e.message });
     res.end();
+  }
+});
+
+// GET /scan/results — return the user's last cached scan results (the job list
+// persisted by the most recent /scan or /scan/stream run). Instant, no
+// re-scan. The cache is overwritten every time a scan runs again.
+app.get('/scan/results', (req, res) => {
+  try {
+    const cache = loadScanResultsCache(req);
+    if (!cache) {
+      return res.json({ results: [], otherLocations: [], total: 0, newFound: 0, cached: false, savedAt: null });
+    }
+    res.json({ ...cache, cached: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -4674,8 +5018,8 @@ app.post('/email/reply/send', async (req, res) => {
   }
 });
 
-// POST /email/spam/delete — delete selected messages (HITL: user selects which to delete)
-// OAuth users: Gmail REST delete by message id. App-password users: IMAP.
+// POST /email/spam/delete — trash selected messages (HITL: user selects which to delete)
+// OAuth users: Gmail REST trash by message id (gmail.modify scope). App-password users: IMAP.
 app.post('/email/spam/delete', async (req, res) => {
   try {
     const { messageIds, markAsRead } = req.body;
@@ -4694,19 +5038,28 @@ app.post('/email/spam/delete', async (req, res) => {
       return res.status(400).json({ error: 'IMAP credentials not configured — connect Gmail in Settings' });
     }
 
-    // ── OAuth users: Gmail REST delete (reliable; avoids IMAP) ──────────
+    // ── OAuth users: Gmail REST trash (reliable; avoids IMAP) ──────────
     if (hasUserOAuth2 || hasLegacyOAuth2) {
       const accessToken = await resolveGmailAccessToken(userId, userEmail);
       const headers = { Authorization: `Bearer ${accessToken}` };
 
-      // Gmail message ids are 15-19 digit numeric strings — use directly.
-      // Anything else is a sequential id (1..N) from /email/inbox; map to gmailId.
-      const isGmailId = (s) => /^\d{15,19}$/.test(String(s));
+      // Gmail REST message ids are 16-char base36 strings (e.g. 19fefbb10e4a9738),
+      // NOT purely numeric. The old numeric-only regex made the app's base36
+      // gmailIds fall through to the resolution map, which is keyed by sequential
+      // /email/inbox ids — every lookup missed, so deletes "succeeded" with 0
+      // moved (silent `!gmailId` skip, no log).
+      const isGmailId = (s) => /^[0-9a-zA-Z]{15,19}$/.test(String(s));
       const needsResolve = messageIds.some(m => !isGmailId(m));
       const gmailIdBySeq = {};
       if (needsResolve) {
         const inboxEmails = await fetchGmailInboxREST(userEmail, userId, { daysBack: 30, maxEmails: 100 });
-        for (const e of inboxEmails) gmailIdBySeq[String(e.id)] = e.gmailId;
+        for (const e of inboxEmails) {
+          // Key by every identifier the app could send — sequential id/uid AND
+          // the base36 gmailId — so resolution can't miss.
+          if (e.gmailId) gmailIdBySeq[String(e.gmailId)] = e.gmailId;
+          if (e.id != null) gmailIdBySeq[String(e.id)] = e.gmailId || String(e.id);
+          if (e.uid != null) gmailIdBySeq[String(e.uid)] = e.gmailId || String(e.uid);
+        }
       }
 
       const deleted = [];
@@ -4724,15 +5077,19 @@ app.post('/email/spam/delete', async (req, res) => {
               body: JSON.stringify({ removeLabelIds: ['UNREAD'] }),
             });
           }
-          const delResp = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${gmailId}`, {
-            method: 'DELETE',
+          // Gmail REST users.messages.delete requires the `https://mail.google.com/`
+          // scope (permanent deletion), which this app's OAuth token does NOT have.
+          // users.messages.trash (POST /trash) only needs `gmail.modify` — messages
+          // go to the Trash label (recoverable) instead of being purged.
+          const delResp = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${gmailId}/trash`, {
+            method: 'POST',
             headers,
           });
           if (delResp.ok) {
             deleted.push(rawId);
           } else {
             const errText = await delResp.text().catch(() => '');
-            console.error(`[email/spam/delete] Gmail delete failed for ${gmailId}: ${delResp.status} ${errText.slice(0, 150)}`);
+            console.error(`[email/spam/delete] Gmail trash failed for ${gmailId}: ${delResp.status} ${errText.slice(0, 150)}`);
             failed.push(rawId);
           }
         } catch (delErr) {
@@ -5243,15 +5600,31 @@ Subject: ${subject}
 Preview: ${(preview || '').slice(0, 500)}
 Body: ${(body || '').slice(0, 2000)}`;
 
-    const result = await runOpencode(prompt, 60000, userCwd(req));
+    // Fast path: the heuristic resolves unambiguous mail (digests/alert digests
+    // and obvious spam) without burning a slow model call — and, crucially, it
+    // is the fallback whenever opencode is slow or down, so a classifier
+    // timeout never silently swallows a recruiter reply as "spam".
+    const heur = classifyEmailHeuristic({ from, fromEmail, subject, preview, body });
+    if (heur.classification === 'job_alert' || (heur.classification === 'spam' && heur.confidence >= 0.85)) {
+      return res.json(heur);
+    }
 
-    // Parse JSON from response
-    let classification = { classification: 'spam', confidence: 0.5, reason: 'parse_error' };
+    let classification = null;
     try {
+      const result = await runOpencode(prompt, 60000, userCwd(req));
       const jsonMatch = result.match(/\{[\s\S]*?\}/);
       if (jsonMatch) classification = JSON.parse(jsonMatch[0]);
-    } catch { /* fallback to default */ }
+    } catch { /* opencode failed — use heuristic below */ }
 
+    if (!classification || typeof classification.classification !== 'string' || typeof classification.confidence !== 'number') {
+      return res.json(heur);
+    }
+    // Guard against the echoed-prompt template parsing into a valid-but-wrong
+    // low-confidence "spam" on a partial session. Never let a weak non-reply
+    // verdict beat a confident heuristic (which errs toward surfacing mail).
+    if (classification.classification !== 'job_reply' && classification.confidence < 0.6 && heur.confidence > classification.confidence) {
+      return res.json(heur);
+    }
     res.json(classification);
   } catch (e) {
     res.json({ classification: 'spam', confidence: 0.0, reason: `Error: ${e.message}` });
@@ -5351,7 +5724,10 @@ Candidate phone: ${profile?.candidate?.phone || ''}
 
 Return JSON: {"to": "hiring contact email or empty string if unknown", "subject": "...", "body": "...", "contactBlock": "...", "phone": "recruiter contact phone or empty string if unknown"}`;
 
-    const result = await runOpencode(prompt, 180000, userCwd(req));
+    // The reasoning model routinely takes ~3min for a grounded application
+    // letter (JD fetch + contact hints + CV), so 180s clipped real drafts. 300s
+    // fits a full letter plus the app's 600s read timeout.
+    const result = await runOpencode(prompt, 300000, userCwd(req));
     const parsed = parseJsonFromOutput(result) || { to: '', subject: '', body: result.trim().slice(0, 2000), contactBlock: '', phone: '' };
 
     // The drafter often stops at "no email on the posting page" without
@@ -5361,7 +5737,7 @@ Return JSON: {"to": "hiring contact email or empty string if unknown", "subject"
     if ((!parsed.to || !parsed.to.trim()) && company) {
       try {
         const lookupPrompt = `Search the web for the real application/recruiting contact email address for ${company} (hiring ${role ? `for ${role} roles` : 'software roles'}). Check their careers page, job-board postings (Greenhouse/Lever/Ashby/etc.), and contact page. Return ONLY a JSON object: {"to": "the verified application/HR email, or empty string if you truly cannot verify one"}. Never guess or fabricate — the address must be one you actually saw in a search result or on their own site.`;
-        const lookupResult = await runOpencode(lookupPrompt, 60000, userCwd(req));
+        const lookupResult = await runOpencode(lookupPrompt, 120000, userCwd(req));
         const lookup = parseJsonFromOutput(lookupResult) || {};
         if (lookup.to && lookup.to.trim()) {
           parsed.to = lookup.to.trim();
@@ -7884,6 +8260,65 @@ function saveEmailClassifyCache(req, cache) {
   } catch { /* non-fatal */ }
 }
 
+// Lightweight metadata cache for the full-listing "check inbox" scan: maps
+// gmailId -> {from, subject, date, preview} so repeat calls only fetch metadata
+// for messages not seen before (the per-message Gmail GET is the slow part).
+// Bodies are never cached — they are only fetched for plausible recruiter mail.
+function inboxMetaCachePath(req) {
+  const dataDir = req.userCtx?.dataDir || join(__dirname, 'data');
+  return join(dataDir, 'inbox-meta-cache.json');
+}
+
+function loadInboxMetaCache(req) {
+  try {
+    const p = inboxMetaCachePath(req);
+    return existsSync(p) ? JSON.parse(readFileSync(p, 'utf-8')) : {};
+  } catch { return {}; }
+}
+
+function saveInboxMetaCache(req, cache) {
+  try {
+    const p = inboxMetaCachePath(req);
+    mkdirSync(dirname(p), { recursive: true });
+    // Bound the cache: keep only the most recent 5000 entries so it can't grow
+    // without limit over months of scanning.
+    const entries = Object.entries(cache);
+    if (entries.length > 5000) {
+      entries.sort((a, b) => new Date(b[1]?.date || 0) - new Date(a[1]?.date || 0));
+      const trimmed = {};
+      for (const [k, v] of entries.slice(0, 5000)) trimmed[k] = v;
+      writeFileSync(p, JSON.stringify(trimmed));
+    } else {
+      writeFileSync(p, JSON.stringify(cache));
+    }
+  } catch { /* non-fatal */ }
+}
+
+// ── Per-user job-scan results cache ──────────────────────────────
+// When a scan runs (POST /scan or GET /scan/stream done), the final job list
+// is persisted per-user to scan-results-cache.json. The app can then read it
+// back with GET /scan/results (instant, no re-scan) and re-run a scan to
+// overwrite it with the latest results. "Scan again" = update the cache.
+function scanResultsCachePath(req) {
+  const dataDir = req.userCtx?.dataDir || join(__dirname, 'data');
+  return join(dataDir, 'scan-results-cache.json');
+}
+
+function loadScanResultsCache(req) {
+  try {
+    const p = scanResultsCachePath(req);
+    return existsSync(p) ? JSON.parse(readFileSync(p, 'utf-8')) : null;
+  } catch { return null; }
+}
+
+function saveScanResultsCache(req, data) {
+  try {
+    const p = scanResultsCachePath(req);
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, JSON.stringify({ savedAt: new Date().toISOString(), ...data }));
+  } catch { /* non-fatal */ }
+}
+
 // ── Pending-notifications queue ───────────────────────────────────
 // Notifications are durable: each recruiter/interview/offer notification is
 // queued to pending-notifications.json as it is found, so a lost scan response
@@ -7952,20 +8387,141 @@ function withInboxScanLock(userId, fn) {
 // - No opportunity is ever lost: messages that fail to fetch or classify are
 //   kept in the cursor's `pendingIds` and re-fetched by id on every scan until
 //   they are processed, independent of the moving time window.
-async function scanInboxForUser(req, { forceBackfill = false } = {}) {
+async function scanInboxForUser(req, { forceBackfill = false, daysBack = null } = {}) {
   const userId = req.userCtx?.userId;
   return withInboxScanLock(userId, async () => {
     const notifications = [];
-    const cursor = loadInboxCursor(req) || {};
     const cache = loadEmailClassifyCache(req) || {};
+    const headers = userId ? { 'X-User-Id': userId } : {};
+
+    // FULL LISTING MODE — the on-demand "check inbox" call. When the caller
+    // explicitly requests a lookback window (e.g. 90 days), re-list EVERY
+    // recruiter/interview/offer email in that window so the user sees all of
+    // their recruiter conversations (not just the newest) and can reply to each.
+    // Classification comes from the persisted model cache (trusted only when
+    // confident) or the synchronous heuristic — no opencode, no cursor
+    // mutation — so this is fast and reliable even when the model is down.
+    //
+    // Three-step fetch tuned for speed: (1) cheap ids-only pass with
+    // job-board/transactional senders excluded at the Gmail query level (they
+    // dominate volume and can never be recruiter replies); (2) metadata
+    // (headers+snippet, no body) fetched ONLY for ids not already in the
+    // persisted metadata cache, so repeat "check inbox" calls are near-instant;
+    // (3) full bodies fetched ONLY for mail whose subject/snippet carries a
+    // recruiter signal. The old single-pass version fetched thousands of heavy
+    // HTML alert bodies and appeared to hang.
+    if (daysBack && daysBack > 0) {
+      const listNotifications = [];
+      const maxEmails = 5000;
+      const metaCache = loadInboxMetaCache(req) || {};
+      // 1) Ids only — the per-message Gmail GET is the slow step, so never run
+      //    it over noise. Exclusions make this a few hundred ids, not 2000+.
+      const idsResp = await fetch(`http://127.0.0.1:8787/email/inbox?daysBack=${daysBack}&maxEmails=${maxEmails}&idsOnly=true&excludeDigest=true`, { headers });
+      const ids = idsResp.ok ? ((await idsResp.json()).ids || []) : [];
+      // 2) Metadata for unseen ids only; reuse the cache for everything else.
+      const missing = ids.filter(id => !metaCache[id]);
+      const fresh = [];
+      if (missing.length) {
+        const metaResp = await fetch(`http://127.0.0.1:8787/email/inbox?ids=${missing.join(',')}&metadataOnly=true&includeSpam=true`, { headers });
+        if (metaResp.ok) fresh.push(...((await metaResp.json()).emails || []));
+      }
+      const emails = [];
+      for (const e of fresh) {
+        if (!e.gmailId) continue;
+        metaCache[e.gmailId] = { from: e.from, fromEmail: e.fromEmail, subject: e.subject, date: e.date, preview: e.preview };
+        emails.push(e);
+      }
+      for (const id of ids) {
+        if (!metaCache[id] || emails.some(x => x.gmailId === id)) continue;
+        emails.push({ gmailId: id, ...metaCache[id] });
+      }
+      // 3) Bodies only for mail with a recruiter signal (subject/snippet) or an
+      //    already-confident job_reply verdict — everything else is dropped
+      //    without ever fetching its (likely huge HTML) body.
+      const needBody = emails.filter(e => {
+        if (!e.gmailId) return false;
+        const cached = cache[e.gmailId];
+        if (cached && cached.classification === 'job_reply' && cached.confidence >= 0.6) return true;
+        return isPlausibleRecruiterMail(e.subject || '', e.preview || '');
+      });
+      if (needBody.length) {
+        const idsParam = needBody.map(e => e.gmailId).join(',');
+        const bodyResp = await fetch(`http://127.0.0.1:8787/email/inbox?ids=${idsParam}&includeSpam=true`, { headers });
+        if (bodyResp.ok) {
+          const bodyData = await bodyResp.json();
+          const byId = new Map((bodyData.emails || []).map(e => [e.gmailId, e]));
+          const full = emails.map(e => byId.get(e.gmailId) || e);
+          emails.length = 0;
+          emails.push(...full);
+        }
+      }
+      // Persist what we learned so the next call skips the metadata GETs.
+      saveInboxMetaCache(req, metaCache);
+
+      const scannedCount = emails.length;
+      for (const email of emails) {
+        if (!email.gmailId) continue;
+        const subj = (email.subject || '').toLowerCase();
+        const body = (email.body || email.preview || '').toLowerCase();
+        if (isDigestSenderL(email)) continue;
+        if (isBelowCompensationEmail(subj, body, email.fromEmail || email.from)) continue;
+        if (isBlacklistedSender(req, email)) continue;
+        let cls = cache[email.gmailId];
+        // Trust the cached model verdict only when confident; anything weak
+        // (incl. the old timeout-era spam defaults) is re-examined by the
+        // heuristic so a real reply is never silently dropped.
+        if (!cls || typeof cls.confidence !== 'number' || cls.confidence < 0.6) {
+          cls = classifyEmailHeuristic(email);
+        }
+        const classification = cls?.classification;
+        const confidence = typeof cls?.confidence === 'number' ? cls.confidence : 0;
+        if (classification !== 'job_reply' || confidence < 0.6) continue;
+        if (/interview|schedule|meeting|next round/i.test(subj) || /interview|schedule|availability|we would like to meet/i.test(body)) {
+          const dt = extractInterviewDateTime(email.subject, email.body || email.preview);
+          listNotifications.push({
+            type: 'interview',
+            title: 'Interview Scheduled',
+            message: `${email.from}: ${email.subject}${dt ? `\n**When:** ${dt.human}` : ''}`,
+            gmailId: email.gmailId,
+            email,
+            scheduledAt: dt ? dt.iso : null,
+            scheduledHuman: dt ? dt.human : null,
+          });
+        } else if (/offer|congratulations|pleased to inform/i.test(subj)) {
+          listNotifications.push({
+            type: 'offer',
+            title: 'Offer Received!',
+            message: `${email.from}: ${email.subject}`,
+            gmailId: email.gmailId,
+            email,
+          });
+        } else {
+          listNotifications.push({
+            type: 'recruiter_reply',
+            title: 'Recruiter Reply',
+            message: `${email.from}: ${email.subject}`,
+            gmailId: email.gmailId,
+            email,
+          });
+        }
+      }
+      return {
+        notifications: dedupeNotifications(listNotifications),
+        scanned: scannedCount,
+        backfill: true,
+        userId: userId || null,
+        full: true,
+      };
+    }
+
+    const cursor = loadInboxCursor(req) || {};
     const processed = new Set(Array.isArray(cursor.processedIds) ? cursor.processedIds : []);
     const pending = new Set(Array.isArray(cursor.pendingIds) ? cursor.pendingIds : []);
-    const headers = userId ? { 'X-User-Id': userId } : {};
 
     const lastScanMs = cursor.lastScanAt ? new Date(cursor.lastScanAt).getTime() : null;
     const isBackfill = forceBackfill || !cursor.lastScanAt;
     const daysSince = lastScanMs ? Math.floor((Date.now() - lastScanMs) / 86400000) : null;
-    const daysBack = isBackfill ? 90 : Math.max(daysSince + 2, 2);
+    const incDaysBack = isBackfill ? 90 : Math.max(daysSince + 2, 2);
     const maxEmails = isBackfill ? 5000 : 250;
 
     // Cache-first classification pipeline shared by pending retries and the
@@ -7985,8 +8541,12 @@ async function scanInboxForUser(req, { forceBackfill = false } = {}) {
       if (isBlacklistedSender(req, email)) return true;
 
       let cls = null;
-      if (email.gmailId && cache[email.gmailId]) {
-        cls = cache[email.gmailId];
+      const cached = email.gmailId ? cache[email.gmailId] : null;
+      // Trust the cached model verdict only when confident. Weak entries (e.g.
+      // the old timeout-era `spam`/0.5 defaults) are re-classified so a real
+      // recruiter reply that was mis-swallowed gets a second chance to surface.
+      if (cached && typeof cached.confidence === 'number' && cached.confidence >= 0.6) {
+        cls = cached;
       } else {
         cls = await classifyEmailViaBridge(userId, email);
         if (cls && email.gmailId) cache[email.gmailId] = { ...cls, scannedAt: new Date().toISOString() };
@@ -8108,7 +8668,7 @@ async function scanInboxForUser(req, { forceBackfill = false } = {}) {
       // 2) Window fetch: backfill enumerates up to 5000 messages so heavy-volume
       // mailboxes don't truncate older recruiter outreach; incremental scans
       // reuse the classify cache so each email is classified exactly once.
-      const inboxResp = await fetch(`http://127.0.0.1:8787/email/inbox?daysBack=${daysBack}&maxEmails=${maxEmails}`, { headers });
+      const inboxResp = await fetch(`http://127.0.0.1:8787/email/inbox?daysBack=${incDaysBack}&maxEmails=${maxEmails}&excludeDigest=true`, { headers });
       if (inboxResp.ok) {
         const inboxData = await inboxResp.json();
         const emails = inboxData.emails || [];
@@ -8161,16 +8721,24 @@ async function scanInboxForUser(req, { forceBackfill = false } = {}) {
 // First call backfills 90 days; later calls scan incrementally. Returns the
 // recruiter/interview/offer notifications + scan stats.
 app.post('/email/scan', async (req, res) => {
+  const t0 = Date.now();
+  const userId = req.userCtx?.userId;
   try {
-    const userId = req.userCtx?.userId;
     if (!userId) return res.status(400).json({ error: 'X-User-Id required' });
     const forceBackfill = req.body?.forceBackfill === true;
-    const scan = await scanInboxForUser(req, { forceBackfill });
+    // An explicit `daysBack` switches the scan to FULL-LISTING mode: re-list
+    // every recruiter reply in that window (e.g. 90) so the app's on-demand
+    // "check inbox" shows all conversations, each with a Reply draft. Without
+    // it, the scan stays incremental (new mail only) for background polling.
+    const daysBack = req.body?.daysBack ? parseInt(req.body.daysBack, 10) : null;
+    console.log(`[email/scan] start userId=${userId} daysBack=${req.body?.daysBack ?? '-'} forceBackfill=${forceBackfill}`);
+    const scan = await scanInboxForUser(req, { forceBackfill, daysBack: daysBack && daysBack > 0 ? daysBack : null });
     // Replay undelivered notifications so a lost backfill response (client
     // timeout / disconnect) never loses an opportunity. The queue is cleared
     // only once the response has actually been written to the client.
     const pending = loadPendingNotifications(req);
     const notifications = dedupeNotifications([...scan.notifications, ...pending]);
+    console.log(`[email/scan] done userId=${userId} count=${notifications.length} scanned=${scan.scanned} ${Date.now() - t0}ms`);
     res.json({
       notifications,
       count: notifications.length,
@@ -8179,6 +8747,7 @@ app.post('/email/scan', async (req, res) => {
     });
     res.on('finish', () => { if (pending.length) savePendingNotifications(req, []); });
   } catch (e) {
+    console.error(`[email/scan] error userId=${userId} ${Date.now() - t0}ms: ${e.message}`);
     res.status(500).json({ error: e.message });
   }
 });

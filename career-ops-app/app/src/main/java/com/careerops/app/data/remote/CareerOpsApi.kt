@@ -53,6 +53,9 @@ interface CareerOpsApi {
     @POST("scan")
     suspend fun scan(@Body request: ScanRequest? = null): ScanResponse
 
+    @GET("scan/results")
+    suspend fun getCachedScanResults(): ScanResultsCacheResponse
+
     // ── AI: Evaluation & Pipeline ──────────────────────────────
     @POST("auto-pipeline")
     suspend fun autoPipeline(@Body request: AutoPipelineRequest): AutoPipelineResponse
@@ -80,7 +83,7 @@ interface CareerOpsApi {
     suspend fun classifyEmail(@Body request: ClassifyRequest): ClassifyResponse
 
     @POST("email/scan")
-    suspend fun scanInbox(@Body body: Map<String, Any> = emptyMap()): ScanInboxResponse
+    suspend fun scanInbox(@Body body: ScanInboxRequest = ScanInboxRequest()): ScanInboxResponse
 
     // ── Email Inbox ────────────────────────────────────────────
     @GET("email/inbox")
@@ -100,7 +103,7 @@ interface CareerOpsApi {
 
     // ── Spam ───────────────────────────────────────────────────
     @POST("email/spam/delete")
-    suspend fun deleteSpam(@Body body: Map<String, Any>): Map<String, Any>
+    suspend fun deleteSpam(@Body body: SpamDeleteRequest): Map<String, Any>
 
     // ── Email Send ─────────────────────────────────────────────
     @POST("email/send")
@@ -169,7 +172,7 @@ interface CareerOpsApi {
 
     // ── Candidate form answers (persisted config/form-answers.yml) ──
     @POST("form-answers")
-    suspend fun saveFormAnswers(@Body body: Map<String, Any>): Map<String, Any>
+    suspend fun saveFormAnswers(@Body body: FormAnswersRequest): Map<String, Any>
 
     // ── Portal logins (Google OAuth primary, portal password fallback) ──
     @GET("portals/requirements")
@@ -192,7 +195,7 @@ interface CareerOpsApi {
     suspend fun getLoginSessionState(): Map<String, Any>
 
     @POST("login/session/tap")
-    suspend fun loginSessionTap(@Body body: Map<String, Any>): Map<String, Any>
+    suspend fun loginSessionTap(@Body body: LoginSessionTapRequest): Map<String, Any>
 
     @POST("login/session/type")
     suspend fun loginSessionType(@Body body: Map<String, String>): Map<String, Any>
@@ -210,7 +213,7 @@ interface CareerOpsApi {
     suspend fun finishLoginSession(): Map<String, Any>
 
     @POST("login/session/seed")
-    suspend fun seedLoginSession(@Body body: Map<String, Any>): Map<String, Any>
+    suspend fun seedLoginSession(@Body body: SeedLoginSessionRequest): Map<String, Any>
 
     @GET("portal/session/status")
     suspend fun getPortalSessionStatus(): Map<String, Any>

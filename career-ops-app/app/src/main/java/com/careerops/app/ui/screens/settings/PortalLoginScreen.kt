@@ -30,6 +30,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.careerops.app.GoogleOAuthActivity
 import com.careerops.app.data.model.OAuthExchangeRequest
+import com.careerops.app.data.model.LoginSessionTapRequest
+import com.careerops.app.data.model.SeedLoginSessionRequest
 import com.careerops.app.data.remote.CareerOpsApi
 import com.careerops.app.util.UserPrefs
 import kotlinx.coroutines.delay
@@ -159,7 +161,10 @@ fun PortalLoginScreen(
         scope.launch {
             try {
                 val r = api.loginSessionTap(
-                    mapOf("x" to (offset.x * scaleX).toInt(), "y" to (offset.y * scaleY).toInt())
+                    LoginSessionTapRequest(
+                        x = (offset.x * scaleX).toInt(),
+                        y = (offset.y * scaleY).toInt()
+                    )
                 )
                 screenshotB64 = r["screenshot"] as? String ?: screenshotB64
             } catch (_: Exception) {}
@@ -217,7 +222,7 @@ fun PortalLoginScreen(
                 }
                 if (cookies.isNotEmpty()) {
                     try {
-                        api.seedLoginSession(mapOf("cookieString" to cookies))
+                        api.seedLoginSession(SeedLoginSessionRequest(cookieString = cookies))
                     } catch (e: Exception) {
                         error = "Cookie save failed: ${e.message}"
                     }

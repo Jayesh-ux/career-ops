@@ -38,10 +38,12 @@ import android.net.Uri
 
 // One source of truth for quick actions. Playwright scraping is part of
 // scanning jobs, so it is intentionally NOT a separate action here.
+// The SCAN prompt is intentionally generic — scanning is profile-driven, so
+// the server iterates the user's OWN target roles, never a hardcoded one.
 private enum class QuickActionKind(val label: String, val prompt: String) {
-    SCAN("Scan jobs", "scan for full stack developer jobs"),
+    SCAN("Scan jobs", "scan"),
     INBOX("Check inbox", "check my inbox for new emails"),
-    SPAM("Clean spam", "clean spam from my inbox"),
+    SPAM("Clean spam", "clean spam"),
     EVALUATE("Evaluate job", "evaluate this job: "),
     TRACKER("Show tracker", "show my applications tracker")
 }
@@ -161,6 +163,30 @@ fun ChatScreen(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        // Permanent "View Jobs" access — FIRST in the row so it is
+                        // always on screen without horizontal scroll. Opens the
+                        // live job list; appears once the first scan has run and
+                        // never goes away, so no scrolling the chat to find it.
+                        if (viewModel.hasScannedOnce) {
+                            AssistChip(
+                                onClick = { viewModel.openSuggestedJobs() },
+                                label = {
+                                    Text(
+                                        text = "View Jobs (${viewModel.suggestedJobs.size})",
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                },
+                                leadingIcon = {
+                                    Icon(
+                                        Icons.Default.Search,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                },
+                                shape = RoundedCornerShape(8.dp)
+                            )
+                        }
                         QuickActionKind.values().forEach { action ->
                             AssistChip(
                                 onClick = { viewModel.sendMessage(action.prompt) },
@@ -306,6 +332,7 @@ fun ChatScreen(
                                  is ChatMessage.FormQuestion -> FormQuestionCard(message)
                                  is ChatMessage.SubmitConfirmation -> SubmitConfirmationCard(message)
                                 is ChatMessage.ManualApplyCard -> ManualApplyCard(message)
+                                is ChatMessage.WhatsAppApply -> WhatsAppApplyCard(message)
                                 is ChatMessage.SpamConfirm -> SpamConfirmCard(message)
                                 is ChatMessage.InboxNotificationCard -> InboxNotificationCard(message)
                             }
@@ -384,9 +411,12 @@ fun ChatScreen(
                 }
             }
 
-            // Pinned "Suggested jobs" button — re-opens every suggested job in a
-            // modal so you never have to scroll the chat back up to find one.
-            if (viewModel.suggestedJobs.isNotEmpty()) {
+            // Pinned "View Jobs" button — re-opens the full job list in a modal
+            // so you never have to scroll the chat back up to find it. Shown
+            // permanently once the first scan runs (even when the list is empty,
+            // so it never "goes away"); the list updates live — applying to a
+            // company removes it instantly.
+            if (viewModel.hasScannedOnce) {
                 ExtendedFloatingActionButton(
                     onClick = { viewModel.openSuggestedJobs() },
                     modifier = Modifier
@@ -395,7 +425,7 @@ fun ChatScreen(
                     icon = { Icon(Icons.Default.Search, contentDescription = null) },
                     text = {
                         Text(
-                            text = "Suggested (${viewModel.suggestedJobs.size})",
+                            text = "View Jobs (${viewModel.suggestedJobs.size})",
                             fontSize = 13.sp,
                             fontWeight = FontWeight.Bold
                         )
@@ -416,115 +446,18 @@ fun ChatScreen(
         )
     }
 
-    // Pinned "Suggested jobs" modal — every scan's jobs live here; applying to a
-    // company removes it, so the list only shows unapplied opportunities.
+    // Pinned "View Jobs" screen — the live job list. Bound directly to
+    // suggestedJobs state, so applying to or discarding a company removes it in
+    // real time while the screen is open. Opened from the pinned FAB / chip and
+    // from any scan's "View all" — never lives inside the chat, so there is no
+    // scrolling to find it.
     if (viewModel.suggestedJobsOverlay) {
-        val suggested = viewModel.suggestedJobs
-        Dialog(onDismissRequest = { viewModel.closeSuggestedJobs() }) {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "Suggested jobs",
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 17.sp,
-                            modifier = Modifier.weight(1f)
-                        )
-                        Text(
-                            text = if (suggested.isEmpty()) "none left" else "${suggested.size}",
-                            fontSize = 12.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(12.dp))
-                    if (suggested.isEmpty()) {
-                        Text(
-                            text = "No unapplied jobs left. Run another scan to find more.",
-                            fontSize = 13.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    } else {
-                        LazyColumn(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(max = 420.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            items(suggested, key = { "${it.company}-${it.role}-${it.url}" }) { job ->
-                                Surface(
-                                    shape = RoundedCornerShape(10.dp),
-                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Column(modifier = Modifier.padding(12.dp)) {
-                                        Row(verticalAlignment = Alignment.CenterVertically) {
-                                            Column(modifier = Modifier.weight(1f)) {
-                                                Text(
-                                                    text = job.company,
-                                                    fontWeight = FontWeight.Bold,
-                                                    fontSize = 14.sp
-                                                )
-                                                Text(
-                                                    text = job.role,
-                                                    fontSize = 12.sp,
-                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                    maxLines = 2,
-                                                    overflow = TextOverflow.Ellipsis
-                                                )
-                                            }
-                                            if (job.score.isNotEmpty() && job.score != "N/A") {
-                                                Spacer(modifier = Modifier.width(8.dp))
-                                                Text(
-                                                    text = job.score,
-                                                    fontSize = 12.sp,
-                                                    fontWeight = FontWeight.Bold,
-                                                    color = MaterialTheme.colorScheme.primary
-                                                )
-                                            }
-                                        }
-                                        if (job.location.isNotEmpty()) {
-                                            Spacer(modifier = Modifier.height(4.dp))
-                                            Text(
-                                                text = job.location,
-                                                fontSize = 11.sp,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis
-                                            )
-                                        }
-                                        Spacer(modifier = Modifier.height(8.dp))
-                                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                            Button(
-                                                onClick = { viewModel.applyFromSuggestedJobs(job) },
-                                                modifier = Modifier.weight(1f)
-                                            ) {
-                                                Icon(Icons.Default.Check, null, modifier = Modifier.size(14.dp))
-                                                Spacer(modifier = Modifier.width(4.dp))
-                                                Text("Apply", fontSize = 13.sp)
-                                            }
-                                            OpenJobUrlButton(url = job.url, modifier = Modifier.weight(1f))
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Spacer(modifier = Modifier.height(12.dp))
-                    OutlinedButton(
-                        onClick = { viewModel.closeSuggestedJobs() },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("Close")
-                    }
-                }
-            }
-        }
+        JobsScreen(
+            jobs = viewModel.suggestedJobs,
+            onBack = { viewModel.closeSuggestedJobs() },
+            onApply = { viewModel.applyFromSuggestedJobs(it) },
+            onDiscard = { viewModel.discardFromScanResults(it) }
+        )
     }
 
     // Draft editor — opened by the persistent "Edit" quick action or the
@@ -1601,6 +1534,99 @@ fun ManualApplyCard(message: ChatMessage.ManualApplyCard) {
                 Icon(Icons.Default.Check, null, modifier = Modifier.size(16.dp))
                 Spacer(modifier = Modifier.width(4.dp))
                 Text("I applied manually — update tracker to Applied", fontSize = 12.sp)
+            }
+        }
+    }
+}
+
+@Composable
+fun WhatsAppApplyCard(message: ChatMessage.WhatsAppApply) {
+    Card(
+        modifier = Modifier.fillMaxWidth(0.92f),
+        shape = RoundedCornerShape(12.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.45f)
+        )
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                text = "WhatsApp application — ${message.company}",
+                fontWeight = FontWeight.Bold,
+                fontSize = 14.sp,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = "No contact email on this posting, but I found the recruiter on WhatsApp. Tap the number below — your application is already typed out, just hit send.",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = "\uD83D\uDCDE ${message.phone}${if (message.role.isNotBlank()) " · ${message.role}" else ""}",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            if (message.url.isNotBlank()) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = message.url,
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+            if (message.message.isNotBlank()) {
+                Spacer(modifier = Modifier.height(8.dp))
+                SelectionContainer {
+                    Text(
+                        text = message.message.take(240) + if (message.message.length > 240) "…" else "",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(12.dp))
+            val context = LocalContext.current
+            val targets = message.waTargets.ifEmpty {
+                listOf(
+                    ChatMessage.WhatsAppTarget(
+                        label = message.phone,
+                        digits = message.phone.replace(Regex("[^\\d]"), ""),
+                        link = message.waLink
+                    )
+                )
+            }
+            targets.forEachIndexed { idx, t ->
+                Button(
+                    onClick = {
+                        val uri = Uri.parse(t.link.ifBlank { "https://wa.me/" })
+                        val intent = Intent(Intent.ACTION_VIEW, uri)
+                        runCatching { context.startActivity(intent) }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.primary
+                    )
+                ) {
+                    Icon(Icons.Default.Phone, null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = if (targets.size > 1) "Send to ${t.label}" else "Open WhatsApp with my application",
+                        fontSize = 12.sp
+                    )
+                }
+                if (idx < targets.size - 1) Spacer(modifier = Modifier.height(6.dp))
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = { message.onMarkApplied?.invoke() },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Default.Check, null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("I sent it — update tracker to Applied", fontSize = 12.sp)
             }
         }
     }

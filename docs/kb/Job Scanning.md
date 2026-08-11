@@ -1,7 +1,7 @@
 ---
 type: flow
 tags: [flow, scan, discovery]
-updated: 2026-08-07
+updated: 2026-08-08
 ---
 
 # Job Scanning
@@ -76,8 +76,69 @@ possible, Playwright for auth-gated career pages.
   discovery on "Scan again"). Portals the plain HTTP fetch can't render are
   queued into the Phase 3 Playwright retry (browser reuse) with a per-role
   keyword set (`_roleKw`) so matching stays role-specific. Salary floor +
-  `isJobDetailUrl` apply in-phase; no hardcoded roles/companies — the specs
-  come from the user's own profile, so any onboarding profile is covered.
+   `isJobDetailUrl` apply in-phase; no hardcoded roles/companies — the specs
+   come from the user's own profile, so any onboarding profile is covered.
+- **Portal names leaked into results as the company.** Role-search (Phase 2.5)
+  and its Phase 3 Playwright retries recorded `company: <portal>` (e.g.
+  `LinkedIn`) because the real employer is embedded in the portal title
+  (`Kiya.ai - Automation Engineer - Python/Ansible`). Applying to one LinkedIn
+  job then recorded "LinkedIn" in the tracker, and the app's anti-spam gate
+  falsely blocked every other LinkedIn-sourced job ("Already applied to
+  LinkedIn"). Fixed in `bridge-server.mjs` (2026-08-07): `employerFromPortalTitle`
+  splits `"Employer - Role - ..."` titles on portal-sourced results — it returns
+  the prefix as the employer UNLESS the prefix contains one of the user's OWN
+  onboarding roles (`rolePhrases`, from the same `target_roles` that drive the
+  scan — no hardcoded role dictionary) or a language-neutral listing marker
+  (jobs/job/careers/hiring/vacancy/...). `stripCompanyPrefix` then removes the
+  employer from the displayed title. `rolePhrases` is threaded through the spec
+  (`spec.rolePhrases`) and the Phase 3 Playwright retry entries (`_rolePhrases`),
+  and both Phase 3 paths (remote proxy + local Chromium) resolve the employer the
+  same way. **Extended (2026-08-08): the Phase 2 websearch loop** (search-query
+  boards such as `Shine — Mumbai`) now resolves the employer the same way — a
+  handler-level `profileRolePhrases` list plus a `portalNameKey()` helper reduce
+  `"Shine — Mumbai"` → `shine` so the portal-id set keys correctly. The app side
+  (`ChatViewModel.removeAppliedFromSuggested`) now also removes the exact
+  applied job by URL in addition to by company.
+- **Scan results only surfaced at the end of the run.** `/scan/stream` filtered
+  everything and emitted a single `done` event, so the app's pinned suggested
+  list stayed empty until the whole (multi-minute) scan finished. Fixed
+  (2026-08-08): the handler streams **live `results` SSE events** on a ~3s
+  cadence while the scan runs. Each snapshot applies the same profile-driven
+  gates as the final pass — tracker exclusion (applied/responded/interview/
+  offer/**discarded**), the salary floor, senior-level drop, and URL/company+role
+  dedup — and the timer is cleared on `done` and on error. The app merges every
+  `results` event into the pinned suggested-jobs list in realtime.
+- **Discarded companies were re-scanned.** `buildTrackerExclusion()` excluded
+  only applied/responded/interview/offer statuses, so a company the user
+  discarded reappeared on the next scan. Fixed (2026-08-08): `discarded` is now
+  part of the active-status exclusion in `/scan`, `/scan/stream`, and the live
+  `results` snapshots; the app mirrors it (`isSpammed`, `filterSuggestedAgainstTracker`).
+- **Result count collapsed from 250+ to ~45.** The 2026-08-08 employer-resolution
+  extension mislabeled ROLE titles as the employer: on LinkedIn/Shine titles like
+  `Software Development Engineer - Backend Technologies` or `Technical Lead - Backend`,
+  the dash-prefix is a role, not a company, and the real employer only lives in the
+  job URL (`...-at-bookmyshow-...`, `/jobs/<slug>/kyzer-software/<id>`). Treating the
+  prefix as `company` made the final dedup key (`company::role`) collapse every
+  distinct posting sharing that prefix into one row (BookMyShow + Swiggy + ... all
+  became `Software Development Engineer :: Backend Technologies`). Fixed
+  (2026-08-08) in `bridge-server.mjs`:
+  - `extractEmployerFromUrl()` pulls the real company slug from LinkedIn
+    (`-at-<company>-<id>`), Shine (`/jobs/<slug>/<company>/<id>`) and Internshala
+    (`-at-<company><id>`) URLs; `slugToName` renders it (`kyzer-software` → `Kyzer Software`).
+  - `employerFromPortalTitle(portal, title, rolePhrases, url)` now rejects
+    role-looking dash-prefixes (`ROLE_TOKEN_RE`, language-level role markers —
+    developer/engineer/manager/analyst/consultant/… plus `walk/drive/event`) and
+    falls back to the URL company; a confident title prefix still wins (clean).
+  - Dedup never collapses distinct URLs under a non-confident employer:
+    `isConfidentEmployer(company)` (not a portal name, no role token) gates the
+    `company::role` key, so unknown-employer rows dedup by URL only and distinct
+    opportunities survive. Same rule in the live `results` snapshots.
+  - `normalizeUrlForDedup()` strips LinkedIn tracking params (`position/pageNum/
+    refId/trackingId` + `utm_*`) and `&amp;` entities so the same posting viewed
+    multiple times is not counted twice.
+  Verified on a live 12-role run: **535 results** (raw 1468, duplicatesSkipped 302,
+  excludedApplied 35), only 7/535 labels look role/portal-ish (and those are real
+  companies: `R3 Consultant`, `Cutshort`).
 
 ## Related files
 
