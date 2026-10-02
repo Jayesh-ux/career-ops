@@ -26,8 +26,8 @@ target_roles:
       level: Junior/Mid
       fit: secondary
 narrative:
-  headline: Jr. Project Coordinator & Full Stack Developer — GeoTrack, OfferGhost, FairPay Solution
-  exit_story: Built three core production platforms — GeoTrack (GPS tracking), OfferGhost (hire-to-onboard pipeline), and FairPay Solution (fintech, 700+ clients). Now seeking a full-time role to build and scale production applications.
+  headline: Jr. Project Coordinator & Full Stack Developer — GeoTrack, OfferGhost (hire2onboard.com), FairPay Solution
+  exit_story: Built three core production platforms — GeoTrack (GPS tracking), OfferGhost (hire-to-onboard pipeline, live at hire2onboard.com), and FairPay Solution (fintech, 700+ clients, live at fairpaysolution.com). Now seeking a full-time role to build and scale production applications.
   superpowers:
     - End-to-end full stack development (React + Node.js/Python/Django/Spring Boot)
     - Shipping production SaaS platforms from zero to live (fintech, logistics, recruitment)
@@ -36,10 +36,11 @@ narrative:
     - name: GeoTrack
       hero_metric: Real-time GPS tracking with PostGIS caching — ~40% map API cost reduction
     - name: OfferGhost
+      url: https://hire2onboard.com
       hero_metric: End-to-end hire-to-onboard recruitment pipeline automation
     - name: FairPay Solution
       url: https://www.fairpaysolution.com
-      hero_metric: Full-stack loan settlement platform — 700+ clients, ₹50Cr+ debt resolved
+      hero_metric: Full-stack loan settlement platform — 700+ clients
 compensation:
   target_range: 3-6 LPA
   currency: INR
