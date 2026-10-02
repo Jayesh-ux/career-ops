@@ -21,6 +21,7 @@ import * as tls from 'tls';
 import { readFileSync, existsSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { mimeAlternative, attachmentPart, encodeMimeSubject } from './email-html.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PDF_PATH = resolve(__dirname, 'output/cv-jayesh-generic.pdf');
@@ -39,7 +40,7 @@ const HOST = 'smtp.gmail.com';
 const PORT = 465;
 const FROM_NAME = 'Jayesh Singh';
 
-function smtpSend(to, cc, subject, body, pdfBuffer) {
+function smtpSend(to, cc, subject, body, pdfBuffer, company) {
   return new Promise((resolve, reject) => {
     const socket = tls.connect(PORT, HOST, () => {
       socket.setTimeout(15000);
@@ -49,29 +50,21 @@ function smtpSend(to, cc, subject, body, pdfBuffer) {
     let buffer = '';
     let mailSent = false;
 
-    // Build MIME message
-    const boundary = '==boundary_' + Date.now() + '==';
+    // Build MIME message: multipart/mixed > multipart/alternative (text+HTML) + PDF
+    const boundary = '==boundary_' + Date.now() + '_' + Math.random().toString(16).slice(2) + '==';
+    const { alt } = mimeAlternative(body, company);
+    const attachment = attachmentPart(pdfBuffer);
+
     let message = `From: ${FROM_NAME} <${USER_EMAIL}>\r\nTo: ${to}\r\n`;
 
     if (cc) message += `Cc: ${cc}\r\n`;
-    message += `Subject: =?UTF-8?Q?${encodeSubject(subject)}?=\r\n`;
+    message += `Subject: ${encodeMimeSubject(subject)}\r\n`;
     message += `MIME-Version: 1.0\r\n`;
     message += `Content-Type: multipart/mixed; boundary="${boundary}"\r\n\r\n`;
-    message += `--${boundary}\r\n`;
-    message += `Content-Type: text/plain; charset="UTF-8"\r\n\r\n`;
-    message += `${body}\r\n\r\n`;
+    message += `--${boundary}\r\n${alt}`;
 
-    if (pdfBuffer) {
-      const b64 = pdfBuffer.toString('base64');
-      message += `--${boundary}\r\n`;
-      message += `Content-Type: application/pdf\r\n`;
-      message += `Content-Disposition: attachment; filename="Jayesh_Singh_CV.pdf"\r\n`;
-      message += `Content-Transfer-Encoding: base64\r\n\r\n`;
-      // Split base64 into 76-char lines
-      for (let i = 0; i < b64.length; i += 76) {
-        message += b64.slice(i, i + 76) + '\r\n';
-      }
-      message += `\r\n`;
+    if (attachment) {
+      message += `--${boundary}\r\n${attachment}`;
     }
 
     message += `--${boundary}--\r\n`;
@@ -149,20 +142,6 @@ function smtpSend(to, cc, subject, body, pdfBuffer) {
       else if (!mailSent && step > 0) reject(new Error('Connection closed before email was accepted'));
     });
   });
-}
-
-function encodeSubject(subject) {
-  let result = '';
-  for (let i = 0; i < subject.length; i++) {
-    const c = subject.charCodeAt(i);
-    if (c > 127 || c === 61 || c === 63 || c === 95) {
-      const hex = subject.charCodeAt(i).toString(16).toUpperCase();
-      result += '=' + (hex.length === 1 ? '0' : '') + hex;
-    } else {
-      result += subject[i];
-    }
-  }
-  return result;
 }
 
 const EMAILS = [
@@ -747,7 +726,7 @@ Jayesh Singh
     process.stdout.write('   ');
 
     try {
-      await smtpSend(email.to, email.cc, email.subject, email.body, pdfBuffer);
+      await smtpSend(email.to, email.cc, email.subject, email.body, pdfBuffer, email.company);
       console.log('✅ Sent!');
       sent++;
     } catch (err) {

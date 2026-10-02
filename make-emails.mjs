@@ -14,7 +14,7 @@ import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const PDF_PATH = resolve(__dirname, 'output/cv-arrk-009.pdf');
+const PDF_PATH = resolve(__dirname, 'data/users/hsinghjayesh@gmail.com/output/current-resume.pdf');
 const FROM = 'hsinghjayesh@gmail.com';
 const FROM_NAME = 'Jayesh Singh';
 

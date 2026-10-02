@@ -447,14 +447,18 @@ function loadCv() {
 
 function resolveTailoredCv(company) {
   // Search the generated-CV output dir AND the user's uploads dir so a CV
-  // uploaded at onboarding (or a freshly generated generic PDF) is always
-  // found. Prefers a company-specific match, then 'generic', then the
-  // newest PDF/DOCX on disk.
+  // uploaded at onboarding is always found. The user's EXACT resume
+  // (`current-resume.pdf`, the byte-for-byte copy of the resume they provided)
+  // is the top preference — it is never regenerated or restyled. Company
+  // tailoring affects the email body only, not the attached CV.
   const outputDir = join(userDir, 'output');
   const uploadsDir = join(userDir, 'data', 'uploads');
   const dirs = [];
   if (existsSync(outputDir)) dirs.push(outputDir);
   if (existsSync(uploadsDir)) dirs.push(uploadsDir);
+
+  const exact = dirs.map(d => join(d, 'current-resume.pdf')).find(existsSync);
+  if (exact) return exact;
 
   const slug = (company || '').toLowerCase().replace(/[^a-z0-9]+/g, '-');
   const all = [];

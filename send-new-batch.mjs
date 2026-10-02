@@ -3,6 +3,7 @@ import * as tls from 'tls';
 import { readFileSync, existsSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { mimeAlternative, attachmentPart, encodeMimeSubject } from './email-html.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PDF_PATH = resolve(__dirname, 'output/cv-jayesh-generic.pdf');
@@ -17,23 +18,21 @@ const HOST = 'smtp.gmail.com';
 const PORT = 465;
 const FROM_NAME = 'Jayesh Singh';
 
-function smtpSend(to, cc, subject, body, pdfBuffer) {
+function smtpSend(to, cc, subject, body, pdfBuffer, company) {
   return new Promise((resolve, reject) => {
     const socket = tls.connect(PORT, HOST, () => socket.setTimeout(15000));
     let step = 0, buffer = '', mailSent = false;
 
-    const boundary = '==boundary_' + Date.now() + '==';
+    const boundary = '==boundary_' + Date.now() + '_' + Math.random().toString(16).slice(2) + '==';
+    const { alt } = mimeAlternative(body, company);
+    const attachment = attachmentPart(pdfBuffer);
+
     let message = `From: ${FROM_NAME} <${USER_EMAIL}>\r\nTo: ${to}\r\n`;
     if (cc) message += `Cc: ${cc}\r\n`;
-    message += `Subject: =?UTF-8?Q?${encodeSubject(subject)}?=\r\n`;
+    message += `Subject: ${encodeMimeSubject(subject)}\r\n`;
     message += `MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary="${boundary}"\r\n\r\n`;
-    message += `--${boundary}\r\nContent-Type: text/plain; charset="UTF-8"\r\n\r\n${body}\r\n\r\n`;
-    if (pdfBuffer) {
-      const b64 = pdfBuffer.toString('base64');
-      message += `--${boundary}\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename="Jayesh_Singh_CV.pdf"\r\nContent-Transfer-Encoding: base64\r\n\r\n`;
-      for (let i = 0; i < b64.length; i += 76) message += b64.slice(i, i + 76) + '\r\n';
-      message += `\r\n`;
-    }
+    message += `--${boundary}\r\n${alt}`;
+    if (attachment) message += `--${boundary}\r\n${attachment}`;
     message += `--${boundary}--\r\n`;
     const msgBytes = Buffer.from(message, 'utf-8');
 
@@ -62,18 +61,6 @@ function smtpSend(to, cc, subject, body, pdfBuffer) {
     socket.on('timeout', () => reject(new Error('Timeout')));
     socket.on('close', () => { if (mailSent) resolve(); else if (!mailSent && step > 0) reject(new Error('Closed before accepted')); });
   });
-}
-
-function encodeSubject(subject) {
-  let result = '';
-  for (let i = 0; i < subject.length; i++) {
-    const c = subject.charCodeAt(i);
-    if (c > 127 || c === 61 || c === 63 || c === 95) {
-      const hex = subject.charCodeAt(i).toString(16).toUpperCase();
-      result += '=' + (hex.length === 1 ? '0' : '') + hex;
-    } else result += subject[i];
-  }
-  return result;
 }
 
 const EMAILS = [
@@ -176,7 +163,7 @@ for (const email of EMAILS) {
   console.log(`   To: ${email.to}`);
   process.stdout.write('   ');
   try {
-    await smtpSend(email.to, email.cc, email.subject, email.body, pdfBuffer);
+    await smtpSend(email.to, email.cc, email.subject, email.body, pdfBuffer, email.company);
     console.log('✅ Sent!');
     sent++;
   } catch (err) {

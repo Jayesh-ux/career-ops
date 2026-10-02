@@ -145,3 +145,10 @@ career-ops-app/.settings/
 career-ops-app/app/.classpath
 career-ops-app/app/.project
 career-ops-app/app/.settings/
+# Runtime browser profile, logs and heavy result dumps — never commit
+.pwprofile/
+bridge.log
+data/apply-results.json
+data/auto-apply-results.json
+data/auto-apply.log
+data/greenhouse-resume-results.json

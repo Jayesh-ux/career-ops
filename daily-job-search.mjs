@@ -24,7 +24,7 @@ import { chromium } from 'playwright';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DRY_RUN = process.argv.includes('--dry-run');
 const SCAN_ONLY = process.argv.includes('--scan');
-const PDF_PATH = resolve(__dirname, 'output/cv-jayesh-generic.pdf');
+const PDF_PATH = resolve(__dirname, 'data/users/hsinghjayesh@gmail.com/output/current-resume.pdf');
 const LOG_FILE = resolve(__dirname, 'data/daily-job-log.md');
 const PIPELINE_FILE = resolve(__dirname, 'data/pipeline.md');
 const OUT_DIR = resolve(__dirname, 'output');

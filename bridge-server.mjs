@@ -19,6 +19,7 @@ import { createRequire } from 'module';
 import { loadProviders, resolveProvider } from './providers/_registry.mjs';
 import { makeHttpCtx } from './providers/_http.mjs';
 import { createOpencode, createOpencodeClient } from '@opencode-ai/sdk';
+import { bodyToHtml } from './email-html.mjs';
 
 const require = createRequire(import.meta.url);
 
@@ -1698,23 +1699,42 @@ app.post('/tracker/add', (req, res) => {
 
 // POST /email/send — supports both app password and OAuth2 (per-user and legacy)
 // Build a raw RFC2822 message (optionally with a PDF attachment) for Gmail REST send.
-function buildRfc2822Message({ from, to, subject, body, pdfPath }) {
+// Includes both a plain-text part and a tailored HTML part (multipart/alternative)
+// so recruiters see a branded layout in clients that render HTML.
+function buildRfc2822Message({ from, to, subject, body, pdfPath, company }) {
   const hasAttachment = pdfPath && existsSync(pdfPath);
   const boundary = `----=_Part_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+  const altBoundary = `----=_Alt_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+  const html = company ? bodyToHtml(body, company) : bodyToHtml(body);
   const lines = [
     `From: ${from}`,
     `To: ${to}`,
     `Subject: ${subject || ''}`,
     'MIME-Version: 1.0',
   ];
+  // (no space, then BODY)... build the alternative part first:
+  const altLines = [
+    `Content-Type: multipart/alternative; boundary="${altBoundary}"`,
+    '',
+    `--${altBoundary}`,
+    'Content-Type: text/plain; charset=UTF-8',
+    'Content-Transfer-Encoding: 7bit',
+    '',
+    body,
+    '',
+    `--${altBoundary}`,
+    'Content-Type: text/html; charset=UTF-8',
+    'Content-Transfer-Encoding: base64',
+    '',
+    Buffer.from(html, 'utf-8').toString('base64'),
+    '',
+    `--${altBoundary}--`,
+  ];
   if (hasAttachment) {
     lines.push(`Content-Type: multipart/mixed; boundary="${boundary}"`);
     lines.push('');
     lines.push(`--${boundary}`);
-    lines.push('Content-Type: text/plain; charset=UTF-8');
-    lines.push('Content-Transfer-Encoding: 7bit');
-    lines.push('');
-    lines.push(body);
+    lines.push(...altLines);
     lines.push('');
     lines.push(`--${boundary}`);
     const pdfBuf = readFileSync(pdfPath);
@@ -1727,12 +1747,67 @@ function buildRfc2822Message({ from, to, subject, body, pdfPath }) {
     lines.push('');
     lines.push(`--${boundary}--`);
   } else {
-    lines.push('Content-Type: text/plain; charset=UTF-8');
-    lines.push('Content-Transfer-Encoding: 7bit');
-    lines.push('');
-    lines.push(body);
+    lines.push(...altLines);
   }
   return Buffer.from(lines.join('\r\n')).toString('base64url');
+}
+
+// Resolve the CV PDF to attach to an application email. Preference order:
+//   1. explicit pdfPath (caller already tailored via /cv/tailor) — unchanged
+//   2. the user's EXACT resume file as provided (current-resume.pdf) — the
+//      byte-for-byte copy of the resume they provided in the job apply folder;
+//      never regenerated, never restyled. Per-company tailoring applies to the
+//      email body only, NOT to the attached CV.
+//   3. a generic/default resume PDF (generic-cv.pdf) as a last-resort baseline
+// Multi-user: everything resolves under the requesting user's tree (or the legacy
+// root output dir). Returns the PDF absolute path or null when nothing exists.
+function resolveResumePdf(userDir, company, candidateName) {
+  const outDir = userDir ? join(userDir, 'output') : join(__dirname, 'output');
+  if (!existsSync(outDir)) return null;
+
+  // The user's exact resume as provided — top priority default. Never returns
+  // per-company regenerated CVs here: those belong to explicit pdfPath calls.
+  const exact = join(outDir, 'current-resume.pdf');
+  if (existsSync(exact)) return exact;
+
+  let files;
+  try {
+    files = readdirSync(outDir).filter(f => f.toLowerCase().endsWith('.pdf'));
+  } catch {
+    return null;
+  }
+  if (!files.length) return null;
+  if (company) {
+    const normalize = s => String(s).toLowerCase()
+      .replace(/\b(infotech|informatics|technologies|technology|solutions|consulting|services|labs|ltd|llp|pvt|private|limited|corp|corporation)\b/g, ' ')
+      .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    const companySlug = normalize(company);
+    const tailored = files.filter(f => {
+      // cv-<candidate>-<company>-<date>.pdf
+      const m = f.match(/^cv-([a-z0-9-]+)-\d{4}-\d{2}-\d{2}\.pdf$/i);
+      if (!m) return false;
+      // Strip the known candidate prefix to isolate the company slug.
+      let fileSlug = m[1];
+      if (candidateSlug && fileSlug.startsWith(candidateSlug + '-')) fileSlug = fileSlug.slice(candidateSlug.length + 1);
+      fileSlug = normalize(fileSlug.replace(/-/g, ' '));
+      if (!fileSlug) return false;
+      return companySlug === fileSlug
+        || (companySlug && (companySlug.includes(fileSlug) || fileSlug.includes(companySlug)));
+    });
+    if (tailored.length) {
+      const best = tailored.sort().pop();
+      const p = join(outDir, best);
+      if (existsSync(p)) return p;
+    }
+  }
+
+  // 2) Generic fallback baseline (the user's themed default resume).
+  const generic = files.filter(f => /^generic-cv\.pdf$/i.test(f)).map(f => join(outDir, f)).find(existsSync);
+  if (generic) return generic;
+
+  // 3) Last resort: any existing CV in the user's output (never send CV-less).
+  const any = files.map(f => join(outDir, f)).find(existsSync);
+  return any || null;
 }
 
 app.post('/email/send', async (req, res) => {
@@ -1764,11 +1839,10 @@ app.post('/email/send', async (req, res) => {
     };
     const clearSend = () => _recentEmailSends.delete(dedupKey);
     // Application emails must carry the CV. When the caller didn't pass a
-    // pdfPath, default to the user's generated CV PDF (per-user, then legacy).
-    // A relative pdfPath is resolved against the user's tree (multi-user).
-    const defaultCv = req.userCtx?.userDir
-      ? join(req.userCtx.userDir, 'output', 'generic-cv.pdf')
-      : join(__dirname, 'output', 'generic-cv.pdf');
+    // pdfPath, resolve the best resume for this user (per-company tailored CV
+    // for the target company, else the themed default resume). A relative
+    // pdfPath is resolved against the user's tree (multi-user).
+    const defaultCv = resolveResumePdf(req.userCtx?.userDir, company, readUserProfileRaw(req)?.candidate?.full_name);
     let resolvedPdf;
     if (pdfPath) {
       if (existsSync(pdfPath)) {
@@ -1777,7 +1851,7 @@ app.post('/email/send', async (req, res) => {
         resolvedPdf = join(req.userCtx.userDir, pdfPath);
       }
     }
-    if (!resolvedPdf && existsSync(defaultCv)) resolvedPdf = defaultCv;
+    if (!resolvedPdf && defaultCv) resolvedPdf = defaultCv;
 
     // Determine auth method: per-user OAuth2 > legacy OAuth2 > app password
     const userOAuth = req.userCtx.userId ? getUserOAuth(req.userCtx.userId) : null;
@@ -1796,7 +1870,7 @@ app.post('/email/send', async (req, res) => {
       }
       if (accessToken) {
         try {
-          const raw = buildRfc2822Message({ from: email, to, subject, body, pdfPath: resolvedPdf });
+          const raw = buildRfc2822Message({ from: email, to, subject, body, pdfPath: resolvedPdf, company });
           const sendResp = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
             method: 'POST',
             headers: {
@@ -1838,6 +1912,7 @@ app.post('/email/send', async (req, res) => {
       to,
       subject,
       text: body,
+      html: bodyToHtml(body, company),
     };
     if (resolvedPdf) mailOpts.attachments = [{ path: resolvedPdf }];
 
@@ -1859,6 +1934,119 @@ app.post('/email/send', async (req, res) => {
     }
     clearSend();
     return res.status(500).json({ success: false, error: lastErr ? lastErr.message : 'Email send failed' });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// POST /email/save-draft — save an application email as a Gmail draft so the
+// user can review it in their Drafts mailbox before sending. Same payload and
+// resume-resolution as /email/send, but POSTs the raw RFC2822 message to
+// users.drafts.create instead of users.messages.send. Requires OAuth2 (the
+// draft scope is covered by the existing gmail.send token).
+app.post('/email/save-draft', async (req, res) => {
+  try {
+    const { email: emailParam, company, role, body, to, pdfPath, subject } = req.body;
+    const email = (emailParam || '').trim() || req.userCtx?.userId || process.env.GMAIL_USER || '';
+    if (!email || !to || !body) {
+      return res.status(400).json({ success: false, error: 'email, to and body are required' });
+    }
+    const fromEmail = (email.includes('<') ? email.match(/<([^>]+)>/)[1] : email).trim();
+    const defaultCv = resolveResumePdf(req.userCtx?.userDir, company, readUserProfileRaw(req)?.candidate?.full_name);
+    let resolvedPdf;
+    if (pdfPath) {
+      if (existsSync(pdfPath)) {
+        resolvedPdf = pdfPath;
+      } else if (req.userCtx?.userDir && existsSync(join(req.userCtx.userDir, pdfPath))) {
+        resolvedPdf = join(req.userCtx.userDir, pdfPath);
+      }
+    }
+    if (!resolvedPdf && defaultCv) resolvedPdf = defaultCv;
+
+    const userOAuth = req.userCtx?.userId ? getUserOAuth(req.userCtx.userId) : null;
+    const hasUserOAuth2 = hasUsableOAuth(userOAuth);
+    const hasLegacyOAuth2 = process.env.GMAIL_CLIENT_ID && process.env.GMAIL_CLIENT_SECRET && process.env.GMAIL_REFRESH_TOKEN;
+    if (!hasUserOAuth2 && !hasLegacyOAuth2) {
+      return res.status(400).json({ success: false, error: 'Gmail draft saving requires OAuth2 (per-user or legacy)' });
+    }
+
+    let accessToken = null;
+    try {
+      accessToken = await resolveGmailAccessToken(req.userCtx?.userId, email);
+    } catch (tokenErr) {
+      console.warn(`[email/save-draft] token resolution failed: ${tokenErr.message}`);
+    }
+    if (!accessToken) {
+      return res.status(500).json({ success: false, error: 'No usable Gmail access token' });
+    }
+
+    const raw = buildRfc2822Message({ from: fromEmail, to, subject: subject || `Application for ${role || 'Unknown Role'} at ${company || 'Unknown Company'}`, body, pdfPath: resolvedPdf, company });
+    const resp = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/drafts', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ message: { raw } }),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => '');
+      console.warn(`[email/save-draft] gmail draft create failed: ${resp.status} ${errText.slice(0, 200)}`);
+      return res.status(502).json({ success: false, error: `Gmail draft create failed: ${resp.status} ${errText.slice(0, 200)}`, method: hasUserOAuth2 ? 'per_user_oauth2_rest' : 'legacy_oauth2_rest' });
+    }
+    const created = await resp.json();
+    console.log(`[email/save-draft] ok (id=${created.id})`);
+    return res.json({ success: true, method: hasUserOAuth2 ? 'per_user_oauth2_rest' : 'legacy_oauth2_rest', draftId: created.id, messageId: created.message?.id });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// POST /email/delete-draft — remove a saved Gmail draft (e.g. a stale body
+// the user asked me to rework). Accepts draftId, or a messageId to resolve
+// the owning draft, in the request body.
+app.post('/email/delete-draft', async (req, res) => {
+  try {
+    const { draftId, messageId } = req.body;
+    const email = (req.body.email || '').trim() || req.userCtx?.userId || process.env.GMAIL_USER || '';
+    if (!draftId && !messageId) {
+      return res.status(400).json({ success: false, error: 'draftId or messageId is required' });
+    }
+    const userOAuth = req.userCtx?.userId ? getUserOAuth(req.userCtx.userId) : null;
+    const hasUserOAuth2 = hasUsableOAuth(userOAuth);
+    const hasLegacyOAuth2 = process.env.GMAIL_CLIENT_ID && process.env.GMAIL_CLIENT_SECRET && process.env.GMAIL_REFRESH_TOKEN;
+    if (!hasUserOAuth2 && !hasLegacyOAuth2) {
+      return res.status(400).json({ success: false, error: 'Deleting Gmail drafts requires OAuth2' });
+    }
+    let accessToken = null;
+    try {
+      accessToken = await resolveGmailAccessToken(req.userCtx?.userId, email);
+    } catch (tokenErr) {
+      console.warn(`[email/delete-draft] token resolution failed: ${tokenErr.message}`);
+    }
+    if (!accessToken) {
+      return res.status(500).json({ success: false, error: 'No usable Gmail access token' });
+    }
+    const headers = { Authorization: `Bearer ${accessToken}` };
+    let targetId = draftId;
+    if (!targetId && messageId) {
+      const listResp = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/drafts', { headers });
+      if (listResp.ok) {
+        const listData = await listResp.json();
+        const match = (listData.drafts || []).find((d) => d.message?.id === messageId);
+        if (match) targetId = match.id;
+      }
+    }
+    if (!targetId) {
+      return res.status(404).json({ success: false, error: 'Draft not found' });
+    }
+    const delResp = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/drafts/${targetId}`, { method: 'DELETE', headers });
+    if (!delResp.ok && delResp.status !== 404) {
+      const errText = await delResp.text().catch(() => '');
+      return res.status(502).json({ success: false, error: `Gmail draft delete failed: ${delResp.status} ${errText.slice(0, 200)}` });
+    }
+    console.log(`[email/delete-draft] ok (draft=${targetId})`);
+    return res.json({ success: true, draftId: targetId });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
@@ -4975,9 +5163,29 @@ app.post('/email/reply/send', async (req, res) => {
     }
 
     // Build RFC 2822 message. In-Reply-To / References make the reply land in
-    // the same Gmail thread as the recruiter's message.
+    // the same Gmail thread as the recruiter's message. HTML alternative keeps
+    // the recruiter-facing reply branded and readable in any client.
     const boundary = `----=_Part_${Date.now()}`;
+    const altBoundary = `----=_Alt_${Date.now()}`;
     const inReplyToHeader = (inReplyTo || messageId || '').trim();
+    const replyHtml = bodyToHtml(body);
+    const altLines = [
+      `Content-Type: multipart/alternative; boundary="${altBoundary}"`,
+      '',
+      `--${altBoundary}`,
+      'Content-Type: text/plain; charset=UTF-8',
+      'Content-Transfer-Encoding: 7bit',
+      '',
+      body,
+      '',
+      `--${altBoundary}`,
+      'Content-Type: text/html; charset=UTF-8',
+      'Content-Transfer-Encoding: base64',
+      '',
+      Buffer.from(replyHtml, 'utf-8').toString('base64'),
+      '',
+      `--${altBoundary}--`,
+    ];
     const lines = [
       `From: ${userEmail}`,
       `To: ${to}`,
@@ -4987,10 +5195,9 @@ app.post('/email/reply/send', async (req, res) => {
       inReplyToHeader ? `References: ${inReplyToHeader}` : null,
       `Subject: ${subject || ''}`,
       `MIME-Version: 1.0`,
-      `Content-Type: text/plain; charset=UTF-8`,
-      `Content-Transfer-Encoding: 7bit`,
+      `Content-Type: multipart/alternative; boundary="${altBoundary}"`,
       '',
-      body,
+      ...altLines,
     ].filter(Boolean);
 
     const raw = Buffer.from(lines.join('\r\n')).toString('base64url');
@@ -8162,16 +8369,29 @@ app.post('/email/send-confirm', async (req, res) => {
       accessToken = await getGmailAccessToken();
     }
 
-    // Build RFC 2822 message
+    // Build RFC 2822 message (text + HTML alternative for branded render)
+    const boundary = `----=_Alt_${Date.now()}`;
+    const html = bodyToHtml(body, company);
     const lines = [
       `From: ${userEmail}`,
       `To: ${to}`,
       `Subject: ${subject || `Application for ${role || 'Unknown Role'} at ${company || 'Unknown Company'}`}`,
       `MIME-Version: 1.0`,
+      `Content-Type: multipart/alternative; boundary="${boundary}"`,
+      '',
+      `--${boundary}`,
       `Content-Type: text/plain; charset=UTF-8`,
       `Content-Transfer-Encoding: 7bit`,
       '',
       body,
+      '',
+      `--${boundary}`,
+      `Content-Type: text/html; charset=UTF-8`,
+      `Content-Transfer-Encoding: base64`,
+      '',
+      Buffer.from(html, 'utf-8').toString('base64'),
+      '',
+      `--${boundary}--`,
     ];
     const raw = Buffer.from(lines.join('\r\n')).toString('base64url');
 

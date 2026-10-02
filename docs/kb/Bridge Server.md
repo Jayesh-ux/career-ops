@@ -1,7 +1,7 @@
 ---
 type: component
 tags: [component, backend, api]
-updated: 2026-08-11
+updated: 2026-10-02
 ---
 
 # Bridge Server
@@ -39,12 +39,23 @@ header.
   legacy OAuth2 > app-password SMTP. The sender is **derived from `X-User-Id`
   when the body omits `email`** (2026-08-03 fix — the app's `EmailSendRequest`
   never sends `email`, which used to hard-fail with `email and body are
-  required`), and the **user's CV PDF is attached by default**
-  (`<userDir>/output/generic-cv.pdf`) so application emails always carry the
-  resume. Since 2026-08-04 the endpoint **idempotency-guards** identical sends
+  required`), and the **user's CV PDF is attached by default** so application
+  emails always carry the resume. The default attachment is resolved by
+  `resolveResumePdf(userDir, company, candidateName)` (2026-10-02): it prefers
+  the **user's exact resume as provided** (`output/current-resume.pdf` — a
+  byte-for-byte copy of the resume from the job-apply folder, never regenerated
+  or restyled), then `output/generic-cv.pdf`, then any existing PDF. Only the
+  **outreach email HTML is themed** (portfolio dark theme via `email-html.mjs`);
+  the CV/resume is exactly what the user provided and is never modified.
+  Since 2026-08-04 the endpoint **idempotency-guards** identical sends
   (same user, recipient, company, role) within a 60s window (`_recentEmailSends`)
   and returns `{success:true, duplicate:true}` for the repeat — so a double-tap
   or client retry can never email a recruiter twice.
+- Sends **tailored HTML bodies**: `/email/send` (and `/email/reply/send`,
+  `/email/send-confirm`) embed a multipart/alternative pair — plain text plus
+  `bodyToHtml(body, company)` from `email-html.mjs` — nested in the outer
+  multipart/mixed envelope, matching Jayesh's portfolio dark theme. The SMTP
+  nodemailer fallback passes the same HTML via `mailOpts.html`.
 - Own **application email drafting** (`POST /email/draft`): `fetchJdAndContact`
   scrapes the posting page (plain HTTP, then a headless-Chromium render
   fallback) for a real application email. If the page yields none — Internshala
@@ -301,6 +312,13 @@ header.
   (follow-up drafts are allowed); sending still requires `to`. `/email/reply/send`
   adds `In-Reply-To` + `References` headers and forwards `threadId` in the Gmail
   REST send body so replies land inside the original conversation.
+- **Tailored HTML bodies** (2026-09-30): every Gmail/IMAP send path now emits a
+  branded HTML alternative alongside plain text via `email-html.mjs` —
+  `buildRfc2822Message` (used by `/email/send` OAuth REST and
+  `/email/reply/send`) builds `multipart/alternative` (7bit text + base64 HTML),
+  the nodemailer SMTP fallback passes `html: bodyToHtml(body, company)`, and
+  `/email/send-confirm` does the same. `<li>` bullets and a styled
+  "Best regards" signature are auto-detected from the plain body.
 - Own **spam deletion** (`POST /email/spam/delete`, HITL): OAuth users go through
   Gmail REST, app-password users through IMAP. The OAuth path resolves the
   selected `messageIds` (Gmail ids pass through; sequential ids from

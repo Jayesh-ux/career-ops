@@ -120,7 +120,9 @@ every later run.
 
 - Company ATS career pages (Greenhouse, Ashby, Lever, Workable, ...) have no
   Cloudflare wall — `apply-job.mjs` extracts + auto-fills them cleanly with the
-  per-user profile, attaching `output/generic-cv.pdf`. This is the reliable path.
+  per-user profile, attaching `output/current-resume.pdf` (the user's exact
+  resume as provided — never regenerated). Only outreach email HTML carries the
+  portfolio dark theme. This is the reliable path.
 - **Cloudflare is now cleared** (patchright) on Internshala and Shine — the
   only remaining blocker is the **portal login**: Internshala bounces
   unauthenticated visitors to `/registration/student` (Google button visible,

@@ -152,7 +152,8 @@ Mechanics (all three scripts share the same shape):
   a Gmail **app password** passed as CLI args (`node send-XXX.mjs <email>
   <app-password>`) — credentials are never stored in files.
 - Each email: hardcoded `EMAILS` array of `{company, to, subject, body}`,
-  multipart/mixed with `output/cv-jayesh-generic.pdf` attached as
+  multipart/mixed with `output/cv-jayesh-generic.pdf` (now served as the user's
+  exact resume — `output/current-resume.pdf`, see `Playwright Automation.md`) attached as
   `Jayesh_Singh_CV.pdf` (76-char base64 folding), UTF-8 Q-encoded subject,
   1s delay between sends, per-send success/failure reporting and a final
   `=== Done: N sent, M failed ===` summary.
@@ -174,9 +175,10 @@ Mechanics (all three scripts share the same shape):
 - `to` address comes from the posting/careers page/JD (e.g.
   careers@unicoconnect.com, info@dpinfosystem.in, contact@metnmat.com).
 
-**The reusable rule:** one generic ATS-safe CV PDF (`output/cv-jayesh-generic.pdf`)
-serves as the attachment base, while the *email body* carries the tailoring per
-company — cheap to produce at scale, still personalized.
+**The reusable rule:** the user's exact resume (`output/current-resume.pdf`,
+  byte-for-byte copy of the resume they provided) is the single attachment base,
+  while the *email body* carries the tailoring per company — cheap to produce at
+  scale, still personalized.
 
 ## Stage 4 — Follow up
 
