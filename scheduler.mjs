@@ -5,15 +5,19 @@
  * Zero new dependencies. Uses setInterval + checkpoint persistence.
  * Designed to be started from bridge-server.mjs or standalone.
  *
- * Daily pipeline:
- *   06:00 — Scan job portals for new jobs
- *   06:01 — Scan inbox for new emails
- *   06:02 — Triage: classify recruiter replies, interviews, spam
- *   06:03 — Draft replies for recruiter emails (queue, never auto-send)
- *   06:05 — Evaluate top new scan results (score >= 4.0)
- *   06:10 — Draft applications for qualifying jobs
- *   08:00 — Follow-up cadence (overdue follow-ups)
- *   20:00 — Daily adaptation: compute metrics, suggest changes
+ * Run-once-per-IST-day pipeline (Termux-friendly — no cron needed):
+ *   When the bridge starts (and every 5 min poll), each task runs the first
+ *   time it's seen a new IST date, regardless of what local hour the app was
+ *   opened. So opening Termux any time runs today's full pipeline once.
+ *   Order (per user, checkpointed so restarts don't redo completed steps):
+ *   scan -> triage -> evaluate -> followup -> adapt.
+ *
+ *   - scan:      job portals, location-filtered
+ *   - triage:    inbox classify recruiter replies / interviews / spam
+ *   - evaluate:  top new scan results (score >= 4.0)
+ *   - followup:  cron/daily-hunt.mjs --followups-only (auto-sends overdue
+ *                warm-thread follow-ups unless SCHEDULER_FOLLOWUP_AUTOSEND=0)
+ *   - adapt:     daily-adapt.mjs metrics
  *
  * Run standalone:  node scheduler.mjs
  * Run from bridge: imported and started by bridge-server.mjs
@@ -35,12 +39,6 @@ function checkpointPathForUser(userDir) {
 }
 
 const POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
-const STAGGER_DELAY_MS = 30 * 1000;     // 30s between users
-const SCAN_HOUR = 6;
-const TRIAGE_HOUR = 6;
-const EVALUATE_HOUR = 6;
-const FOLLOWUP_HOUR = 8;
-const ADAPT_HOUR = 20;
 const DAILY_APP_TARGET = 8;             // max applications per day
 
 let running = false;
@@ -76,12 +74,35 @@ function resetDailyFlags(cp, today) {
   cp.repliesDrafted = 0;
 }
 
-function todayKey() {
-  return new Date().toISOString().slice(0, 10);
+function istDateKey() {
+  // IST date string YYYY-MM-DD regardless of server/device timezone.
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(new Date());
+    return parts; // en-CA yields YYYY-MM-DD
+  } catch {
+    return new Date().toISOString().slice(0, 10); // fallback
+  }
 }
 
-function hourNow() {
-  return new Date().getHours();
+// Must run once per IST day. Compare against the IST date so a bridge that was
+// off overnight flips to a fresh day in the user's local (Termux = IST) time.
+function todayKey() {
+  return istDateKey();
+}
+
+// IST weekday: 0 = Sunday ... 6 = Saturday. Used to avoid Sunday auto-sends.
+function istWeekday() {
+  try {
+    const dow = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Asia/Kolkata', weekday: 'short',
+    }).format(new Date()); // e.g. "Sun"
+    return ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(dow);
+  } catch {
+    return -1; // unknown — never block on this
+  }
 }
 
 // ── User discovery ──────────────────────────────────────────────────
@@ -148,9 +169,9 @@ async function runScriptAsync(script, args, userDir) {
 
 // ── Task 1: Daily scan ─────────────────────────────────────────────
 
-function runScan(userDir) {
+async function runScan(userDir) {
   console.log(`[scheduler] Scanning portals for ${userDir}...`);
-  const result = runScript('scan.mjs', ['--json'], userDir);
+  const result = await runScriptAsync('scan.mjs', ['--json'], userDir);
   if (result.ok) {
     try {
       const data = JSON.parse(result.stdout.trim());
@@ -215,7 +236,7 @@ async function runTriage(userDir) {
   }
 
   // Call the bridge server's triage endpoint if available, otherwise use inline classification
-  const result = runScript('auto-reply-draft.mjs', [], userDir);
+  const result = await runScriptAsync('auto-reply-draft.mjs', [], userDir);
   if (result.ok) {
     try {
       return JSON.parse(result.stdout.trim());
@@ -226,22 +247,35 @@ async function runTriage(userDir) {
 
 // ── Task 3: Auto-evaluate new scan results ─────────────────────────
 
-function runAutoEvaluate(userDir) {
+async function runAutoEvaluate(userDir) {
   console.log(`[scheduler] Auto-evaluating new jobs for ${userDir}...`);
 
   // Read pipeline to find unevaluated URLs
   const pipelinePath = join(userDir, 'data', 'pipeline.md');
   if (!existsSync(pipelinePath)) return null;
 
-  const pipeline = readFileSync(pipelinePath, 'utf-8');
+  const pipelineLines = readFileSync(pipelinePath, 'utf-8').split('\n');
+  // Only evaluate jobs posted within the last 30 days — the pipeline is
+  // append-only and holds months of stale entries that would otherwise block
+  // the daily pipeline evaluating ancient listings.
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - 30);
   const urls = [];
-  const lines = pipeline.split('\n');
-  for (const line of lines) {
+  for (const line of pipelineLines) {
     const m = line.match(/https?:\/\/[^\s\)]+/);
-    if (m) urls.push(m[0]);
+    if (!m) continue;
+    const posted = line.match(/posted:\s*(\d{4}-\d{2}-\d{2})/);
+    if (posted) {
+      const d = new Date(posted[1]);
+      if (isNaN(d) || d < cutoff) continue;
+    }
+    urls.push(m[0]);
   }
 
-  if (urls.length === 0) return null;
+  if (urls.length === 0) {
+    console.log(`[scheduler] No recent (<30d) pipeline URLs to evaluate — skipping`);
+    return null;
+  }
 
   // Check how many apps sent today
   const cp = loadCheckpoint(userDir);
@@ -257,7 +291,7 @@ function runAutoEvaluate(userDir) {
   const results = [];
   for (const url of toEvaluate) {
     console.log(`[scheduler] Evaluating ${url}...`);
-    const evalResult = runScript('evaluate-url.mjs', [url], userDir);
+    const evalResult = await runScriptAsync('evaluate-url.mjs', [url], userDir);
     if (evalResult.ok) {
       try {
         const data = JSON.parse(evalResult.stdout.trim());
@@ -280,21 +314,24 @@ function runAutoEvaluate(userDir) {
 // (respecting FOLLOWUP_MAX_PER_RUN + AUTO_SEND_FOLLOWUPS), and advances
 // data/follow-ups.md so cadence stays honest. Falls back to the plain cadence
 // dry-run analysis if daily-hunt.mjs is missing.
-function runFollowupCadence(userDir) {
+async function runFollowupCadence(userDir) {
   console.log(`[scheduler] Running followup cadence for ${userDir}...`);
   const hunter = join(__dirname, 'cron', 'daily-hunt.mjs');
   if (existsSync(hunter)) {
-    // The scheduler fires at 08:00 UTC (13:30 IST). The dedicated IST crontab
-    // (daily-hunt-cron.sh) is the SINGLE auto-send window; the scheduler's own
-    // kick is a dry-run that refreshes the digest and cadence log without
-    // double-sending a thread in the same day. Set
-    // SCHEDULER_FOLLOWUP_AUTOSEND=1 to let the scheduler send instead.
+    // Termux model: there IS no wall-clock cron to depend on. The scheduler is
+    // the single run-once-per-day follower and it auto-sends overdue warm
+    // threads (capped in the engine). Set SCHEDULER_FOLLOWUP_AUTOSEND=0 for a
+    // dry-run (drafts + digest only, nothing sent). Respect the engine's own
+    // AUTO_SEND_FOLLOWUPS env (default 1) unless explicitly overridden here.
     const prev = process.env.AUTO_SEND_FOLLOWUPS;
-    if ((process.env.SCHEDULER_FOLLOWUP_AUTOSEND || '0') === '0') process.env.AUTO_SEND_FOLLOWUPS = '0';
-    const followupBatch = runScript('cron/daily-hunt.mjs', ['--followups-only'], userDir);
+    if (process.env.SCHEDULER_FOLLOWUP_AUTOSEND === '0') process.env.AUTO_SEND_FOLLOWUPS = '0';
+    // Never auto-send on a Sunday (recruiters aren't checking; looking
+    // desperate, not diligent). Digest still refreshes, nothing goes out.
+    if (istWeekday() === 0) process.env.AUTO_SEND_FOLLOWUPS = '0';
+    const followupBatch = await runScriptAsync('cron/daily-hunt.mjs', ['--followups-only'], userDir);
     if (prev !== undefined) process.env.AUTO_SEND_FOLLOWUPS = prev;
     const summary = (followupBatch.stdout || '').split('\n').filter(l =>
-      /followups|follow-up|sent|would send|digest|would send on next/i.test(l)).slice(-10).join('\n');
+      /followups|follow-up|sent|would send|digest|on next/i.test(l)).slice(-10).join('\n');
     console.log(`[scheduler] followup summary:\n${summary}`);
     return followupBatch;
   }
@@ -304,9 +341,9 @@ function runFollowupCadence(userDir) {
 
 // ── Task 5: Daily adaptation ───────────────────────────────────────
 
-function runDailyAdapt(userDir) {
+async function runDailyAdapt(userDir) {
   console.log(`[scheduler] Running daily adaptation for ${userDir}...`);
-  const result = runScript('daily-adapt.mjs', [], userDir);
+  const result = await runScriptAsync('daily-adapt.mjs', [], userDir);
   if (result.ok) {
     // Log the adaptation
     try {
@@ -325,13 +362,12 @@ function runDailyAdapt(userDir) {
 
 // ── Main loop ───────────────────────────────────────────────────────
 
-function tick() {
+async function tick() {
   if (running) return;
   running = true;
 
   try {
     const today = todayKey();
-    const hour = hourNow();
 
     const userDirs = listUserDirs();
     if (userDirs.length === 0) {
@@ -339,77 +375,53 @@ function tick() {
       return;
     }
 
-    // Task 1: Daily scan at 6 AM
-    if (hour === SCAN_HOUR) {
-      console.log(`[scheduler] Running daily scan for ${userDirs.length} users...`);
-      for (let i = 0; i < userDirs.length; i++) {
-        const dir = userDirs[i];
-        const cp = loadCheckpoint(dir);
-        if (cp._date !== today) resetDailyFlags(cp, today);
-        if (cp.scanDone) { console.log(`[scheduler] Scan already done for ${dir} — skipping`); continue; }
-        runScan(dir);
+    // Run-once-per-IST-day: a task runs when its checkpoint flag for today is
+    // not yet set. No wall-clock gating — opening Termux any hour runs today's
+    // pipeline. Tasks run in dependency order (evaluate needs scan).
+    for (const dir of userDirs) {
+      let cp = loadCheckpoint(dir);
+      if (cp._date !== today) resetDailyFlags(cp, today);
+
+      if (!cp.scanDone) {
+        await runScan(dir);
+        cp = loadCheckpoint(dir);
+        cp._date = today;
         cp.scanDone = true;
         cp.lastScan = new Date().toISOString();
         saveCheckpoint(dir, cp);
-        if (i < userDirs.length - 1) {
-          const wait = STAGGER_DELAY_MS;
-          const start = Date.now();
-          while (Date.now() - start < wait) { /* busy wait */ }
-        }
       }
-    }
 
-    // Task 2: Inbox triage at 6 AM
-    if (hour === TRIAGE_HOUR) {
-      console.log(`[scheduler] Running inbox triage for ${userDirs.length} users...`);
-      for (const dir of userDirs) {
-        const cp = loadCheckpoint(dir);
-        if (cp._date !== today) resetDailyFlags(cp, today);
-        if (cp.triageDone) continue;
-        runTriage(dir);
+      if (!cp.triageDone) {
+        await runTriage(dir);
+        cp = loadCheckpoint(dir);
+        cp._date = today;
         cp.triageDone = true;
         cp.lastTriage = new Date().toISOString();
         saveCheckpoint(dir, cp);
       }
-    }
 
-    // Task 3: Auto-evaluate at 6 AM (after scan)
-    if (hour === EVALUATE_HOUR) {
-      console.log(`[scheduler] Running auto-evaluate for ${userDirs.length} users...`);
-      for (const dir of userDirs) {
-        const cp = loadCheckpoint(dir);
-        if (cp._date !== today) resetDailyFlags(cp, today);
-        if (cp.evaluateDone) continue;
-        if (!cp.scanDone) { console.log(`[scheduler] Scan not done for ${dir} — skipping eval`); continue; }
-        runAutoEvaluate(dir);
+      if (!cp.evaluateDone && cp.scanDone) {
+        await runAutoEvaluate(dir);
+        cp = loadCheckpoint(dir);
+        cp._date = today;
         cp.evaluateDone = true;
         cp.lastEvaluate = new Date().toISOString();
         saveCheckpoint(dir, cp);
       }
-    }
 
-    // Task 4: Follow-up cadence at 8 AM
-    if (hour === FOLLOWUP_HOUR) {
-      console.log(`[scheduler] Running followup-cadence for ${userDirs.length} users...`);
-      for (const dir of userDirs) {
-        const cp = loadCheckpoint(dir);
-        if (cp._date !== today) resetDailyFlags(cp, today);
-        if (cp.followupDone) continue;
-        runFollowupCadence(dir);
+      if (!cp.followupDone) {
+        await runFollowupCadence(dir);
+        cp = loadCheckpoint(dir);
+        cp._date = today;
         cp.followupDone = true;
         cp.lastFollowup = new Date().toISOString();
         saveCheckpoint(dir, cp);
       }
-    }
 
-    // Task 5: Daily adaptation at 8 PM
-    if (hour === ADAPT_HOUR) {
-      console.log(`[scheduler] Running daily adaptation for ${userDirs.length} users...`);
-      for (const dir of userDirs) {
-        const cp = loadCheckpoint(dir);
-        if (cp._date !== today) resetDailyFlags(cp, today);
-        if (cp.adaptDone) continue;
-        runDailyAdapt(dir);
+      if (!cp.adaptDone) {
+        await runDailyAdapt(dir);
+        cp = loadCheckpoint(dir);
+        cp._date = today;
         cp.adaptDone = true;
         cp.lastAdapt = new Date().toISOString();
         saveCheckpoint(dir, cp);
@@ -425,11 +437,11 @@ function tick() {
 // ── Start ───────────────────────────────────────────────────────────
 
 export function startScheduler() {
-  console.log(`[scheduler] Starting — poll every ${POLL_INTERVAL_MS / 1000}s`);
-  console.log(`[scheduler] Daily pipeline: scan(${SCAN_HOUR}h) triage(${TRIAGE_HOUR}h) evaluate(${EVALUATE_HOUR}h) followup(${FOLLOWUP_HOUR}h) adapt(${ADAPT_HOUR}h)`);
-  setInterval(tick, POLL_INTERVAL_MS);
+  console.log(`[scheduler] Starting — poll every ${POLL_INTERVAL_MS / 1000}s (run-once-per-IST-day)`);
+  console.log(`[scheduler] Daily pipeline: scan -> triage -> evaluate -> followup (auto-send) -> adapt`);
+  setInterval(() => { tick().catch(e => console.error(`[scheduler] Tick async error: ${e.message}`)); }, POLL_INTERVAL_MS);
   // Run first tick immediately (after 10s to let bridge-server finish booting)
-  setTimeout(tick, 10_000);
+  setTimeout(() => { tick().catch(e => console.error(`[scheduler] Tick async error: ${e.message}`)); }, 10_000);
 }
 
 // Run standalone if invoked directly
