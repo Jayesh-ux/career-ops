@@ -1644,7 +1644,10 @@ job_boards:
     notes: Remote-first international board via free public API
     max_pages: 2
     expand_on_rerun: true
-    enabled: true
+    enabled: false
+    disabled_note: EU-only postings ("Remote job, Remote") bypass the bare
+      `allow: remote` rule and flood the India/MMR pipeline with continental
+      roles; irrelevant for India-zone focused profiles.
 
   # ── SolidJobs (Polish market) ──────────────────────────────────────
   # Public API — no auth needed. Division in URL path, campaign=career-ops for tracking.

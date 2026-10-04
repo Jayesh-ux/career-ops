@@ -1,7 +1,7 @@
 ---
 type: flow
 tags: [flow, scan, discovery]
-updated: 2026-08-08
+updated: 2026-10-04
 ---
 
 # Job Scanning
@@ -17,6 +17,23 @@ possible, Playwright for auth-gated career pages.
 2. **Auth-gated portals** — Internshala, Naukri, Shine, TimesJobs, etc. use
    Playwright with the saved [[Portal Session]] so logged-in pages render
    real openings. Output lands in `data/pipeline.md`.
+
+## CLI location filter (`scan.mjs`)
+
+The CLI scanner honours a **`location_filter`** block in the shared
+`portals.yml` (three tiers, case-insensitive substring, evaluated in order):
+`always_allow` → pass (overrides `block`, for multi-city strings), `block` →
+reject, then `allow` (empty = pass, otherwise must match one keyword). Built
+in `scan.mjs` via `buildLocationFilter()`; absent → everything passes. The
+bridge `/scan` paths stay **profile-driven** and ignore this block — see the
+profile-alignment notes below. Because the CLI filter lives in shared config,
+it applies to every CLI scan; keep it to geography, not per-candidate
+keywords (those belong in `profile.yml`).
+
+Remote caveat: a bare `remote` in `allow` also admits European-only boards
+whose location field is just "Remote job, Remote". Region-locked profiles
+should disable such boards (`enabled: false`, e.g. arbeitnow) rather than
+relying on the `block` list, which can't see the city behind a bare "Remote".
 
 ## Known gaps (recorded 2026-08-03)
 
