@@ -318,6 +318,63 @@ You paste a job URL or description
   .md   .pdf   .tsv
 ```
 
+## Referral-Grade Outreach & Follow-up Engine
+
+Careers are won in the inbox, not the ATS. This branch turns career-ops into a
+full outreach-and-follow-up system — every email is recruiter-grade, truthful,
+and tracked. Built and battle-tested at scale for a Mumbai-region full-stack
+hunt (15+ applications in one batch, all with the exact resume attached).
+
+### Application emails
+
+- **One-click application through the bridge server:** `POST /email/send`
+  resolves the user's OAuth token, builds a proper RFC-2822 message, attaches
+  the **exact resume PDF** (byte-identical copy — never a stale generated PDF),
+  injects the candidate's professional dark-themed HTML body, and sends via
+  Gmail REST (`per_user_oauth2_rest`). Human-in-the-loop is enforced: draft →
+  show → confirm → send.
+- **Match-the-JD tailoring:** every body maps JD keywords to the resume's real
+  proof points (e.g. a React/Node/PostgreSQL job gets FairPay Solution's
+  "700+ clients, live at fairpaysolution.com" story). No copy-paste boilerplate.
+- **Claim-grounding rule (hard):** nothing goes in an email that isn't in the
+  actual resume PDF. Placeholder domains, embellished metrics (e.g. "₹50Cr+
+  debt resolved"), and degree-wording shortcuts are systematically stripped —
+  verified by diffing each draft against the extracted resume text
+  (`/tmp/…/resume-text.txt`). Honest emails beat punchy ones.
+
+### Draft review & versioning
+
+- `POST /email/save-draft` and `POST /email/delete-draft` let the user review
+  every application as a **Gmail draft** before it's committed. Review →
+  approve → send → auto-delete the draft so nothing double-sends.
+
+### Follow-up cadence
+
+- Warm threads get polite, context-aware nudges on a 3–5 day cadence
+  (`POST /email/reply` + `/email/reply/send`). The system knows your interview
+  status (e.g. "assessment promised after the Google Meet") and writes the
+  follow-up around the *actual* stalled step, never a generic blurb.
+
+### Inbox triage & tracking
+
+- `GET /email/inbox` classifies legitimate replies vs. spam, flags
+  mailer-daemon delivery delays/failures (transient "inbox full" vs. hard
+  bounce), and surfaces recruiter signals (rejection notices, "we're reviewing",
+  "job match" digests). Everything lands in `applications.md` with the Gmail
+  message id for audit.
+
+### Zone-specific scanning
+
+- `portals.yml` carries a three-tier location filter:
+  - `always_allow` — home zone keywords (e.g. Kalyan/Dombivli/Thane/Navi
+    Mumbai) rescue multi-city postings;
+  - `allow` — pass MMR/remote/hybrid only;
+  - `block` — kill Bangalore/Pune/Delhi/Germany-style noise before it reaches
+    `pipeline.md`.
+- Boards are pre-wired for the region (Naukri/Indeed/internshala/hirist for
+  Mumbai) and Tier-2 boards join on "Scan again". In one run this surfaced 6
+  new in-zone offers that the old global config would have starved out.
+
 ## Pre-configured Portals
 
 The scanner comes with **45+ companies** ready to scan and **19 search queries** across major job boards. Copy `templates/portals.example.yml` to `portals.yml` and add your own:
@@ -332,6 +389,8 @@ The scanner comes with **45+ companies** ready to scan and **19 search queries**
 **European:** Factorial, Attio, Tinybird, Clarity AI, Travelperk
 
 **Job boards searched:** 21 provider modules cover ATS APIs, board-wide feeds, XML/RSS feeds, markdown feeds, and local parsers. See [Supported job boards](docs/SUPPORTED_JOB_BOARDS.md) for the full table.
+
+The default `portals.yml` also ships with **India/Mumbai-region job boards** (Naukri, Indeed India, Shine, Foundit, TimesJobs, Hirist, Instahyre, Internshala, plus Tier-2 boards Opt-in'd on "Scan again") and a **three-tier location filter** — `always_allow` your home zone, `allow` MMR/remote/hybrid, `block` distant hubs. This keeps scans local first and cuts ATS noise before it ever reaches `pipeline.md`. Tune the keyword lists to your own geography.
 
 By default `node scan.mjs` (a.k.a. `npm run scan`) trusts what each ATS feed returns. Some companies leave stale postings in their public API even after the role is closed, so those expired entries can leak into `pipeline.md`. Pass `--verify` to launch Playwright after the API pass and drop expired postings before they hit the pipeline:
 
