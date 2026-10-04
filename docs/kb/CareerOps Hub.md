@@ -43,7 +43,7 @@ graph TD
 
 - [[CareerOps Hub]] — you are here
 - Components: [[Bridge Server]], [[Android App]], [[Playwright Automation]], [[Start Bridge]]
-- Flows: [[Onboarding Flow]], [[Auto-fill Pipeline]], [[Job Scanning]], [[Application Tracker]], [[Batch Pipeline Training Baseline]]
+- Flows: [[Onboarding Flow]], [[Auto-fill Pipeline]], [[Job Scanning]], [[Application Tracker]], [[Batch Pipeline Training Baseline]], [[Daily Hunt]]
 - Boundaries: [[Google OAuth]], [[Portal Session]], [[Data Contract]], [[Multi-user Data Model]], [[Security & Human-in-the-loop]]
 - Tools: [[IMAP Email]], [[CV & PDF Generation]], [[Evaluation Engine]], [[System Updater]]
 

@@ -91,6 +91,10 @@ function listUserDirs() {
   try {
     return readdirSync(USERS_ROOT, { withFileTypes: true })
       .filter(d => d.isDirectory())
+      // A real user dir is an email (X-User-Id). Reject stray project-tree
+      // copies like data/users/career-ops (batch/config/modes/reports) that
+      // happen to contain a profile.yml but are NOT a mailbox user.
+      .filter(d => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(d.name))
       .map(d => join(USERS_ROOT, d.name))
       .filter(dir => existsSync(join(dir, 'config', 'profile.yml')));
   } catch { return []; }
@@ -240,7 +244,7 @@ function runAutoEvaluate(userDir) {
   if (urls.length === 0) return null;
 
   // Check how many apps sent today
-  const cp = loadCheckpoint();
+  const cp = loadCheckpoint(userDir);
   const today = todayKey();
   const appsSentToday = (cp.dailyApps && cp.dailyApps[today]) || 0;
   if (appsSentToday >= DAILY_APP_TARGET) {
@@ -271,8 +275,30 @@ function runAutoEvaluate(userDir) {
 
 // ── Task 4: Follow-up cadence ──────────────────────────────────────
 
+// Runs cron/daily-hunt.mjs in follow-up-only mode. That script computes the
+// overdue/urgent set from followup-cadence, drafts each follow-up, sends it
+// (respecting FOLLOWUP_MAX_PER_RUN + AUTO_SEND_FOLLOWUPS), and advances
+// data/follow-ups.md so cadence stays honest. Falls back to the plain cadence
+// dry-run analysis if daily-hunt.mjs is missing.
 function runFollowupCadence(userDir) {
-  console.log(`[scheduler] Running followup-cadence for ${userDir}...`);
+  console.log(`[scheduler] Running followup cadence for ${userDir}...`);
+  const hunter = join(__dirname, 'cron', 'daily-hunt.mjs');
+  if (existsSync(hunter)) {
+    // The scheduler fires at 08:00 UTC (13:30 IST). The dedicated IST crontab
+    // (daily-hunt-cron.sh) is the SINGLE auto-send window; the scheduler's own
+    // kick is a dry-run that refreshes the digest and cadence log without
+    // double-sending a thread in the same day. Set
+    // SCHEDULER_FOLLOWUP_AUTOSEND=1 to let the scheduler send instead.
+    const prev = process.env.AUTO_SEND_FOLLOWUPS;
+    if ((process.env.SCHEDULER_FOLLOWUP_AUTOSEND || '0') === '0') process.env.AUTO_SEND_FOLLOWUPS = '0';
+    const followupBatch = runScript('cron/daily-hunt.mjs', ['--followups-only'], userDir);
+    if (prev !== undefined) process.env.AUTO_SEND_FOLLOWUPS = prev;
+    const summary = (followupBatch.stdout || '').split('\n').filter(l =>
+      /followups|follow-up|sent|would send|digest|would send on next/i.test(l)).slice(-10).join('\n');
+    console.log(`[scheduler] followup summary:\n${summary}`);
+    return followupBatch;
+  }
+  console.log(`[scheduler] cron/daily-hunt.mjs missing — falling back to dry cadence analysis`);
   return runScript('followup-cadence.mjs', ['--json'], userDir);
 }
 

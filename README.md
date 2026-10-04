@@ -354,6 +354,15 @@ hunt (15+ applications in one batch, all with the exact resume attached).
   (`POST /email/reply` + `/email/reply/send`). The system knows your interview
   status (e.g. "assessment promised after the Google Meet") and writes the
   follow-up around the *actual* stalled step, never a generic blurb.
+- **Fully automated daily loop — `cron/daily-hunt.mjs`** (cron in
+  `cron/RUNBOOK.md`): every IST morning it scans for in-zone offers, triages
+  the inbox (job-board alerts filtered out), auto-drafts and **sends follow-ups**
+  on threads that are overdue — capped, priority-ordered
+  (stalled-interview > responded > applied), stopped automatically once a
+  thread hits Interview/Offer — and writes a digest. The bridge's
+  `scheduler.mjs` runs the fixed-hour pipeline and shells to the engine for the
+  08:00 follow-up kick. New/cold applications are never auto-sent; they land in
+  the digest for your review. A watchdog keeps the bridge alive under cron.
 
 ### Inbox triage & tracking
 
@@ -442,6 +451,10 @@ career-ops/
 ├── batch/
 │   ├── batch-prompt.md          # Self-contained worker prompt
 │   └── batch-runner.sh          # Orchestrator script
+├── cron/                        # Daily-hunt automation (see cron/RUNBOOK.md)
+│   ├── daily-hunt.mjs           # Scan + triage + auto-follow-up + digest engine
+│   ├── daily-hunt-cron.sh       # Cron wrapper (08:00 IST, the send window)
+│   └── bridge-watchdog.sh       # Restarts the bridge if it dies
 ├── dashboard/                   # Go TUI pipeline viewer
 ├── data/                        # Your tracking data (gitignored)
 ├── reports/                     # Evaluation reports (gitignored)
