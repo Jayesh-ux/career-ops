@@ -136,6 +136,10 @@ export async function main() {
       if (e.status === 'interview') {
         const stalls = (e.notes || '').match(/\b(assessment|assignment|task|round|test|review|update|next step)\b/i);
         if (!stalls) return false;
+        // Don't re-nag a stalled interview more than once per
+        // responded_subsequent cadence: skip if we already followed up
+        // within the last 3 days (e.daysSinceLastFollowup from the cadence).
+        if (e.daysSinceLastFollowup !== null && e.daysSinceLastFollowup < 3) return false;
         return e.daysUntilNext !== null ? e.daysUntilNext <= -3 : false;
       }
       return (e.urgency === 'overdue' || e.urgency === 'urgent');
