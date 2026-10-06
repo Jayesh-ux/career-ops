@@ -1,7 +1,7 @@
 ---
 type: flow
 tags: [flow, followup, scheduler, daily]
-updated: 2026-10-04
+updated: 2026-10-06
 ---
 
 # Daily Hunt (automation)
@@ -16,15 +16,23 @@ Two layers, one send window.
    [[Bridge Server]] on boot. Discovers user dirs that are **email-shaped**
    under `data/users/` (rejects stray project-tree copies like
    `data/users/career-ops/` that happen to contain a `profile.yml`) and runs a
-   fixed-hour pipeline: scan (06h), inbox triage (06h), auto-evaluate (06h),
-   follow-up (08h), daily adapt (20h) — all UTC hours. Checkpoints per user in
-   `.scheduler-checkpoint.json`.
+   **run-once-per-IST-day** pipeline in-order: scan → inbox triage →
+   auto-evaluate → follow-up (auto-send; dry-run on Sundays) → daily adapt.
+   No wall-clock gating — opening Termux any hour runs today's full pipeline
+   once. Checkpoints per user in `.scheduler-checkpoint.json`. Task order and
+   dependency (evaluate only after scan) enforced there; tasks are non-blocking
+   (spawned) so the bridge stays responsive.
 2. **Daily-hunt engine** — `cron/daily-hunt.mjs`, the actual work:
    - **Scan** — `scan.mjs` (location-filtered, EU boards disabled; see
-     [[Job Scanning]]).
+     [[Job Scanning]]). Must run with the repo root as cwd — scan.mjs resolves
+     `portals.yml` relative to its working directory.
    - **Triage** — `/email/triage`, then strips job-board alert senders
      (Indeed/LinkedIn/Internshala/Shine/Jobrapido/… and the user's own sent
-     mail) so only real recruiter signals surface.
+     mail) so only real recruiter signals surface. The scheduler reads
+     `data/users/<id>/.oauth2.json` itself (base64 AES-GCM blob OR legacy
+     `{encrypted,iv,authTag}` OR plaintext refreshToken) and runs
+     `auto-reply-draft.mjs` (needs `js-yaml`; calls bridge `/email/inbox` with
+     `X-User-Id`).
    - **Follow-ups** — reads `/followups` (cadence engine), filters to due
      threads, **prioritizes stalled-interview > responded > applied, freshest
      first**, drafts each via `/followup/draft` (opencode, resume-grounded),
