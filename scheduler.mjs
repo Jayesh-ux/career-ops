@@ -27,10 +27,23 @@ import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync } from 
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { spawnSync } from 'child_process';
+import YAML from 'js-yaml';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const USERS_ROOT = join(__dirname, 'data', 'users');
 const ADAPT_LOG_PATH = join(__dirname, 'data', 'adapt-log.md');
+
+function readBridgeEnvKey() {
+  for (const p of [join(__dirname, '.bridge.env'), join(__dirname, '.env')]) {
+    try {
+      if (existsSync(p)) {
+        const m = readFileSync(p, 'utf-8').match(/^CREDENTIALS_KEY=(.+)$/m);
+        if (m && m[1]) return m[1].trim();
+      }
+    } catch { /* ignore */ }
+  }
+  return null;
+}
 
 function checkpointPathForUser(userDir) {
   const d = join(userDir, 'data');
@@ -123,11 +136,11 @@ function listUserDirs() {
 
 // ── Task runners ────────────────────────────────────────────────────
 
-function runScript(script, args, userDir) {
+function runScript(script, args, userDir, opts = {}) {
   try {
     const fullArgs = [join(__dirname, script), ...args, '--user-dir', userDir];
     const r = spawnSync('node', fullArgs, {
-      cwd: userDir,
+      cwd: opts.cwd || userDir,
       encoding: 'utf-8',
       timeout: 180_000,
       env: { ...process.env, FORCE_COLOR: '0' },
@@ -142,13 +155,13 @@ function runScript(script, args, userDir) {
   }
 }
 
-async function runScriptAsync(script, args, userDir) {
+async function runScriptAsync(script, args, userDir, opts = {}) {
   // Non-blocking version — fires and forgets for long-running tasks
   try {
     const { spawn } = await import('child_process');
     const fullArgs = [join(__dirname, script), ...args, '--user-dir', userDir];
     const proc = spawn('node', fullArgs, {
-      cwd: userDir,
+      cwd: opts.cwd || userDir,
       encoding: 'utf-8',
       env: { ...process.env, FORCE_COLOR: '0' },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -171,7 +184,9 @@ async function runScriptAsync(script, args, userDir) {
 
 async function runScan(userDir) {
   console.log(`[scheduler] Scanning portals for ${userDir}...`);
-  const result = await runScriptAsync('scan.mjs', ['--json'], userDir);
+  // scan.mjs resolves portals.yml from its working directory — run it from the
+  // repo root, not the user dir, or every scheduled scan fails "portals.yml not found".
+  const result = await runScriptAsync('scan.mjs', ['--json'], userDir, { cwd: __dirname });
   if (result.ok) {
     try {
       const data = JSON.parse(result.stdout.trim());
@@ -192,8 +207,7 @@ async function runTriage(userDir) {
   // Read profile to get email
   let profile;
   try {
-    const yaml = await import('yaml');
-    profile = yaml.parse(readFileSync(profilePath, 'utf-8'));
+    profile = YAML.load(readFileSync(profilePath, 'utf-8'));
   } catch {
     try {
       profile = JSON.parse(readFileSync(profilePath, 'utf-8'));
@@ -203,25 +217,39 @@ async function runTriage(userDir) {
   const email = profile?.candidate?.email || process.env.GMAIL_USER;
   if (!email) return null;
 
-  // Read OAuth credentials
+  // Read OAuth credentials — same on-disk formats the bridge supports:
+  // legacy JSON {encrypted,iv,authTag}, plaintext {refreshToken, ...}, or the
+  // current AES-256-GCM base64 blob (iv||authTag||ciphertext) in .oauth2.json.
   const oauthPath = join(userDir, '.oauth2.json');
   let userOAuth = null;
   if (existsSync(oauthPath)) {
     try {
-      const raw = JSON.parse(readFileSync(oauthPath, 'utf-8'));
-      // Handle encrypted credentials
-      if (raw.encrypted && process.env.CREDENTIALS_KEY) {
+      const raw = readFileSync(oauthPath, 'utf-8').trim();
+      const credsKey = process.env.CREDENTIALS_KEY || readBridgeEnvKey();
+      if (raw.startsWith('{')) {
+        const parsed = JSON.parse(raw);
+        if (parsed.encrypted && credsKey) {
+          const crypto = await import('crypto');
+          const key = Buffer.from(credsKey, 'hex');
+          const iv = Buffer.from(parsed.iv, 'hex');
+          const authTag = Buffer.from(parsed.authTag, 'hex');
+          const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+          decipher.setAuthTag(authTag);
+          let decrypted = decipher.update(parsed.encrypted, 'base64', 'utf-8');
+          decrypted += decipher.final('utf-8');
+          userOAuth = JSON.parse(decrypted);
+        } else if (parsed.refreshToken) {
+          userOAuth = parsed;
+        }
+      } else if (credsKey && /^[A-Za-z0-9+/=]{60,}$/.test(raw)) {
+        // Current format: base64(iv(12) + authTag(16) + ciphertext)
         const crypto = await import('crypto');
-        const key = Buffer.from(process.env.CREDENTIALS_KEY, 'hex');
-        const iv = Buffer.from(raw.iv, 'hex');
-        const authTag = Buffer.from(raw.authTag, 'hex');
-        const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-        decipher.setAuthTag(authTag);
-        let decrypted = decipher.update(raw.encrypted, 'base64', 'utf-8');
-        decrypted += decipher.final('utf-8');
-        userOAuth = JSON.parse(decrypted);
-      } else if (raw.refreshToken) {
-        userOAuth = raw;
+        const key = Buffer.from(credsKey, 'hex');
+        const buf = Buffer.from(raw, 'base64');
+        const decipher = crypto.createDecipheriv('aes-256-gcm', key, buf.subarray(0, 12));
+        decipher.setAuthTag(buf.subarray(12, 28));
+        const decrypted = Buffer.concat([decipher.update(buf.subarray(28)), decipher.final()]);
+        userOAuth = JSON.parse(decrypted.toString('utf-8'));
       }
     } catch { /* no valid OAuth */ }
   }

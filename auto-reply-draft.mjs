@@ -12,6 +12,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import YAML from 'js-yaml';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -34,8 +35,7 @@ const inboxQueuePath = join(userDir, 'data', 'agent-inbox.md');
 function loadProfile() {
   if (!existsSync(profilePath)) return {};
   try {
-    const yaml = await import('yaml');
-    return yaml.parse(readFileSync(profilePath, 'utf-8')) || {};
+    return YAML.load(readFileSync(profilePath, 'utf-8')) || {};
   } catch {
     try { return JSON.parse(readFileSync(profilePath, 'utf-8')); } catch { return {}; }
   }
@@ -159,7 +159,9 @@ async function main() {
   // Try to fetch emails via bridge server if running
   try {
     const bridgeUrl = 'http://127.0.0.1:8787';
-    const resp = await fetch(`${bridgeUrl}/email/inbox?daysBack=7&maxEmails=20`);
+    const resp = await fetch(`${bridgeUrl}/email/inbox?daysBack=7&maxEmails=20`, {
+      headers: email ? { 'X-User-Id': email } : {},
+    });
     if (!resp.ok) throw new Error(`Bridge returned ${resp.status}`);
     const data = await resp.json();
     const emails = data.emails || [];
