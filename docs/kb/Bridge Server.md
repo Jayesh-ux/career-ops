@@ -1,8 +1,18 @@
 ---
 type: component
 tags: [component, backend, api]
-updated: 2026-10-02
+updated: 2026-10-08
 ---
+
+## Email send hard blocklist (2026-10-08)
+
+`/email/send` and `/email/reply/send` refuse (HTTP 403, `blocked:true`) any
+recipient whose domain is in `BRIDGE_BLOCKED_SEND_DOMAINS`
+(`peppermint.co.in`, `inticedebsd.com`, `inticede.com`). This is the
+do-not-contact last line of defense at the send layer; the data blacklist
+(`data/blacklist.md`, bullets parsed by `loadSenderBlacklist`) separately skips
+those companies at scan/triage and suppresses them from inbox alerts. Keep the
+two lists in sync.
 
 # Bridge Server
 

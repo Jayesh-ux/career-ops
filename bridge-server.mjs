@@ -1810,6 +1810,15 @@ function resolveResumePdf(userDir, company, candidateName) {
   return any || null;
 }
 
+const BRIDGE_BLOCKED_SEND_DOMAINS = ['peppermint.co.in', 'inticedebsd.com', 'inticede.com'];
+function blockedSendRecipient(to) {
+  const addr = String(to || '').replace(/^\s*.*<([^>]+)>\s*$/, '$1').trim().toLowerCase();
+  const domain = addr.split('@')[1] || '';
+  return BRIDGE_BLOCKED_SEND_DOMAINS.includes(domain)
+    ? `recipient domain @${domain} is on the hard blocklist (never send)`
+    : null;
+}
+
 app.post('/email/send', async (req, res) => {
   try {
     const { email: emailParam, appPassword, company, role, body, to, pdfPath } = req.body;
@@ -1821,6 +1830,10 @@ app.post('/email/send', async (req, res) => {
     }
     if (!to || !String(to).trim()) {
       return res.status(400).json({ error: 'to (recipient) is required — refusing to send without a recipient' });
+    }
+    const blockedSend = blockedSendRecipient(to);
+    if (blockedSend) {
+      return res.status(403).json({ success: false, blocked: true, error: blockedSend, blockedDomain: true });
     }
 
     // Idempotency: refuse an identical send (user, recipient, company, role)
@@ -5122,6 +5135,10 @@ app.post('/email/reply/send', async (req, res) => {
   try {
     const { to, subject, body, cc, bcc, inReplyTo, messageId, threadId } = req.body;
     if (!to || !body) return res.status(400).json({ error: 'to and body are required' });
+    const blockedSendReply = blockedSendRecipient(to);
+    if (blockedSendReply) {
+      return res.status(403).json({ success: false, blocked: true, error: blockedSendReply, blockedDomain: true });
+    }
 
     // Resolve auth (same logic as /email/send)
     const userId = req.userCtx?.userId;
