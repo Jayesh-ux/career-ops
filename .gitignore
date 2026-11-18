@@ -116,6 +116,12 @@ plan/
 # Setup scripts (local dev)
 setup-backend.sh
 gmail-oauth-setup.mjs
+run_daily.sh
+
+# Ephemeral runtime profiles and IDE settings
+.pwprofile/
+.vscode/
+batch/apply-packages/
 
 # Android app build artifacts
 career-ops-app/.gradle/

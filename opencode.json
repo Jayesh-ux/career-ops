@@ -1,9 +1,21 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "model": "opencode/big-pickle",
+  "provider": {
+    "omniroute": {
+      "name": "OmniRoute",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://localhost:20128/v1",
+        "apiKey": "{env:OMNIROUTE_API_KEY}"
+      }
+    }
+  },
   "permission": {
     "bash": {
       "node scan.mjs*": "allow",
+      "node apply-job.mjs*": "allow",
+      "node openrouter-runner.mjs*": "allow",
       "node check-liveness.mjs*": "allow",
       "node followup-cadence.mjs*": "allow",
       "node generate-pdf.mjs*": "allow",

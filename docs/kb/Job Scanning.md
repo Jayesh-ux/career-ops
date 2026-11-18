@@ -1,7 +1,7 @@
 ---
 type: flow
 tags: [flow, scan, discovery]
-updated: 2026-08-08
+updated: 2026-09-05
 ---
 
 # Job Scanning
@@ -94,9 +94,9 @@ possible, Playwright for auth-gated career pages.
   (`spec.rolePhrases`) and the Phase 3 Playwright retry entries (`_rolePhrases`),
   and both Phase 3 paths (remote proxy + local Chromium) resolve the employer the
   same way. **Extended (2026-08-08): the Phase 2 websearch loop** (search-query
-  boards such as `Shine — Mumbai`) now resolves the employer the same way — a
+  boards such as `Shine — Hyderabad`) now resolves the employer the same way — a
   handler-level `profileRolePhrases` list plus a `portalNameKey()` helper reduce
-  `"Shine — Mumbai"` → `shine` so the portal-id set keys correctly. The app side
+  `"Shine — Hyderabad"` → `shine` so the portal-id set keys correctly. The app side
   (`ChatViewModel.removeAppliedFromSuggested`) now also removes the exact
   applied job by URL in addition to by company.
 - **Scan results only surfaced at the end of the run.** `/scan/stream` filtered

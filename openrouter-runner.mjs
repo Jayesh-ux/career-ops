@@ -42,8 +42,8 @@ if (fs.existsSync(envPath)) {
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-const OPENROUTER_API_URL    = 'https://openrouter.ai/api/v1/chat/completions';
-const OPENROUTER_MODELS_URL = 'https://openrouter.ai/api/v1/models';
+const OPENROUTER_API_URL    = process.env.OPENROUTER_BASE_URL ? `${process.env.OPENROUTER_BASE_URL.replace(/\/$/, '')}/chat/completions` : (process.env.OPENAI_BASE_URL ? `${process.env.OPENAI_BASE_URL.replace(/\/$/, '')}/chat/completions` : 'https://openrouter.ai/api/v1/chat/completions');
+const OPENROUTER_MODELS_URL = process.env.OPENROUTER_BASE_URL ? `${process.env.OPENROUTER_BASE_URL.replace(/\/$/, '')}/models` : (process.env.OPENAI_BASE_URL ? `${process.env.OPENAI_BASE_URL.replace(/\/$/, '')}/models` : 'https://openrouter.ai/api/v1/models');
 const MAX_TOKENS            = 8192;
 const RATE_LIMIT_DELAY_MS   = 2500;  // pause between requests on free tier
 const MODEL_TIMEOUT_MS      = 15_000; // abort a single model call after 15 s

@@ -38,6 +38,9 @@ The job pool came from **three complementary channels**:
    Foundit Mumbai, TimesJobs Mumbai, Hirist Mumbai, Instahyre Mumbai,
    Internshala Mumbai. Tier 2 (`expand_on_rerun`) — Cutshort, apna, iimjobs,
    LinkedIn India Mumbai, Glassdoor India Mumbai, Freshersworld.
+   *Current config (2026-09-05): `job_boards:` in `portals.yml` is scoped to the
+   Hyderabad region (PIN 500032) for the active Hyderabad profile — board names
+   and URLs are location-suffixed per market; see [[Job Scanning]].*
 2. **Company ATS boards** — zero-token public APIs and Playwright scraping of
    Greenhouse / Lever / Ashby / Workable. `data/users/*/data/scan-history.tsv`
    (5,619 rows) breaks down: 2,818 greenhouse, 1,831 ashby, 339 lever, plus
